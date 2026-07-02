@@ -1,0 +1,159 @@
+use anyhow::{Context, Result};
+use arrow_array::{ArrayRef as ArrowArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema};
+use bytes::Bytes;
+use std::sync::Arc;
+use vortex::VortexSessionDefault;
+use vortex::array::ArrayRef;
+use vortex::array::arrow::FromArrowArray;
+use vortex::array::stream::ArrayStreamExt;
+use vortex::buffer::ByteBufferMut;
+use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
+use vortex::io::session::RuntimeSessionExt;
+use vortex::session::VortexSession;
+
+use crate::otlp::SpanRecord;
+
+pub async fn encode_span_records(records: &[SpanRecord]) -> Result<Bytes> {
+    let batch = records_to_batch(records)?;
+    let vortex_array =
+        ArrayRef::from_arrow(batch, false).context("convert Arrow span batch to Vortex")?;
+
+    let session = VortexSession::default().with_tokio();
+    let mut buffer = ByteBufferMut::empty();
+    session
+        .write_options()
+        .write(&mut buffer, vortex_array.to_array_stream())
+        .await
+        .context("write Vortex span segment")?;
+
+    Ok(Bytes::copy_from_slice(buffer.as_ref()))
+}
+
+pub async fn read_span_count(payload: Bytes) -> Result<usize> {
+    let session = VortexSession::default().with_tokio();
+    let array = session
+        .open_options()
+        .open_buffer(payload)
+        .context("open Vortex buffer")?
+        .scan()
+        .context("scan Vortex buffer")?
+        .into_array_stream()
+        .context("create Vortex scan stream")?
+        .read_all()
+        .await
+        .context("read Vortex buffer")?;
+    Ok(array.len())
+}
+
+fn records_to_batch(records: &[SpanRecord]) -> Result<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("project_name", DataType::Utf8, false),
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("span_id", DataType::Utf8, false),
+        Field::new("parent_span_id", DataType::Utf8, true),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("start_time_unix_nano", DataType::Int64, false),
+        Field::new("end_time_unix_nano", DataType::Int64, false),
+        Field::new("status_code", DataType::Int32, false),
+        Field::new("attributes_json", DataType::Utf8, false),
+    ]));
+
+    let parent_span_ids: Vec<Option<&str>> = records
+        .iter()
+        .map(|record| record.parent_span_id.as_deref())
+        .collect();
+    let columns: Vec<ArrowArrayRef> = vec![
+        Arc::new(StringArray::from(
+            records
+                .iter()
+                .map(|record| record.project_name.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            records
+                .iter()
+                .map(|record| record.trace_id.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            records
+                .iter()
+                .map(|record| record.span_id.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(parent_span_ids)),
+        Arc::new(StringArray::from(
+            records
+                .iter()
+                .map(|record| record.name.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            records
+                .iter()
+                .map(|record| record.start_time_unix_nano)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            records
+                .iter()
+                .map(|record| record.end_time_unix_nano)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Int32Array::from(
+            records
+                .iter()
+                .map(|record| record.status_code)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            records
+                .iter()
+                .map(|record| record.attributes_json.as_str())
+                .collect::<Vec<_>>(),
+        )),
+    ];
+
+    RecordBatch::try_new(schema, columns).context("build Arrow span batch")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn encodes_span_records_as_readable_vortex() {
+        let records = vec![
+            span_record("root", None),
+            span_record("child", Some("1111111111111111")),
+        ];
+
+        let payload = encode_span_records(&records)
+            .await
+            .expect("encode Vortex segment");
+        assert!(!payload.is_empty());
+        assert_eq!(
+            read_span_count(payload).await.expect("read Vortex segment"),
+            2
+        );
+    }
+
+    fn span_record(name: &str, parent_span_id: Option<&str>) -> SpanRecord {
+        SpanRecord {
+            project_name: "demo".to_owned(),
+            trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            span_id: if parent_span_id.is_some() {
+                "2222222222222222".to_owned()
+            } else {
+                "1111111111111111".to_owned()
+            },
+            parent_span_id: parent_span_id.map(str::to_owned),
+            name: name.to_owned(),
+            start_time_unix_nano: 1,
+            end_time_unix_nano: 2,
+            status_code: 1,
+            attributes_json: "{}".to_owned(),
+        }
+    }
+}
