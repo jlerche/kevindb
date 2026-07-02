@@ -1,0 +1,437 @@
+use std::sync::Arc;
+
+use anyhow::Context;
+use axum::body::Bytes;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use kevindb::ingest::{FlushReceipt, IngestConfig, IngestReceipt, Ingestor};
+use kevindb::query::{QueryEngine, RunSummary};
+use object_store::ObjectStore;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use prost::Message;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone)]
+pub struct ServerState {
+    postgres_url: String,
+    object_store: Arc<dyn ObjectStore>,
+    ingestor: Arc<Ingestor>,
+}
+
+impl ServerState {
+    pub fn new(
+        postgres_url: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        ingest_config: IngestConfig,
+    ) -> Self {
+        let postgres_url = postgres_url.into();
+        let ingestor = Arc::new(Ingestor::new(
+            postgres_url.clone(),
+            Arc::clone(&object_store),
+            ingest_config,
+        ));
+
+        Self {
+            postgres_url,
+            object_store,
+            ingestor,
+        }
+    }
+
+    fn query_engine(&self) -> QueryEngine {
+        QueryEngine::new(self.postgres_url.clone(), Arc::clone(&self.object_store))
+    }
+}
+
+pub fn app(state: ServerState) -> Router {
+    Router::new()
+        .route("/v1/projects/{project_name}/traces", post(ingest_trace))
+        .route(
+            "/v1/projects/{project_name}/traces/{trace_id}/runs",
+            get(list_trace_runs),
+        )
+        .with_state(state)
+}
+
+async fn ingest_trace(
+    State(state): State<ServerState>,
+    Path(project_name): Path<String>,
+    body: Bytes,
+) -> Result<Json<IngestResponse>, ApiError> {
+    let request = ExportTraceServiceRequest::decode(body)
+        .map_err(|error| ApiError::bad_request(format!("invalid OTLP protobuf: {error}")))?;
+    let receipt = state.ingestor.ingest_otlp(project_name, request).await?;
+    Ok(Json(IngestResponse::from(receipt)))
+}
+
+async fn list_trace_runs(
+    State(state): State<ServerState>,
+    Path((project_name, trace_id)): Path<(String, String)>,
+) -> Result<Json<RunsResponse>, ApiError> {
+    let runs = state
+        .query_engine()
+        .list_runs_in_trace(&project_name, &trace_id)
+        .await
+        .with_context(|| format!("list runs for trace {trace_id}"))?;
+    Ok(Json(RunsResponse {
+        runs: runs.into_iter().map(RunResponse::from).collect(),
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestResponse {
+    pub accepted_spans: usize,
+    pub flushed_segments: usize,
+    pub flush: Option<FlushResponse>,
+}
+
+impl From<IngestReceipt> for IngestResponse {
+    fn from(receipt: IngestReceipt) -> Self {
+        Self {
+            accepted_spans: receipt.accepted_spans,
+            flushed_segments: receipt.flushed_segments,
+            flush: receipt.flush.map(FlushResponse::from),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlushResponse {
+    pub segment_uri: String,
+    pub span_count: usize,
+    pub total_bytes: usize,
+}
+
+impl From<FlushReceipt> for FlushResponse {
+    fn from(receipt: FlushReceipt) -> Self {
+        Self {
+            segment_uri: receipt.segment_uri,
+            span_count: receipt.span_count,
+            total_bytes: receipt.total_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunsResponse {
+    pub runs: Vec<RunResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunResponse {
+    pub project_name: String,
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_span_id: Option<String>,
+    pub name: String,
+    pub run_type: String,
+    pub status: String,
+    pub start_time_unix_nano: i64,
+    pub end_time_unix_nano: i64,
+    pub is_root: bool,
+}
+
+impl From<RunSummary> for RunResponse {
+    fn from(run: RunSummary) -> Self {
+        Self {
+            project_name: run.project_name,
+            trace_id: run.trace_id,
+            span_id: run.span_id,
+            parent_span_id: run.parent_span_id,
+            name: run.name,
+            run_type: run.run_type,
+            status: run.status,
+            start_time_unix_nano: run.start_time_unix_nano,
+            end_time_unix_nano: run.end_time_unix_nano,
+            is_root: run.is_root,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ApiError {
+    BadRequest(String),
+    Internal(anyhow::Error),
+}
+
+impl ApiError {
+    fn bad_request(message: String) -> Self {
+        Self::BadRequest(message)
+    }
+}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Internal(error)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            Self::Internal(error) => {
+                tracing::error!(error = %error, "request failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error".to_owned(),
+                )
+            }
+        };
+
+        (status, Json(ErrorResponse { error: message })).into_response()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+    use std::process::Stdio;
+    use std::time::{Duration as StdDuration, Instant};
+
+    use anyhow::{Result, anyhow};
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use object_store::memory::InMemory;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, status};
+    use tokio::process::{Child, Command};
+    use tokio::time::sleep;
+    use tokio_postgres::NoTls;
+    use tower::ServiceExt;
+
+    use super::*;
+    use kevindb::db::run_migrations;
+
+    #[tokio::test]
+    async fn serves_otlp_ingest_and_trace_run_query() -> Result<()> {
+        let mockgres = Mockgres::start().await?;
+        run_migrations(mockgres.postgres_url()).await?;
+
+        let state = ServerState::new(
+            mockgres.postgres_url().to_owned(),
+            Arc::new(InMemory::new()),
+            IngestConfig {
+                max_spans_per_segment: 64,
+                flush_interval: std::time::Duration::ZERO,
+            },
+        );
+        let app = app(state);
+
+        let ingest_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/demo/traces")
+                    .body(Body::from(sample_export().encode_to_vec()))?,
+            )
+            .await?;
+        assert_eq!(ingest_response.status(), StatusCode::OK);
+        let ingest_body: IngestResponse = decode_response(ingest_response.into_body()).await?;
+        assert_eq!(ingest_body.accepted_spans, 2);
+        assert_eq!(ingest_body.flushed_segments, 1);
+
+        let runs_response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/projects/demo/traces/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/runs")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(runs_response.status(), StatusCode::OK);
+        let runs_body: RunsResponse = decode_response(runs_response.into_body()).await?;
+        assert_eq!(
+            runs_body
+                .runs
+                .iter()
+                .map(|run| run.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent.run", "llm.call"]
+        );
+        assert_eq!(
+            runs_body.runs[1].parent_span_id.as_deref(),
+            Some("1111111111111111")
+        );
+
+        mockgres.stop().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_otlp_payloads() -> Result<()> {
+        let state = ServerState::new(
+            "postgresql://127.0.0.1:1/postgres",
+            Arc::new(InMemory::new()),
+            IngestConfig {
+                max_spans_per_segment: 64,
+                flush_interval: std::time::Duration::ZERO,
+            },
+        );
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/demo/traces")
+                    .body(Body::from("not protobuf"))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: ErrorResponse = decode_response(response.into_body()).await?;
+        assert!(body.error.contains("invalid OTLP protobuf"));
+        Ok(())
+    }
+
+    async fn decode_response<T>(body: Body) -> Result<T>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let bytes = to_bytes(body, usize::MAX).await?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    fn sample_export() -> ExportTraceServiceRequest {
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![string_attr("service.name", "agent-api")],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![
+                        Span {
+                            trace_id: repeated_bytes(0xAA, 16),
+                            span_id: repeated_bytes(0x11, 8),
+                            parent_span_id: vec![],
+                            name: "agent.run".to_owned(),
+                            start_time_unix_nano: 1,
+                            end_time_unix_nano: 10,
+                            status: Some(Status {
+                                message: String::new(),
+                                code: status::StatusCode::Ok as i32,
+                            }),
+                            ..Default::default()
+                        },
+                        Span {
+                            trace_id: repeated_bytes(0xAA, 16),
+                            span_id: repeated_bytes(0x22, 8),
+                            parent_span_id: repeated_bytes(0x11, 8),
+                            name: "llm.call".to_owned(),
+                            start_time_unix_nano: 2,
+                            end_time_unix_nano: 9,
+                            status: Some(Status {
+                                message: String::new(),
+                                code: status::StatusCode::Ok as i32,
+                            }),
+                            ..Default::default()
+                        },
+                    ],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    fn string_attr(key: &str, value: &str) -> KeyValue {
+        KeyValue {
+            key: key.to_owned(),
+            key_strindex: 0,
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(value.to_owned())),
+            }),
+        }
+    }
+
+    fn repeated_bytes(byte: u8, len: usize) -> Vec<u8> {
+        vec![byte; len]
+    }
+
+    struct Mockgres {
+        child: Child,
+        postgres_url: String,
+    }
+
+    impl Mockgres {
+        async fn start() -> Result<Self> {
+            let port = portpicker::pick_unused_port()
+                .ok_or_else(|| anyhow!("could not reserve mockgres port"))?;
+            let postgres_url = format!("postgresql://127.0.0.1:{port}/postgres");
+            let child = Command::new("mockgres")
+                .arg("--host")
+                .arg("127.0.0.1")
+                .arg("--port")
+                .arg(port.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+            let mockgres = Self {
+                child,
+                postgres_url,
+            };
+            mockgres.wait_until_ready().await?;
+            Ok(mockgres)
+        }
+
+        fn postgres_url(&self) -> &str {
+            &self.postgres_url
+        }
+
+        async fn stop(mut self) -> Result<()> {
+            self.child.start_kill()?;
+            let _ = self.child.wait().await?;
+            Ok(())
+        }
+
+        async fn wait_until_ready(&self) -> Result<()> {
+            let deadline = Instant::now() + StdDuration::from_secs(5);
+            loop {
+                match tokio_postgres::connect(&self.postgres_url, NoTls).await {
+                    Ok((client, connection)) => {
+                        tokio::spawn(async move {
+                            let _ = connection.await;
+                        });
+                        if client.simple_query("SELECT 1").await.is_ok() {
+                            return Ok(());
+                        }
+                    }
+                    Err(_) if Instant::now() >= deadline => {
+                        return Err(anyhow!(
+                            "mockgres did not become ready on {}",
+                            self.postgres_url
+                        ));
+                    }
+                    Err(_) => {}
+                }
+
+                sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    impl Drop for Mockgres {
+        fn drop(&mut self) {
+            let _ = self.child.start_kill();
+        }
+    }
+
+    #[test]
+    fn reserve_port_smoke_test() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        assert!(listener.local_addr().expect("local addr").port() > 0);
+    }
+}

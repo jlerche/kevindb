@@ -4,6 +4,10 @@ version = "0.0.1"
 edition = "2024"
 rust-version = "1.92"
 
+[workspace]
+members = [".", "crates/kevindb-server"]
+resolver = "3"
+
 [dependencies]
 anyhow = "1.0.100"
 arrow-array = "58.3"
