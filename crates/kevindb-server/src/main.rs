@@ -1,10 +1,11 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use kevindb::db::run_migrations;
 use kevindb::ingest::IngestConfig;
+use kevindb_config::{ObjectStoreConfig, ServerConfig};
 use kevindb_server::{ServerState, app};
+use object_store::ObjectStore;
 use object_store::memory::InMemory;
 
 #[tokio::main]
@@ -16,23 +17,24 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let postgres_url =
-        std::env::var("KEVINDB_POSTGRES_URL").context("KEVINDB_POSTGRES_URL must be set")?;
-    let bind_addr = std::env::var("KEVINDB_BIND_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:3000".to_owned())
-        .parse::<SocketAddr>()
-        .context("KEVINDB_BIND_ADDR must be a socket address")?;
+    let config = ServerConfig::from_env()?;
 
-    run_migrations(&postgres_url).await?;
+    run_migrations(&config.postgres_url).await?;
 
     let state = ServerState::new(
-        postgres_url,
-        Arc::new(InMemory::new()),
+        config.postgres_url,
+        object_store_from_config(config.object_store),
         IngestConfig::default(),
     );
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    tracing::info!(%bind_addr, "kevindb server listening");
+    let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
+    tracing::info!(bind_addr = %config.bind_addr, "kevindb server listening");
 
     axum::serve(listener, app(state)).await?;
     Ok(())
+}
+
+fn object_store_from_config(config: ObjectStoreConfig) -> Arc<dyn ObjectStore> {
+    match config {
+        ObjectStoreConfig::Memory => Arc::new(InMemory::new()),
+    }
 }

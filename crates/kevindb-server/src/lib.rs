@@ -13,6 +13,7 @@ use object_store::ObjectStore;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use tokio_postgres::NoTls;
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -44,16 +45,48 @@ impl ServerState {
     fn query_engine(&self) -> QueryEngine {
         QueryEngine::new(self.postgres_url.clone(), Arc::clone(&self.object_store))
     }
+
+    async fn check_ready(&self) -> anyhow::Result<()> {
+        let (client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
+            .await
+            .context("connect postgres for readiness check")?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::warn!(error = %err, "postgres readiness connection failed");
+            }
+        });
+
+        client
+            .simple_query("SELECT 1")
+            .await
+            .context("run readiness query")?;
+        Ok(())
+    }
 }
 
 pub fn app(state: ServerState) -> Router {
     Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/v1/projects/{project_name}/traces", post(ingest_trace))
         .route(
             "/v1/projects/{project_name}/traces/{trace_id}/runs",
             get(list_trace_runs),
         )
         .with_state(state)
+}
+
+async fn healthz() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok".to_owned(),
+    })
+}
+
+async fn readyz(State(state): State<ServerState>) -> Result<Json<HealthResponse>, ApiError> {
+    state.check_ready().await?;
+    Ok(Json(HealthResponse {
+        status: "ok".to_owned(),
+    }))
 }
 
 async fn ingest_trace(
@@ -79,6 +112,11 @@ async fn list_trace_runs(
     Ok(Json(RunsResponse {
         runs: runs.into_iter().map(RunResponse::from).collect(),
     }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthResponse {
+    pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,7 +244,6 @@ mod tests {
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, status};
     use tokio::process::{Child, Command};
     use tokio::time::sleep;
-    use tokio_postgres::NoTls;
     use tower::ServiceExt;
 
     use super::*;
@@ -226,6 +263,32 @@ mod tests {
             },
         );
         let app = app(state);
+
+        let health_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/healthz")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(health_response.status(), StatusCode::OK);
+        let health_body: HealthResponse = decode_response(health_response.into_body()).await?;
+        assert_eq!(health_body.status, "ok");
+
+        let ready_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/readyz")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(ready_response.status(), StatusCode::OK);
+        let ready_body: HealthResponse = decode_response(ready_response.into_body()).await?;
+        assert_eq!(ready_body.status, "ok");
 
         let ingest_response = app
             .clone()
