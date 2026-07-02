@@ -53,6 +53,7 @@ fn records_to_batch(records: &[SpanRecord]) -> Result<RecordBatch> {
         Field::new("span_id", DataType::Utf8, false),
         Field::new("parent_span_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
+        Field::new("run_type", DataType::Utf8, false),
         Field::new("start_time_unix_nano", DataType::Int64, false),
         Field::new("end_time_unix_nano", DataType::Int64, false),
         Field::new("status_code", DataType::Int32, false),
@@ -87,6 +88,12 @@ fn records_to_batch(records: &[SpanRecord]) -> Result<RecordBatch> {
             records
                 .iter()
                 .map(|record| record.name.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            records
+                .iter()
+                .map(|record| record.run_type.as_str())
                 .collect::<Vec<_>>(),
         )),
         Arc::new(Int64Array::from(
@@ -150,6 +157,7 @@ mod tests {
             },
             parent_span_id: parent_span_id.map(str::to_owned),
             name: name.to_owned(),
+            run_type: "span".to_owned(),
             start_time_unix_nano: 1,
             end_time_unix_nano: 2,
             status_code: 1,

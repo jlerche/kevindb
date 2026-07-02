@@ -14,6 +14,7 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Sta
 use tokio_postgres::NoTls;
 
 use kevindb::ingest::{IngestConfig, Ingestor};
+use kevindb::query::QueryEngine;
 use kevindb::segment::read_span_count;
 use mockgres_support::start_mockgres_with_migrations;
 use tokio::time::Duration;
@@ -74,6 +75,25 @@ async fn ingests_otlp_spans_to_vortex_segment_and_postgres_indexes() -> Result<(
         .await?
         .get(0);
     assert_eq!(parent.as_deref(), Some("1111111111111111"));
+
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store.clone());
+    let runs = query_engine
+        .list_runs_in_trace("demo", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .await?;
+    assert_eq!(
+        runs.iter().map(|run| run.name.as_str()).collect::<Vec<_>>(),
+        vec!["agent.run", "llm.call"]
+    );
+    assert_eq!(runs[0].status, "success");
+    assert_eq!(runs[1].run_type, "llm");
+
+    let trace = query_engine
+        .load_trace_tree("demo", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .await?;
+    assert_eq!(trace.roots.len(), 1);
+    assert_eq!(trace.roots[0].run.name, "agent.run");
+    assert_eq!(trace.roots[0].children.len(), 1);
+    assert_eq!(trace.roots[0].children[0].run.name, "llm.call");
 
     mockgres.stop().await?;
     Ok(())

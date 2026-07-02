@@ -13,6 +13,7 @@ pub struct SpanRecord {
     pub span_id: String,
     pub parent_span_id: Option<String>,
     pub name: String,
+    pub run_type: String,
     pub start_time_unix_nano: i64,
     pub end_time_unix_nano: i64,
     pub status_code: i32,
@@ -65,11 +66,14 @@ fn span_record_from_span(
         .context("span end_time_unix_nano does not fit in postgres BIGINT")?;
     let status_code = span.status.as_ref().map(|status| status.code).unwrap_or(0);
 
+    let span_attributes = attributes_to_json_map(span.attributes);
+    let run_type = infer_run_type(&span.name, &span_attributes);
+
     let mut attributes = Map::new();
     for (key, value) in resource_attributes {
         attributes.insert(format!("resource.{key}"), value.clone());
     }
-    for (key, value) in attributes_to_json_map(span.attributes) {
+    for (key, value) in span_attributes {
         attributes.insert(key, value);
     }
 
@@ -79,11 +83,48 @@ fn span_record_from_span(
         span_id,
         parent_span_id,
         name: span.name,
+        run_type,
         start_time_unix_nano,
         end_time_unix_nano,
         status_code,
         attributes_json: Value::Object(attributes).to_string(),
     })
+}
+
+fn infer_run_type(name: &str, attributes: &BTreeMap<String, Value>) -> String {
+    for key in ["langsmith.run_type", "kevindb.run_type", "run_type"] {
+        if let Some(Value::String(value)) = attributes.get(key) {
+            return normalize_run_type(value);
+        }
+    }
+
+    if let Some(Value::String(value)) = attributes.get("gen_ai.operation.name") {
+        return match value.as_str() {
+            "chat" | "completion" => "llm".to_owned(),
+            "embeddings" => "embedding".to_owned(),
+            _ => "span".to_owned(),
+        };
+    }
+
+    let lower_name = name.to_ascii_lowercase();
+    if lower_name.contains("llm") || lower_name.contains("chat") {
+        "llm".to_owned()
+    } else if lower_name.contains("tool") {
+        "tool".to_owned()
+    } else if lower_name.contains("retriev") {
+        "retriever".to_owned()
+    } else {
+        "span".to_owned()
+    }
+}
+
+fn normalize_run_type(value: &str) -> String {
+    match value.to_ascii_lowercase().as_str() {
+        "chain" | "llm" | "tool" | "retriever" | "embedding" | "prompt" | "parser" => {
+            value.to_ascii_lowercase()
+        }
+        _ => "span".to_owned(),
+    }
 }
 
 fn attributes_to_json_map(attributes: Vec<KeyValue>) -> BTreeMap<String, Value> {
@@ -184,11 +225,36 @@ mod tests {
         assert_eq!(record.span_id, "1111111111111111");
         assert_eq!(record.parent_span_id.as_deref(), Some("2222222222222222"));
         assert_eq!(record.name, "llm.call");
+        assert_eq!(record.run_type, "llm");
         assert_eq!(record.start_time_unix_nano, 1);
         assert_eq!(record.end_time_unix_nano, 2);
         assert_eq!(record.status_code, status::StatusCode::Ok as i32);
         assert!(record.attributes_json.contains("resource.service.name"));
         assert!(record.attributes_json.contains("gen_ai.request.model"));
+    }
+
+    #[test]
+    fn prefers_explicit_run_type_attribute() {
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: None,
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: repeated_bytes(0xAA, 16),
+                        span_id: repeated_bytes(0x11, 8),
+                        name: "custom".to_owned(),
+                        attributes: vec![string_attr("langsmith.run_type", "tool")],
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let records = span_records_from_export("demo", request).expect("convert export");
+        assert_eq!(records[0].run_type, "tool");
     }
 
     #[test]

@@ -265,9 +265,10 @@ async fn persist_metadata(
         tx.execute(
             "INSERT INTO trace_segment_spans(
                 trace_segment_id, project_name, trace_id, span_id, parent_span_id,
-                name, start_time_unix_nano, end_time_unix_nano, status_code, row_index
+                name, run_type, start_time_unix_nano, end_time_unix_nano,
+                status_code, status, is_root, row_index
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
             &[
                 &segment_id,
                 &record.project_name,
@@ -275,9 +276,12 @@ async fn persist_metadata(
                 &record.span_id,
                 &record.parent_span_id,
                 &record.name,
+                &record.run_type,
                 &record.start_time_unix_nano,
                 &record.end_time_unix_nano,
                 &record.status_code,
+                &status_from_record(record),
+                &record.parent_span_id.is_none(),
                 &(row_index as i64),
             ],
         )
@@ -286,18 +290,21 @@ async fn persist_metadata(
 
         tx.execute(
             "INSERT INTO run_heads(
-                project_name, trace_id, span_id, parent_span_id, name,
-                start_time_unix_nano, end_time_unix_nano, status_code,
+                project_name, trace_id, span_id, parent_span_id, name, run_type,
+                start_time_unix_nano, end_time_unix_nano, status_code, status, is_root,
                 last_trace_segment_id, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)
             ON CONFLICT (project_name, trace_id, span_id)
             DO UPDATE SET
                 parent_span_id = EXCLUDED.parent_span_id,
                 name = EXCLUDED.name,
+                run_type = EXCLUDED.run_type,
                 start_time_unix_nano = EXCLUDED.start_time_unix_nano,
                 end_time_unix_nano = EXCLUDED.end_time_unix_nano,
                 status_code = EXCLUDED.status_code,
+                status = EXCLUDED.status,
+                is_root = EXCLUDED.is_root,
                 last_trace_segment_id = EXCLUDED.last_trace_segment_id,
                 updated_at = CURRENT_TIMESTAMP",
             &[
@@ -306,9 +313,12 @@ async fn persist_metadata(
                 &record.span_id,
                 &record.parent_span_id,
                 &record.name,
+                &record.run_type,
                 &record.start_time_unix_nano,
                 &record.end_time_unix_nano,
                 &record.status_code,
+                &status_from_record(record),
+                &record.parent_span_id.is_none(),
                 &segment_id,
             ],
         )
@@ -317,6 +327,16 @@ async fn persist_metadata(
     }
 
     Ok(())
+}
+
+fn status_from_record(record: &SpanRecord) -> String {
+    if record.end_time_unix_nano == 0 {
+        "pending".to_owned()
+    } else if record.status_code == 2 {
+        "error".to_owned()
+    } else {
+        "success".to_owned()
+    }
 }
 
 fn segment_uri(records: &[SpanRecord]) -> Result<String> {
@@ -477,6 +497,7 @@ mod tests {
             span_id: "1111111111111111".to_owned(),
             parent_span_id: None,
             name: "root".to_owned(),
+            run_type: "span".to_owned(),
             start_time_unix_nano: 1,
             end_time_unix_nano: 2,
             status_code: 1,
