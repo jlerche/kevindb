@@ -155,22 +155,66 @@ pub(super) async fn query_runs(
         ));
     }
 
+    let parent_run_id = request
+        .parent_run_id
+        .as_deref()
+        .map(|parent_run_id| canonical_uuid(parent_run_id, "parent_run_id"))
+        .transpose()?;
+    let start_time_min_unix_nano = parse_time_nanos(
+        request
+            .start_time_min
+            .as_deref()
+            .or(request.start_time_gte.as_deref())
+            .or(request.start_time.as_deref()),
+    )?;
+    let start_time_max_unix_nano = parse_time_nanos(
+        request
+            .start_time_max
+            .as_deref()
+            .or(request.start_time_lte.as_deref())
+            .or(request.end_time.as_deref()),
+    )?;
+    let offset = request.cursor_offset().or(request.offset);
+    let limit = request.limit;
     let runs = state
         .query_engine()
         .list_runs(RunQuery {
             project_names,
             trace_id: normalize_trace_filter(request.trace_id),
+            parent_run_id,
+            parent_span_id: request.parent_span_id,
             run_type: request.run_type,
             is_root: request.is_root,
             error: request.error,
-            limit: request.limit,
+            start_time_min_unix_nano,
+            start_time_max_unix_nano,
+            limit: limit.map(|limit| limit.saturating_add(1)),
+            offset,
         })
         .await
         .context("query runs")?;
 
-    Ok(Json(RunsResponse::new(
-        runs.into_iter().map(RunResponse::from).collect(),
+    Ok(Json(RunsResponse::from_runs_with_limit(
+        runs, limit, offset,
     )))
+}
+
+pub(super) async fn read_project_trace(
+    State(state): State<ServerState>,
+    Path((project_name, trace_id)): Path<(String, String)>,
+) -> Result<Json<TraceResponse>, ApiError> {
+    let trace_id = normalize_trace_filter(Some(trace_id)).unwrap_or_default();
+    let runs = state
+        .query_engine()
+        .list_runs_in_trace(&project_name, &trace_id)
+        .await
+        .with_context(|| format!("read trace {trace_id}"))?;
+
+    if runs.is_empty() {
+        return Err(ApiError::not_found("trace not found".to_owned()));
+    }
+
+    Ok(Json(TraceResponse::from_runs(project_name, trace_id, runs)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -364,10 +408,15 @@ impl ServerState {
             .list_runs(RunQuery {
                 project_names: vec![existing.project_name],
                 trace_id: Some(existing.trace_id),
+                parent_run_id: None,
+                parent_span_id: None,
                 run_type: None,
                 is_root: None,
                 error: None,
+                start_time_min_unix_nano: None,
+                start_time_max_unix_nano: None,
                 limit: None,
+                offset: None,
             })
             .await
             .context("load run summary by id")?;
@@ -387,10 +436,15 @@ impl ServerState {
             .list_runs(RunQuery {
                 project_names: vec![existing.project_name.clone()],
                 trace_id: Some(existing.trace_id.clone()),
+                parent_run_id: None,
+                parent_span_id: None,
                 run_type: None,
                 is_root: None,
                 error: None,
+                start_time_min_unix_nano: None,
+                start_time_max_unix_nano: None,
                 limit: None,
+                offset: None,
             })
             .await
             .context("load run payload")?;
@@ -494,6 +548,10 @@ pub struct RunsQueryRequest {
     pub session: Option<StringList>,
     #[serde(default, alias = "trace")]
     pub trace_id: Option<String>,
+    #[serde(default, alias = "parent_run")]
+    pub parent_run_id: Option<String>,
+    #[serde(default)]
+    pub parent_span_id: Option<String>,
     #[serde(default)]
     pub run_type: Option<String>,
     #[serde(default)]
@@ -501,7 +559,32 @@ pub struct RunsQueryRequest {
     #[serde(default)]
     pub error: Option<bool>,
     #[serde(default)]
+    pub start_time: Option<String>,
+    #[serde(default)]
+    pub end_time: Option<String>,
+    #[serde(default, alias = "start_time_after")]
+    pub start_time_gte: Option<String>,
+    #[serde(default, alias = "start_time_before")]
+    pub start_time_lte: Option<String>,
+    #[serde(default, alias = "start_time_min")]
+    pub start_time_min: Option<String>,
+    #[serde(default, alias = "start_time_max")]
+    pub start_time_max: Option<String>,
+    #[serde(default)]
     pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+impl RunsQueryRequest {
+    fn cursor_offset(&self) -> Option<usize> {
+        self.cursor
+            .as_deref()
+            .filter(|cursor| !cursor.trim().is_empty())
+            .and_then(|cursor| cursor.parse().ok())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -527,6 +610,32 @@ pub struct RunsResponse {
     pub cursors: CursorResponse,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceResponse {
+    pub project_name: String,
+    pub trace_id: String,
+    pub root_run_ids: Vec<String>,
+    pub runs: Vec<RunResponse>,
+}
+
+impl TraceResponse {
+    fn from_runs(project_name: String, trace_id: String, runs: Vec<RunSummary>) -> Self {
+        let runs = RunsResponse::new(runs.into_iter().map(RunResponse::from).collect()).runs;
+        let root_run_ids = runs
+            .iter()
+            .filter(|run| run.is_root)
+            .map(|run| run.id.clone())
+            .collect();
+
+        Self {
+            project_name,
+            trace_id,
+            root_run_ids,
+            runs,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorResponse {
     pub next: Option<String>,
@@ -535,8 +644,29 @@ pub struct CursorResponse {
 impl RunsResponse {
     pub fn new(runs: Vec<RunResponse>) -> Self {
         Self {
-            runs,
+            runs: runs_with_children(runs),
             cursors: CursorResponse { next: None },
+        }
+    }
+
+    fn from_runs_with_limit(
+        runs: Vec<RunSummary>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Self {
+        let mut runs = runs.into_iter().map(RunResponse::from).collect::<Vec<_>>();
+        let next = limit.and_then(|limit| {
+            if runs.len() > limit {
+                runs.truncate(limit);
+                Some(offset.unwrap_or(0).saturating_add(limit).to_string())
+            } else {
+                None
+            }
+        });
+
+        Self {
+            runs: runs_with_children(runs),
+            cursors: CursorResponse { next },
         }
     }
 }
@@ -608,6 +738,24 @@ impl From<RunSummary> for RunResponse {
             child_run_ids: Vec::new(),
         }
     }
+}
+
+fn runs_with_children(mut runs: Vec<RunResponse>) -> Vec<RunResponse> {
+    let mut children_by_parent = HashMap::<String, Vec<String>>::new();
+    for run in &runs {
+        if let Some(parent_run_id) = &run.parent_run_id {
+            children_by_parent
+                .entry(parent_run_id.clone())
+                .or_default()
+                .push(run.id.clone());
+        }
+    }
+
+    for run in &mut runs {
+        run.child_run_ids = children_by_parent.remove(&run.id).unwrap_or_default();
+    }
+
+    runs
 }
 
 fn tenant_uuid() -> Uuid {

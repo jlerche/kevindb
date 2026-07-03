@@ -17,8 +17,10 @@ use tokio_postgres::NoTls;
 
 mod langsmith;
 
-pub use langsmith::{ProjectResponse, RunResponse, RunsQueryRequest, RunsResponse, StringList};
-use langsmith::{create_run, list_sessions, query_runs, read_run, update_run};
+pub use langsmith::{
+    ProjectResponse, RunResponse, RunsQueryRequest, RunsResponse, StringList, TraceResponse,
+};
+use langsmith::{create_run, list_sessions, query_runs, read_project_trace, read_run, update_run};
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -86,6 +88,10 @@ pub fn app(state: ServerState) -> Router {
         .route("/runs/query", post(query_runs))
         .route("/v1/runs/query", post(query_runs))
         .route("/v1/projects/{project_name}/traces", post(ingest_trace))
+        .route(
+            "/v1/projects/{project_name}/traces/{trace_id}",
+            get(read_project_trace),
+        )
         .route(
             "/v1/projects/{project_name}/traces/{trace_id}/runs",
             get(list_trace_runs),
@@ -344,6 +350,23 @@ mod tests {
         );
         assert!(runs_body.runs[1].parent_run_id.is_some());
 
+        let trace_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/projects/demo/traces/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(trace_response.status(), StatusCode::OK);
+        let trace_body: TraceResponse = decode_response(trace_response.into_body()).await?;
+        assert_eq!(trace_body.root_run_ids, vec![trace_body.runs[0].id.clone()]);
+        assert_eq!(
+            trace_body.runs[0].child_run_ids,
+            vec![trace_body.runs[1].id.clone()]
+        );
+
         let langsmith_response = app
             .clone()
             .oneshot(
@@ -363,6 +386,68 @@ mod tests {
         assert_eq!(langsmith_body.runs.len(), 1);
         assert_eq!(langsmith_body.runs[0].name, "llm.call");
         assert_eq!(langsmith_body.runs[0].inputs, json!({}));
+
+        let filtered_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runs/query")
+                    .header("content-type", "application/json")
+                    .body(json_body(json!({
+                        "project_name": "demo",
+                        "parent_span_id": "1111111111111111",
+                        "start_time_gte": "1970-01-01T00:00:00.000000002Z"
+                    })))?,
+            )
+            .await?;
+        assert_eq!(filtered_response.status(), StatusCode::OK);
+        let filtered_body: RunsResponse = decode_response(filtered_response.into_body()).await?;
+        assert_eq!(
+            filtered_body
+                .runs
+                .iter()
+                .map(|run| run.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["llm.call"]
+        );
+
+        let first_page_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runs/query")
+                    .header("content-type", "application/json")
+                    .body(json_body(json!({
+                        "project_name": "demo",
+                        "limit": 1
+                    })))?,
+            )
+            .await?;
+        assert_eq!(first_page_response.status(), StatusCode::OK);
+        let first_page: RunsResponse = decode_response(first_page_response.into_body()).await?;
+        assert_eq!(first_page.runs[0].name, "agent.run");
+        assert_eq!(first_page.cursors.next.as_deref(), Some("1"));
+
+        let second_page_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runs/query")
+                    .header("content-type", "application/json")
+                    .body(json_body(json!({
+                        "project_name": "demo",
+                        "limit": 1,
+                        "cursor": first_page.cursors.next
+                    })))?,
+            )
+            .await?;
+        assert_eq!(second_page_response.status(), StatusCode::OK);
+        let second_page: RunsResponse = decode_response(second_page_response.into_body()).await?;
+        assert_eq!(second_page.runs[0].name, "llm.call");
+        assert_eq!(second_page.cursors.next, None);
 
         let root_response = app
             .oneshot(

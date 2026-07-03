@@ -47,10 +47,15 @@ pub struct TraceTree {
 pub struct RunQuery {
     pub project_names: Vec<String>,
     pub trace_id: Option<String>,
+    pub parent_run_id: Option<String>,
+    pub parent_span_id: Option<String>,
     pub run_type: Option<String>,
     pub is_root: Option<bool>,
     pub error: Option<bool>,
+    pub start_time_min_unix_nano: Option<i64>,
+    pub start_time_max_unix_nano: Option<i64>,
     pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }
 
 impl RunQuery {
@@ -58,10 +63,15 @@ impl RunQuery {
         Self {
             project_names: vec![project_name.into()],
             trace_id: None,
+            parent_run_id: None,
+            parent_span_id: None,
             run_type: None,
             is_root: None,
             error: None,
+            start_time_min_unix_nano: None,
+            start_time_max_unix_nano: None,
             limit: None,
+            offset: None,
         }
     }
 }
@@ -87,10 +97,15 @@ impl QueryEngine {
         self.list_runs(RunQuery {
             project_names: vec![project_name.to_owned()],
             trace_id: Some(trace_id.to_owned()),
+            parent_run_id: None,
+            parent_span_id: None,
             run_type: None,
             is_root: None,
             error: None,
+            start_time_min_unix_nano: None,
+            start_time_max_unix_nano: None,
             limit: None,
+            offset: None,
         })
         .await
     }
@@ -178,6 +193,11 @@ async fn query_trace_segments_with_datafusion(
         .limit
         .map(|limit| format!(" LIMIT {limit}"))
         .unwrap_or_default();
+    let offset_sql = query
+        .offset
+        .filter(|offset| *offset > 0)
+        .map(|offset| format!(" OFFSET {offset}"))
+        .unwrap_or_default();
 
     let sql = format!(
         "SELECT
@@ -214,7 +234,7 @@ async fn query_trace_segments_with_datafusion(
             ) AS versioned_runs
         ) AS runs
         WHERE run_version = 1 AND {where_sql}
-        ORDER BY start_time_unix_nano ASC, span_id ASC{limit_sql}",
+        ORDER BY start_time_unix_nano ASC, span_id ASC{limit_sql}{offset_sql}",
     );
     let dataframe = context
         .sql(&sql)
@@ -244,6 +264,18 @@ fn run_query_where_sql(query: &RunQuery) -> String {
     if let Some(trace_id) = &query.trace_id {
         predicates.push(format!("trace_id = {}", sql_string_literal(trace_id)));
     }
+    if let Some(parent_run_id) = &query.parent_run_id {
+        predicates.push(format!(
+            "parent_run_id = {}",
+            sql_string_literal(parent_run_id)
+        ));
+    }
+    if let Some(parent_span_id) = &query.parent_span_id {
+        predicates.push(format!(
+            "parent_span_id = {}",
+            sql_string_literal(parent_span_id)
+        ));
+    }
     if let Some(run_type) = &query.run_type {
         predicates.push(format!("run_type = {}", sql_string_literal(run_type)));
     }
@@ -259,6 +291,16 @@ fn run_query_where_sql(query: &RunQuery) -> String {
         } else {
             predicates.push("status <> 'error'".to_owned());
         }
+    }
+    if let Some(start_time_min_unix_nano) = query.start_time_min_unix_nano {
+        predicates.push(format!(
+            "start_time_unix_nano >= {start_time_min_unix_nano}"
+        ));
+    }
+    if let Some(start_time_max_unix_nano) = query.start_time_max_unix_nano {
+        predicates.push(format!(
+            "start_time_unix_nano <= {start_time_max_unix_nano}"
+        ));
     }
 
     if predicates.is_empty() {
@@ -527,10 +569,15 @@ mod tests {
             &RunQuery {
                 project_names: vec!["demo".to_owned()],
                 trace_id: Some(TRACE_ID.to_owned()),
+                parent_run_id: None,
+                parent_span_id: None,
                 run_type: None,
                 is_root: None,
                 error: None,
+                start_time_min_unix_nano: None,
+                start_time_max_unix_nano: None,
                 limit: None,
+                offset: None,
             },
         )
         .await
@@ -573,10 +620,15 @@ mod tests {
             &RunQuery {
                 project_names: vec!["demo".to_owned()],
                 trace_id: None,
+                parent_run_id: None,
+                parent_span_id: None,
                 run_type: Some("llm".to_owned()),
                 is_root: Some(false),
                 error: Some(true),
+                start_time_min_unix_nano: None,
+                start_time_max_unix_nano: None,
                 limit: Some(1),
+                offset: None,
             },
         )
         .await
@@ -608,10 +660,15 @@ mod tests {
             &RunQuery {
                 project_names: vec!["demo".to_owned()],
                 trace_id: Some(TRACE_ID.to_owned()),
+                parent_run_id: None,
+                parent_span_id: None,
                 run_type: None,
                 is_root: None,
                 error: Some(false),
+                start_time_min_unix_nano: None,
+                start_time_max_unix_nano: None,
                 limit: None,
+                offset: None,
             },
         )
         .await
@@ -624,10 +681,15 @@ mod tests {
             &RunQuery {
                 project_names: vec!["demo".to_owned()],
                 trace_id: Some(TRACE_ID.to_owned()),
+                parent_run_id: None,
+                parent_span_id: None,
                 run_type: None,
                 is_root: None,
                 error: Some(true),
+                start_time_min_unix_nano: None,
+                start_time_max_unix_nano: None,
                 limit: None,
+                offset: None,
             },
         )
         .await
@@ -669,12 +731,17 @@ mod tests {
             run_query_where_sql(&RunQuery {
                 project_names: vec!["demo".to_owned()],
                 trace_id: Some("trace".to_owned()),
+                parent_run_id: Some("parent-run".to_owned()),
+                parent_span_id: Some("parent-span".to_owned()),
                 run_type: Some("llm".to_owned()),
                 is_root: Some(false),
                 error: Some(false),
+                start_time_min_unix_nano: Some(10),
+                start_time_max_unix_nano: Some(20),
                 limit: None,
+                offset: None,
             }),
-            "project_name IN ('demo') AND trace_id = 'trace' AND run_type = 'llm' AND is_root = false AND status <> 'error'"
+            "project_name IN ('demo') AND trace_id = 'trace' AND parent_run_id = 'parent-run' AND parent_span_id = 'parent-span' AND run_type = 'llm' AND is_root = false AND status <> 'error' AND start_time_unix_nano >= 10 AND start_time_unix_nano <= 20"
         );
     }
 
