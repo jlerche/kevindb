@@ -49,8 +49,10 @@ pub async fn read_span_count(payload: Bytes) -> Result<usize> {
 fn records_to_batch(records: &[SpanRecord]) -> Result<RecordBatch> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("project_name", DataType::Utf8, false),
+        Field::new("run_id", DataType::Utf8, false),
         Field::new("trace_id", DataType::Utf8, false),
         Field::new("span_id", DataType::Utf8, false),
+        Field::new("parent_run_id", DataType::Utf8, true),
         Field::new("parent_span_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
         Field::new("run_type", DataType::Utf8, false),
@@ -60,6 +62,10 @@ fn records_to_batch(records: &[SpanRecord]) -> Result<RecordBatch> {
         Field::new("attributes_json", DataType::Utf8, false),
     ]));
 
+    let parent_run_ids: Vec<Option<&str>> = records
+        .iter()
+        .map(|record| record.parent_run_id.as_deref())
+        .collect();
     let parent_span_ids: Vec<Option<&str>> = records
         .iter()
         .map(|record| record.parent_span_id.as_deref())
@@ -74,6 +80,12 @@ fn records_to_batch(records: &[SpanRecord]) -> Result<RecordBatch> {
         Arc::new(StringArray::from(
             records
                 .iter()
+                .map(|record| record.run_id.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            records
+                .iter()
                 .map(|record| record.trace_id.as_str())
                 .collect::<Vec<_>>(),
         )),
@@ -83,6 +95,7 @@ fn records_to_batch(records: &[SpanRecord]) -> Result<RecordBatch> {
                 .map(|record| record.span_id.as_str())
                 .collect::<Vec<_>>(),
         )),
+        Arc::new(StringArray::from(parent_run_ids)),
         Arc::new(StringArray::from(parent_span_ids)),
         Arc::new(StringArray::from(
             records
@@ -149,12 +162,14 @@ mod tests {
     fn span_record(name: &str, parent_span_id: Option<&str>) -> SpanRecord {
         SpanRecord {
             project_name: "demo".to_owned(),
+            run_id: String::new(),
             trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             span_id: if parent_span_id.is_some() {
                 "2222222222222222".to_owned()
             } else {
                 "1111111111111111".to_owned()
             },
+            parent_run_id: None,
             parent_span_id: parent_span_id.map(str::to_owned),
             name: name.to_owned(),
             run_type: "span".to_owned(),

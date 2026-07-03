@@ -9,8 +9,10 @@ use serde_json::{Map, Value, json};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpanRecord {
     pub project_name: String,
+    pub run_id: String,
     pub trace_id: String,
     pub span_id: String,
+    pub parent_run_id: Option<String>,
     pub parent_span_id: Option<String>,
     pub name: String,
     pub run_type: String,
@@ -79,8 +81,10 @@ fn span_record_from_span(
 
     Ok(SpanRecord {
         project_name,
+        run_id: String::new(),
         trace_id,
         span_id,
+        parent_run_id: None,
         parent_span_id,
         name: span.name,
         run_type,

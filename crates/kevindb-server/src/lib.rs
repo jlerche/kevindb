@@ -5,7 +5,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use kevindb::ingest::{FlushReceipt, IngestConfig, IngestReceipt, Ingestor};
 use kevindb::query::QueryEngine;
@@ -18,7 +18,7 @@ use tokio_postgres::NoTls;
 mod langsmith;
 
 pub use langsmith::{ProjectResponse, RunResponse, RunsQueryRequest, RunsResponse, StringList};
-use langsmith::{list_sessions, query_runs};
+use langsmith::{create_run, list_sessions, query_runs, update_run};
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -75,6 +75,10 @@ pub fn app(state: ServerState) -> Router {
         .route("/readyz", get(readyz))
         .route("/sessions", get(list_sessions))
         .route("/v1/sessions", get(list_sessions))
+        .route("/runs", post(create_run))
+        .route("/v1/runs", post(create_run))
+        .route("/runs/{run_id}", patch(update_run))
+        .route("/v1/runs/{run_id}", patch(update_run))
         .route("/runs/query", post(query_runs))
         .route("/v1/runs/query", post(query_runs))
         .route("/v1/projects/{project_name}/traces", post(ingest_trace))

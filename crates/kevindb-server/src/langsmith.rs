@@ -2,8 +2,11 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Context;
 use axum::Json;
+use axum::extract::Path;
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use chrono::{DateTime, SecondsFormat, Utc};
+use kevindb::otlp::SpanRecord;
 use kevindb::query::{RunQuery, RunSummary};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -85,6 +88,25 @@ impl ServerState {
     }
 }
 
+pub(super) async fn create_run(
+    State(state): State<ServerState>,
+    Json(request): Json<RunWriteRequest>,
+) -> Result<StatusCode, ApiError> {
+    let record = request.into_span_record(&state, None).await?;
+    state.ingestor.ingest_records(vec![record]).await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+pub(super) async fn update_run(
+    State(state): State<ServerState>,
+    Path(run_id): Path<String>,
+    Json(request): Json<RunWriteRequest>,
+) -> Result<StatusCode, ApiError> {
+    let record = request.into_span_record(&state, Some(run_id)).await?;
+    state.ingestor.ingest_records(vec![record]).await?;
+    Ok(StatusCode::OK)
+}
+
 pub(super) async fn list_sessions(
     State(state): State<ServerState>,
     Query(query): Query<ListSessionsQuery>,
@@ -145,6 +167,180 @@ pub(super) struct ListSessionsQuery {
     limit: Option<usize>,
     #[allow(dead_code)]
     include_stats: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RunWriteRequest {
+    id: Option<String>,
+    name: Option<String>,
+    run_type: Option<String>,
+    #[serde(default, alias = "project_name")]
+    session_name: Option<String>,
+    session_id: Option<String>,
+    trace_id: Option<String>,
+    parent_run_id: Option<String>,
+    start_time: Option<String>,
+    end_time: Option<String>,
+    error: Option<String>,
+    inputs: Option<Value>,
+    outputs: Option<Value>,
+    extra: Option<Value>,
+}
+
+impl RunWriteRequest {
+    async fn into_span_record(
+        self,
+        state: &ServerState,
+        path_run_id: Option<String>,
+    ) -> Result<SpanRecord, ApiError> {
+        let run_id = canonical_uuid(
+            self.id
+                .as_deref()
+                .or(path_run_id.as_deref())
+                .ok_or_else(|| ApiError::bad_request("run id is required".to_owned()))?,
+            "run id",
+        )?;
+        let existing = state.load_run_head(&run_id).await?;
+        let project_name = state
+            .resolve_write_project_name(
+                self.session_name.as_deref(),
+                self.session_id.as_deref(),
+                existing.as_ref(),
+            )
+            .await?;
+        let trace_id = self
+            .trace_id
+            .as_deref()
+            .map(|trace_id| uuid_to_otel_trace_id(trace_id, "trace_id"))
+            .transpose()?
+            .or_else(|| existing.as_ref().map(|run| run.trace_id.clone()))
+            .unwrap_or_else(|| uuid_simple(&run_id));
+        let parent_run_id = self
+            .parent_run_id
+            .as_deref()
+            .map(|parent_run_id| canonical_uuid(parent_run_id, "parent_run_id"))
+            .transpose()?
+            .or_else(|| existing.as_ref().and_then(|run| run.parent_run_id.clone()));
+        let parent_span_id = parent_run_id
+            .as_deref()
+            .map(uuid_to_span_id)
+            .or_else(|| existing.as_ref().and_then(|run| run.parent_span_id.clone()));
+        let name = self
+            .name
+            .or_else(|| existing.as_ref().map(|run| run.name.clone()))
+            .ok_or_else(|| ApiError::bad_request("run name is required".to_owned()))?;
+        let run_type = self
+            .run_type
+            .or_else(|| existing.as_ref().map(|run| run.run_type.clone()))
+            .ok_or_else(|| ApiError::bad_request("run_type is required".to_owned()))?;
+        let start_time_unix_nano = parse_time_nanos(self.start_time.as_deref())?
+            .or_else(|| existing.as_ref().map(|run| run.start_time_unix_nano))
+            .unwrap_or_else(current_time_nanos);
+        let end_time_unix_nano = parse_time_nanos(self.end_time.as_deref())?
+            .or_else(|| existing.as_ref().map(|run| run.end_time_unix_nano))
+            .unwrap_or(0);
+        let status_code = if self.error.is_some() {
+            2
+        } else if end_time_unix_nano == 0 {
+            0
+        } else {
+            1
+        };
+        let span_id = uuid_to_span_id(&run_id);
+
+        Ok(SpanRecord {
+            project_name,
+            run_id,
+            trace_id,
+            span_id,
+            parent_run_id,
+            parent_span_id,
+            name,
+            run_type,
+            start_time_unix_nano,
+            end_time_unix_nano,
+            status_code,
+            attributes_json: json!({
+                "langsmith.inputs": self.inputs.unwrap_or_else(|| json!({})),
+                "langsmith.outputs": self.outputs,
+                "langsmith.extra": self.extra.unwrap_or_else(|| json!({})),
+                "langsmith.error": self.error,
+            })
+            .to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredRunHead {
+    project_name: String,
+    trace_id: String,
+    parent_run_id: Option<String>,
+    parent_span_id: Option<String>,
+    name: String,
+    run_type: String,
+    start_time_unix_nano: i64,
+    end_time_unix_nano: i64,
+}
+
+impl ServerState {
+    async fn resolve_write_project_name(
+        &self,
+        session_name: Option<&str>,
+        session_id: Option<&str>,
+        existing: Option<&StoredRunHead>,
+    ) -> Result<String, ApiError> {
+        if let Some(session_name) = session_name.filter(|name| !name.trim().is_empty()) {
+            return Ok(session_name.to_owned());
+        }
+        if let Some(existing) = existing {
+            return Ok(existing.project_name.clone());
+        }
+        if let Some(session_id) = session_id {
+            let mut projects = self
+                .resolve_project_selectors(vec![session_id.to_owned()])
+                .await?;
+            if let Some(project_name) = projects.pop() {
+                return Ok(project_name);
+            }
+        }
+
+        Ok("default".to_owned())
+    }
+
+    async fn load_run_head(&self, run_id: &str) -> Result<Option<StoredRunHead>, ApiError> {
+        let (client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
+            .await
+            .context("connect postgres for run head lookup")?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::warn!(error = %err, "postgres run head lookup connection failed");
+            }
+        });
+
+        let row = client
+            .query_opt(
+                "SELECT project_name, trace_id, parent_run_id, parent_span_id, name,
+                    run_type, start_time_unix_nano, end_time_unix_nano
+                FROM run_heads
+                WHERE run_id = $1
+                LIMIT 1",
+                &[&run_id],
+            )
+            .await
+            .context("load run head by run id")?;
+
+        Ok(row.map(|row| StoredRunHead {
+            project_name: row.get(0),
+            trace_id: row.get(1),
+            parent_run_id: row.get(2),
+            parent_span_id: row.get(3),
+            name: row.get(4),
+            run_type: row.get(5),
+            start_time_unix_nano: row.get(6),
+            end_time_unix_nano: row.get(7),
+        }))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,10 +432,14 @@ pub struct RunResponse {
 
 impl From<RunSummary> for RunResponse {
     fn from(run: RunSummary) -> Self {
-        let id = run_uuid(&run.project_name, &run.trace_id, &run.span_id).to_string();
+        let id = run.run_id.clone().unwrap_or_else(|| {
+            run_uuid(&run.project_name, &run.trace_id, &run.span_id).to_string()
+        });
         let session_id = project_uuid(&run.project_name).to_string();
-        let parent_run_id = run.parent_span_id.as_ref().map(|parent_span_id| {
-            run_uuid(&run.project_name, &run.trace_id, parent_span_id).to_string()
+        let parent_run_id = run.parent_run_id.clone().or_else(|| {
+            run.parent_span_id.as_ref().map(|parent_span_id| {
+                run_uuid(&run.project_name, &run.trace_id, parent_span_id).to_string()
+            })
         });
         let start_time = unix_nano_to_rfc3339(run.start_time_unix_nano);
         let end_time =
@@ -291,12 +491,63 @@ fn run_uuid(project_name: &str, trace_id: &str, span_id: &str) -> Uuid {
     )
 }
 
+fn canonical_uuid(value: &str, field: &str) -> Result<String, ApiError> {
+    Uuid::parse_str(value)
+        .map(|uuid| uuid.to_string())
+        .map_err(|error| ApiError::bad_request(format!("{field} must be a UUID: {error}")))
+}
+
+fn uuid_to_otel_trace_id(value: &str, field: &str) -> Result<String, ApiError> {
+    Uuid::parse_str(value)
+        .map(|uuid| uuid.simple().to_string())
+        .map_err(|error| ApiError::bad_request(format!("{field} must be a UUID: {error}")))
+}
+
+fn uuid_simple(value: &str) -> String {
+    Uuid::parse_str(value)
+        .map(|uuid| uuid.simple().to_string())
+        .unwrap_or_else(|_| value.replace('-', ""))
+}
+
+fn uuid_to_span_id(value: &str) -> String {
+    uuid_simple(value).chars().take(16).collect()
+}
+
 fn normalize_trace_filter(trace_id: Option<String>) -> Option<String> {
     trace_id.map(|trace_id| {
         Uuid::parse_str(&trace_id)
             .map(|uuid| uuid.simple().to_string())
             .unwrap_or(trace_id)
     })
+}
+
+fn parse_time_nanos(value: Option<&str>) -> Result<Option<i64>, ApiError> {
+    value
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map_err(|error| {
+                    ApiError::bad_request(format!("timestamp must be RFC3339: {error}"))
+                })
+                .and_then(|datetime| {
+                    datetime
+                        .timestamp()
+                        .checked_mul(1_000_000_000)
+                        .and_then(|seconds| {
+                            seconds.checked_add(i64::from(datetime.timestamp_subsec_nanos()))
+                        })
+                        .ok_or_else(|| {
+                            ApiError::bad_request("timestamp is out of range".to_owned())
+                        })
+                })
+        })
+        .transpose()
+}
+
+fn current_time_nanos() -> i64 {
+    let now = Utc::now();
+    now.timestamp()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(i64::from(now.timestamp_subsec_nanos()))
 }
 
 fn unix_nano_to_rfc3339(nanos: i64) -> String {
@@ -335,10 +586,14 @@ mod tests {
 
     #[test]
     fn builds_langsmith_run_response_fields() {
+        let run_id = "33333333-3333-5333-8333-333333333333";
+        let parent_run_id = "22222222-2222-5222-8222-222222222222";
         let response = RunResponse::from(RunSummary {
             project_name: "demo".to_owned(),
+            run_id: Some(run_id.to_owned()),
             trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             span_id: "1111111111111111".to_owned(),
+            parent_run_id: Some(parent_run_id.to_owned()),
             parent_span_id: Some("2222222222222222".to_owned()),
             name: "llm.call".to_owned(),
             run_type: "llm".to_owned(),
@@ -348,9 +603,9 @@ mod tests {
             is_root: false,
         });
 
-        assert!(Uuid::parse_str(&response.id).is_ok());
+        assert_eq!(response.id, run_id);
         assert!(Uuid::parse_str(&response.session_id).is_ok());
-        assert!(Uuid::parse_str(response.parent_run_id.as_deref().unwrap()).is_ok());
+        assert_eq!(response.parent_run_id.as_deref(), Some(parent_run_id));
         assert_eq!(response.start_time, "1970-01-01T00:00:00.000000001Z");
         assert_eq!(
             response.end_time.as_deref(),

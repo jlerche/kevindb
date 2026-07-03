@@ -4,7 +4,9 @@ import os
 import socket
 import subprocess
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 import requests
@@ -77,6 +79,50 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
 
         root_runs = list(client.list_runs(project_name=PROJECT_NAME, is_root=True))
         assert [run.name for run in root_runs] == ["agent.run"]
+
+        sdk_root_id = uuid4()
+        sdk_child_id = uuid4()
+        sdk_start = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        client.create_run(
+            id=sdk_root_id,
+            project_name=PROJECT_NAME,
+            trace_id=sdk_root_id,
+            name="sdk.agent",
+            run_type="chain",
+            inputs={"prompt": "hello"},
+            start_time=sdk_start,
+        )
+        client.create_run(
+            id=sdk_child_id,
+            project_name=PROJECT_NAME,
+            trace_id=sdk_root_id,
+            parent_run_id=sdk_root_id,
+            name="sdk.llm",
+            run_type="llm",
+            inputs={"messages": ["hello"]},
+            start_time=sdk_start + timedelta(milliseconds=100),
+        )
+        client.update_run(
+            sdk_child_id,
+            trace_id=sdk_root_id,
+            parent_run_id=sdk_root_id,
+            outputs={"text": "world"},
+            end_time=sdk_start + timedelta(milliseconds=900),
+        )
+        client.update_run(
+            sdk_root_id,
+            trace_id=sdk_root_id,
+            outputs={"answer": "world"},
+            end_time=sdk_start + timedelta(seconds=1),
+        )
+
+        sdk_runs = list(client.list_runs(project_name=PROJECT_NAME, trace_id=sdk_root_id))
+        assert [run.name for run in sdk_runs] == ["sdk.agent", "sdk.llm"]
+        assert str(sdk_runs[0].id) == str(sdk_root_id)
+        assert str(sdk_runs[1].id) == str(sdk_child_id)
+        assert sdk_runs[1].parent_run_id == sdk_root_id
+        assert sdk_runs[0].end_time is not None
+        assert sdk_runs[1].end_time is not None
     finally:
         stop_process(server)
         stop_process(mockgres)

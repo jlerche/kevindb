@@ -82,6 +82,10 @@ impl Ingestor {
         request: ExportTraceServiceRequest,
     ) -> Result<IngestReceipt> {
         let records = span_records_from_export(project_name, request)?;
+        self.ingest_records(records).await
+    }
+
+    pub async fn ingest_records(&self, records: Vec<SpanRecord>) -> Result<IngestReceipt> {
         let accepted_spans = records.len();
         if accepted_spans == 0 {
             return Ok(IngestReceipt {
@@ -264,16 +268,19 @@ async fn persist_metadata(
     for (row_index, record) in records.iter().enumerate() {
         tx.execute(
             "INSERT INTO trace_segment_spans(
-                trace_segment_id, project_name, trace_id, span_id, parent_span_id,
+                trace_segment_id, project_name, run_id, trace_id, span_id,
+                parent_run_id, parent_span_id,
                 name, run_type, start_time_unix_nano, end_time_unix_nano,
                 status_code, status, is_root, row_index
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
             &[
                 &segment_id,
                 &record.project_name,
+                &record.run_id,
                 &record.trace_id,
                 &record.span_id,
+                &record.parent_run_id,
                 &record.parent_span_id,
                 &record.name,
                 &record.run_type,
@@ -290,13 +297,16 @@ async fn persist_metadata(
 
         tx.execute(
             "INSERT INTO run_heads(
-                project_name, trace_id, span_id, parent_span_id, name, run_type,
+                project_name, run_id, trace_id, span_id, parent_run_id, parent_span_id,
+                name, run_type,
                 start_time_unix_nano, end_time_unix_nano, status_code, status, is_root,
                 last_trace_segment_id, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, CURRENT_TIMESTAMP)
             ON CONFLICT (project_name, trace_id, span_id)
             DO UPDATE SET
+                run_id = EXCLUDED.run_id,
+                parent_run_id = EXCLUDED.parent_run_id,
                 parent_span_id = EXCLUDED.parent_span_id,
                 name = EXCLUDED.name,
                 run_type = EXCLUDED.run_type,
@@ -309,8 +319,10 @@ async fn persist_metadata(
                 updated_at = CURRENT_TIMESTAMP",
             &[
                 &record.project_name,
+                &record.run_id,
                 &record.trace_id,
                 &record.span_id,
+                &record.parent_run_id,
                 &record.parent_span_id,
                 &record.name,
                 &record.run_type,
@@ -493,8 +505,10 @@ mod tests {
     fn segment_uri_escapes_project_name() {
         let uri = segment_uri(&[SpanRecord {
             project_name: "demo/project".to_owned(),
+            run_id: String::new(),
             trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             span_id: "1111111111111111".to_owned(),
+            parent_run_id: None,
             parent_span_id: None,
             name: "root".to_owned(),
             run_type: "span".to_owned(),

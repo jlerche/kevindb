@@ -31,6 +31,8 @@ Current endpoints:
 - `GET /healthz`
 - `GET /readyz`
 - `GET /sessions`
+- `POST /runs`
+- `PATCH /runs/{run_id}`
 - `POST /runs/query`
 - `POST /v1/runs/query`
 - `POST /v1/projects/{project_name}/traces`

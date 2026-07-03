@@ -16,8 +16,10 @@ use vortex_datafusion::VortexFormatFactory;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunSummary {
     pub project_name: String,
+    pub run_id: Option<String>,
     pub trace_id: String,
     pub span_id: String,
+    pub parent_run_id: Option<String>,
     pub parent_span_id: Option<String>,
     pub name: String,
     pub run_type: String,
@@ -178,27 +180,38 @@ async fn query_trace_segments_with_datafusion(
 
     let sql = format!(
         "SELECT
-            project_name, trace_id, span_id, parent_span_id, name, run_type, status,
+            project_name, run_id, trace_id, span_id, parent_run_id, parent_span_id,
+            name, run_type, status,
             start_time_unix_nano, end_time_unix_nano, is_root
         FROM (
             SELECT
-                project_name,
-                trace_id,
-                span_id,
-                parent_span_id,
-                name,
-                run_type,
-                CASE
-                    WHEN end_time_unix_nano = 0 THEN 'pending'
-                    WHEN status_code = 2 THEN 'error'
-                    ELSE 'success'
-                END AS status,
-                start_time_unix_nano,
-                end_time_unix_nano,
-                parent_span_id IS NULL AS is_root
-            FROM ({source_sql}) AS segment_spans
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY project_name, trace_id, span_id
+                    ORDER BY end_time_unix_nano DESC, start_time_unix_nano DESC
+                ) AS run_version
+            FROM (
+                SELECT
+                    project_name,
+                    NULLIF(run_id, '') AS run_id,
+                    trace_id,
+                    span_id,
+                    parent_run_id,
+                    parent_span_id,
+                    name,
+                    run_type,
+                    CASE
+                        WHEN end_time_unix_nano = 0 THEN 'pending'
+                        WHEN status_code = 2 THEN 'error'
+                        ELSE 'success'
+                    END AS status,
+                    start_time_unix_nano,
+                    end_time_unix_nano,
+                    parent_span_id IS NULL AS is_root
+                FROM ({source_sql}) AS segment_spans
+            ) AS versioned_runs
         ) AS runs
-        WHERE {where_sql}
+        WHERE run_version = 1 AND {where_sql}
         ORDER BY start_time_unix_nano ASC, span_id ASC{limit_sql}",
     );
     let dataframe = context
@@ -363,26 +376,26 @@ fn run_summaries_from_batches(batches: &[RecordBatch]) -> Result<Vec<RunSummary>
     let mut runs = Vec::new();
     for batch in batches {
         let project_names = string_column(batch, 0, "project_name")?;
-        let trace_ids = string_column(batch, 1, "trace_id")?;
-        let span_ids = string_column(batch, 2, "span_id")?;
-        let parent_span_ids = string_column(batch, 3, "parent_span_id")?;
-        let names = string_column(batch, 4, "name")?;
-        let run_types = string_column(batch, 5, "run_type")?;
-        let statuses = string_column(batch, 6, "status")?;
-        let start_times = int64_column(batch, 7, "start_time_unix_nano")?;
-        let end_times = int64_column(batch, 8, "end_time_unix_nano")?;
-        let roots = bool_column(batch, 9, "is_root")?;
+        let run_ids = string_column(batch, 1, "run_id")?;
+        let trace_ids = string_column(batch, 2, "trace_id")?;
+        let span_ids = string_column(batch, 3, "span_id")?;
+        let parent_run_ids = string_column(batch, 4, "parent_run_id")?;
+        let parent_span_ids = string_column(batch, 5, "parent_span_id")?;
+        let names = string_column(batch, 6, "name")?;
+        let run_types = string_column(batch, 7, "run_type")?;
+        let statuses = string_column(batch, 8, "status")?;
+        let start_times = int64_column(batch, 9, "start_time_unix_nano")?;
+        let end_times = int64_column(batch, 10, "end_time_unix_nano")?;
+        let roots = bool_column(batch, 11, "is_root")?;
 
         for row in 0..batch.num_rows() {
             runs.push(RunSummary {
                 project_name: project_names.value(row).to_owned(),
+                run_id: optional_string_value(&run_ids, row),
                 trace_id: trace_ids.value(row).to_owned(),
                 span_id: span_ids.value(row).to_owned(),
-                parent_span_id: if parent_span_ids.is_null(row) {
-                    None
-                } else {
-                    Some(parent_span_ids.value(row).to_owned())
-                },
+                parent_run_id: optional_string_value(&parent_run_ids, row),
+                parent_span_id: optional_string_value(&parent_span_ids, row),
                 name: names.value(row).to_owned(),
                 run_type: run_types.value(row).to_owned(),
                 status: statuses.value(row).to_owned(),
@@ -394,6 +407,14 @@ fn run_summaries_from_batches(batches: &[RecordBatch]) -> Result<Vec<RunSummary>
     }
 
     Ok(runs)
+}
+
+fn optional_string_value(column: &StringColumn<'_>, row: usize) -> Option<String> {
+    if column.is_null(row) {
+        None
+    } else {
+        Some(column.value(row).to_owned())
+    }
 }
 
 enum StringColumn<'a> {
@@ -561,6 +582,57 @@ mod tests {
         assert_eq!(result[0].name, "child");
     }
 
+    #[tokio::test]
+    async fn datafusion_filters_latest_run_versions() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let segment_uri = "projects/demo/trace-segments/updates.vortex";
+        let records = vec![
+            span_record("root", "demo", TRACE_ID, None, 10, 0, 1),
+            span_record("root", "demo", TRACE_ID, None, 10, 40, 2),
+        ];
+        let payload = encode_span_records(&records)
+            .await
+            .expect("encode Vortex segment");
+        object_store
+            .put(&Path::from(segment_uri), PutPayload::from_bytes(payload))
+            .await
+            .expect("write Vortex segment");
+
+        let successful_runs = query_trace_segments_with_datafusion(
+            Arc::clone(&object_store),
+            vec![segment_uri.to_owned()],
+            &RunQuery {
+                project_names: vec!["demo".to_owned()],
+                trace_id: Some(TRACE_ID.to_owned()),
+                run_type: None,
+                is_root: None,
+                error: Some(false),
+                limit: None,
+            },
+        )
+        .await
+        .expect("query successful runs");
+        assert!(successful_runs.is_empty());
+
+        let error_runs = query_trace_segments_with_datafusion(
+            object_store,
+            vec![segment_uri.to_owned()],
+            &RunQuery {
+                project_names: vec!["demo".to_owned()],
+                trace_id: Some(TRACE_ID.to_owned()),
+                run_type: None,
+                is_root: None,
+                error: Some(true),
+                limit: None,
+            },
+        )
+        .await
+        .expect("query error runs");
+        assert_eq!(error_runs.len(), 1);
+        assert_eq!(error_runs[0].status, "error");
+        assert_eq!(error_runs[0].end_time_unix_nano, 40);
+    }
+
     #[test]
     fn builds_trace_tree_from_runs() {
         let tree = trace_tree_from_runs(
@@ -611,8 +683,10 @@ mod tests {
     ) -> RunSummary {
         RunSummary {
             project_name: project_name.to_owned(),
+            run_id: None,
             trace_id: trace_id.to_owned(),
             span_id: name.to_owned(),
+            parent_run_id: None,
             parent_span_id: parent_span_id.map(str::to_owned),
             name: name.to_owned(),
             run_type: if parent_span_id.is_some() {
@@ -638,8 +712,10 @@ mod tests {
     ) -> SpanRecord {
         SpanRecord {
             project_name: project_name.to_owned(),
+            run_id: String::new(),
             trace_id: trace_id.to_owned(),
             span_id: name.to_owned(),
+            parent_run_id: None,
             parent_span_id: parent_span_id.map(str::to_owned),
             name: name.to_owned(),
             run_type: if parent_span_id.is_some() {
