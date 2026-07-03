@@ -11,6 +11,7 @@ bytes = "1.11.0"
 chrono = "0.4.42"
 kevindb = { path = "../.." }
 kevindb-config = { path = "../kevindb-config" }
+kevindb-metastore-postgres = { path = "../kevindb-metastore-postgres" }
 object_store = "0.13.2"
 opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic-messages", "trace"] }
 prost = "0.14.1"

@@ -1,10 +1,9 @@
-use anyhow::Context;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use kevindb_metastore_postgres::{FeedbackFilter, FeedbackRecord, PostgresMetastore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio_postgres::{NoTls, Row};
 use uuid::Uuid;
 
 use super::{
@@ -18,7 +17,9 @@ pub(crate) async fn create_feedback(
     Json(request): Json<FeedbackWriteRequest>,
 ) -> Result<StatusCode, ApiError> {
     let feedback = request.into_feedback(&state).await?;
-    state.insert_feedback(&feedback).await?;
+    metastore(&state)
+        .insert_feedback(&feedback.to_record()?)
+        .await?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -26,7 +27,12 @@ pub(crate) async fn list_feedback(
     State(state): State<ServerState>,
     Query(query): Query<ListFeedbackQuery>,
 ) -> Result<Json<Vec<FeedbackResponse>>, ApiError> {
-    Ok(Json(state.list_feedback(query, None).await?))
+    let records = metastore(&state)
+        .list_feedback(query.into_filter(None)?)
+        .await?;
+    Ok(Json(
+        records.into_iter().map(FeedbackResponse::from).collect(),
+    ))
 }
 
 pub(crate) async fn list_run_feedback(
@@ -35,7 +41,12 @@ pub(crate) async fn list_run_feedback(
     Query(query): Query<ListFeedbackQuery>,
 ) -> Result<Json<Vec<FeedbackResponse>>, ApiError> {
     let run_id = canonical_uuid(&run_id, "run_id")?;
-    Ok(Json(state.list_feedback(query, Some(run_id)).await?))
+    let records = metastore(&state)
+        .list_feedback(query.into_filter(Some(run_id))?)
+        .await?;
+    Ok(Json(
+        records.into_iter().map(FeedbackResponse::from).collect(),
+    ))
 }
 
 pub(crate) async fn read_feedback(
@@ -43,9 +54,10 @@ pub(crate) async fn read_feedback(
     Path(feedback_id): Path<String>,
 ) -> Result<Json<FeedbackResponse>, ApiError> {
     let feedback_id = canonical_uuid(&feedback_id, "feedback_id")?;
-    let feedback = state
+    let feedback = metastore(&state)
         .load_feedback(&feedback_id)
         .await?
+        .map(FeedbackResponse::from)
         .ok_or_else(|| ApiError::not_found("feedback not found".to_owned()))?;
     Ok(Json(feedback))
 }
@@ -130,94 +142,11 @@ pub struct ListFeedbackQuery {
     offset: Option<usize>,
 }
 
-impl ServerState {
-    async fn insert_feedback(&self, feedback: &FeedbackResponse) -> Result<(), ApiError> {
-        let (client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
-            .await
-            .context("connect postgres for feedback insert")?;
-        tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                tracing::warn!(error = %err, "postgres feedback insert connection failed");
-            }
-        });
-
-        let created_at_unix_nano = parse_time_nanos(Some(&feedback.created_at))?.unwrap_or(0);
-        let modified_at_unix_nano = parse_time_nanos(Some(&feedback.modified_at))?.unwrap_or(0);
-        let score_json = json_option_to_string(&feedback.score);
-        let value_json = json_option_to_string(&feedback.value);
-        let correction_json = json_option_to_string(&feedback.correction);
-        let feedback_source_json = json_option_to_string(&feedback.feedback_source);
-        let extra_json = json_option_to_string(&feedback.extra);
-        client
-            .execute(
-                "INSERT INTO feedback(
-                    id, run_id, trace_id, project_name, key, score_json, value_json,
-                    correction_json, comment, feedback_source_json, extra_json,
-                    created_at_unix_nano, modified_at_unix_nano
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                ON CONFLICT (id) DO UPDATE SET
-                    run_id = EXCLUDED.run_id,
-                    trace_id = EXCLUDED.trace_id,
-                    project_name = EXCLUDED.project_name,
-                    key = EXCLUDED.key,
-                    score_json = EXCLUDED.score_json,
-                    value_json = EXCLUDED.value_json,
-                    correction_json = EXCLUDED.correction_json,
-                    comment = EXCLUDED.comment,
-                    feedback_source_json = EXCLUDED.feedback_source_json,
-                    extra_json = EXCLUDED.extra_json,
-                    modified_at_unix_nano = EXCLUDED.modified_at_unix_nano",
-                &[
-                    &feedback.id,
-                    &feedback.run_id,
-                    &feedback.trace_id,
-                    &feedback.project_name,
-                    &feedback.key,
-                    &score_json,
-                    &value_json,
-                    &correction_json,
-                    &feedback.comment,
-                    &feedback_source_json,
-                    &extra_json,
-                    &created_at_unix_nano,
-                    &modified_at_unix_nano,
-                ],
-            )
-            .await
-            .context("insert feedback")?;
-
-        Ok(())
-    }
-
-    async fn list_feedback(
-        &self,
-        query: ListFeedbackQuery,
-        path_run_id: Option<String>,
-    ) -> Result<Vec<FeedbackResponse>, ApiError> {
-        let (client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
-            .await
-            .context("connect postgres for feedback list")?;
-        tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                tracing::warn!(error = %err, "postgres feedback list connection failed");
-            }
-        });
-
-        let rows = client
-            .query(
-                "SELECT id, run_id, trace_id, project_name, key, score_json, value_json,
-                    correction_json, comment, feedback_source_json, extra_json,
-                    created_at_unix_nano, modified_at_unix_nano
-                FROM feedback
-                ORDER BY created_at_unix_nano ASC, id ASC",
-                &[],
-            )
-            .await
-            .context("list feedback")?;
+impl ListFeedbackQuery {
+    fn into_filter(self, path_run_id: Option<String>) -> Result<FeedbackFilter, ApiError> {
         let run_ids = match path_run_id {
             Some(run_id) => vec![run_id],
-            None => query
+            None => self
                 .run
                 .map(StringList::into_vec)
                 .unwrap_or_default()
@@ -225,51 +154,13 @@ impl ServerState {
                 .map(|run_id| canonical_uuid(&run_id, "run_id"))
                 .collect::<Result<Vec<_>, _>>()?,
         };
-        let keys = query.key.map(StringList::into_vec).unwrap_or_default();
-        let offset = query.offset.unwrap_or(0);
-        let limit = query.limit.unwrap_or(100).min(1000);
 
-        Ok(rows
-            .into_iter()
-            .map(feedback_from_row)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|feedback| {
-                run_ids.is_empty()
-                    || feedback
-                        .run_id
-                        .as_ref()
-                        .is_some_and(|run_id| run_ids.contains(run_id))
-            })
-            .filter(|feedback| keys.is_empty() || keys.contains(&feedback.key))
-            .skip(offset)
-            .take(limit)
-            .collect())
-    }
-
-    async fn load_feedback(&self, feedback_id: &str) -> Result<Option<FeedbackResponse>, ApiError> {
-        let (client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
-            .await
-            .context("connect postgres for feedback lookup")?;
-        tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                tracing::warn!(error = %err, "postgres feedback lookup connection failed");
-            }
-        });
-
-        client
-            .query_opt(
-                "SELECT id, run_id, trace_id, project_name, key, score_json, value_json,
-                    correction_json, comment, feedback_source_json, extra_json,
-                    created_at_unix_nano, modified_at_unix_nano
-                FROM feedback
-                WHERE id = $1",
-                &[&feedback_id],
-            )
-            .await
-            .context("load feedback")?
-            .map(feedback_from_row)
-            .transpose()
+        Ok(FeedbackFilter {
+            run_ids,
+            keys: self.key.map(StringList::into_vec).unwrap_or_default(),
+            limit: self.limit.unwrap_or(100).min(1000),
+            offset: self.offset.unwrap_or(0),
+        })
     }
 }
 
@@ -290,39 +181,44 @@ pub struct FeedbackResponse {
     pub extra: Option<Value>,
 }
 
-fn feedback_from_row(row: Row) -> Result<FeedbackResponse, ApiError> {
-    let created_at_unix_nano: i64 = row.get(11);
-    let modified_at_unix_nano: i64 = row.get(12);
-
-    Ok(FeedbackResponse {
-        id: row.get(0),
-        run_id: row.get(1),
-        trace_id: row.get(2),
-        project_name: row.get(3),
-        key: row.get(4),
-        score: json_string_to_option(row.get(5))?,
-        value: json_string_to_option(row.get(6))?,
-        correction: json_string_to_option(row.get(7))?,
-        comment: row.get(8),
-        feedback_source: json_string_to_option(row.get(9))?,
-        extra: json_string_to_option(row.get(10))?,
-        created_at: unix_nano_to_rfc3339(created_at_unix_nano),
-        modified_at: unix_nano_to_rfc3339(modified_at_unix_nano),
-    })
-}
-
-fn json_option_to_string(value: &Option<Value>) -> Option<String> {
-    value.as_ref().map(Value::to_string)
-}
-
-fn json_string_to_option(value: Option<String>) -> Result<Option<Value>, ApiError> {
-    value
-        .map(|value| {
-            serde_json::from_str(&value)
-                .with_context(|| format!("parse stored feedback JSON value: {value}"))
-                .map_err(ApiError::from)
+impl FeedbackResponse {
+    fn to_record(&self) -> Result<FeedbackRecord, ApiError> {
+        Ok(FeedbackRecord {
+            id: self.id.clone(),
+            run_id: self.run_id.clone(),
+            trace_id: self.trace_id.clone(),
+            project_name: self.project_name.clone(),
+            key: self.key.clone(),
+            score: self.score.clone(),
+            value: self.value.clone(),
+            correction: self.correction.clone(),
+            comment: self.comment.clone(),
+            feedback_source: self.feedback_source.clone(),
+            extra: self.extra.clone(),
+            created_at_unix_nano: parse_time_nanos(Some(&self.created_at))?.unwrap_or(0),
+            modified_at_unix_nano: parse_time_nanos(Some(&self.modified_at))?.unwrap_or(0),
         })
-        .transpose()
+    }
+}
+
+impl From<FeedbackRecord> for FeedbackResponse {
+    fn from(record: FeedbackRecord) -> Self {
+        Self {
+            id: record.id,
+            created_at: unix_nano_to_rfc3339(record.created_at_unix_nano),
+            modified_at: unix_nano_to_rfc3339(record.modified_at_unix_nano),
+            run_id: record.run_id,
+            trace_id: record.trace_id,
+            project_name: record.project_name,
+            key: record.key,
+            score: record.score,
+            value: record.value,
+            correction: record.correction,
+            comment: record.comment,
+            feedback_source: record.feedback_source,
+            extra: record.extra,
+        }
+    }
 }
 
 fn feedback_uuid(run_id: Option<&str>, key: &str, created_at_unix_nano: i64) -> String {
@@ -335,4 +231,8 @@ fn feedback_uuid(run_id: Option<&str>, key: &str, created_at_unix_nano: i64) -> 
         .as_bytes(),
     )
     .to_string()
+}
+
+fn metastore(state: &ServerState) -> PostgresMetastore {
+    PostgresMetastore::new(state.postgres_url.clone())
 }

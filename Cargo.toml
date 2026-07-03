@@ -5,7 +5,12 @@ edition = "2024"
 rust-version = "1.92"
 
 [workspace]
-members = [".", "crates/kevindb-config", "crates/kevindb-server"]
+members = [
+    ".",
+    "crates/kevindb-config",
+    "crates/kevindb-metastore-postgres",
+    "crates/kevindb-server",
+]
 resolver = "3"
 
 [dependencies]

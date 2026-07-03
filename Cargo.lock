@@ -2307,6 +2307,19 @@ name = "kevindb-config"
 version = "0.0.1"
 
 [[package]]
+name = "kevindb-metastore-postgres"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "kevindb",
+ "portpicker",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+]
+
+[[package]]
 name = "kevindb-server"
 version = "0.0.1"
 dependencies = [
@@ -2316,6 +2329,7 @@ dependencies = [
  "chrono",
  "kevindb",
  "kevindb-config",
+ "kevindb-metastore-postgres",
  "object_store",
  "opentelemetry-proto",
  "portpicker",
