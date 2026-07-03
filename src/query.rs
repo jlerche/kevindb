@@ -27,6 +27,7 @@ pub struct RunSummary {
     pub start_time_unix_nano: i64,
     pub end_time_unix_nano: i64,
     pub is_root: bool,
+    pub attributes_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,7 +183,7 @@ async fn query_trace_segments_with_datafusion(
         "SELECT
             project_name, run_id, trace_id, span_id, parent_run_id, parent_span_id,
             name, run_type, status,
-            start_time_unix_nano, end_time_unix_nano, is_root
+            start_time_unix_nano, end_time_unix_nano, is_root, attributes_json
         FROM (
             SELECT
                 *,
@@ -207,7 +208,8 @@ async fn query_trace_segments_with_datafusion(
                     END AS status,
                     start_time_unix_nano,
                     end_time_unix_nano,
-                    parent_span_id IS NULL AS is_root
+                    parent_span_id IS NULL AS is_root,
+                    attributes_json
                 FROM ({source_sql}) AS segment_spans
             ) AS versioned_runs
         ) AS runs
@@ -387,6 +389,7 @@ fn run_summaries_from_batches(batches: &[RecordBatch]) -> Result<Vec<RunSummary>
         let start_times = int64_column(batch, 9, "start_time_unix_nano")?;
         let end_times = int64_column(batch, 10, "end_time_unix_nano")?;
         let roots = bool_column(batch, 11, "is_root")?;
+        let attributes_json_values = string_column(batch, 12, "attributes_json")?;
 
         for row in 0..batch.num_rows() {
             runs.push(RunSummary {
@@ -402,6 +405,7 @@ fn run_summaries_from_batches(batches: &[RecordBatch]) -> Result<Vec<RunSummary>
                 start_time_unix_nano: start_times.value(row),
                 end_time_unix_nano: end_times.value(row),
                 is_root: roots.value(row),
+                attributes_json: attributes_json_values.value(row).to_owned(),
             });
         }
     }
@@ -698,6 +702,7 @@ mod tests {
             start_time_unix_nano,
             end_time_unix_nano: start_time_unix_nano + 10,
             is_root: parent_span_id.is_none(),
+            attributes_json: "{}".to_owned(),
         }
     }
 

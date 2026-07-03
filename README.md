@@ -32,6 +32,7 @@ Current endpoints:
 - `GET /readyz`
 - `GET /sessions`
 - `POST /runs`
+- `GET /runs/{run_id}`
 - `PATCH /runs/{run_id}`
 - `POST /runs/query`
 - `POST /v1/runs/query`

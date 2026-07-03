@@ -5,7 +5,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use kevindb::ingest::{FlushReceipt, IngestConfig, IngestReceipt, Ingestor};
 use kevindb::query::QueryEngine;
@@ -18,7 +18,7 @@ use tokio_postgres::NoTls;
 mod langsmith;
 
 pub use langsmith::{ProjectResponse, RunResponse, RunsQueryRequest, RunsResponse, StringList};
-use langsmith::{create_run, list_sessions, query_runs, update_run};
+use langsmith::{create_run, list_sessions, query_runs, read_run, update_run};
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -77,8 +77,8 @@ pub fn app(state: ServerState) -> Router {
         .route("/v1/sessions", get(list_sessions))
         .route("/runs", post(create_run))
         .route("/v1/runs", post(create_run))
-        .route("/runs/{run_id}", patch(update_run))
-        .route("/v1/runs/{run_id}", patch(update_run))
+        .route("/runs/{run_id}", get(read_run).patch(update_run))
+        .route("/v1/runs/{run_id}", get(read_run).patch(update_run))
         .route("/runs/query", post(query_runs))
         .route("/v1/runs/query", post(query_runs))
         .route("/v1/projects/{project_name}/traces", post(ingest_trace))
@@ -122,9 +122,9 @@ async fn list_trace_runs(
         .list_runs_in_trace(&project_name, &trace_id)
         .await
         .with_context(|| format!("list runs for trace {trace_id}"))?;
-    Ok(Json(RunsResponse {
-        runs: runs.into_iter().map(RunResponse::from).collect(),
-    }))
+    Ok(Json(RunsResponse::new(
+        runs.into_iter().map(RunResponse::from).collect(),
+    )))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,12 +169,17 @@ impl From<FlushReceipt> for FlushResponse {
 #[derive(Debug)]
 enum ApiError {
     BadRequest(String),
+    NotFound(String),
     Internal(anyhow::Error),
 }
 
 impl ApiError {
     fn bad_request(message: String) -> Self {
         Self::BadRequest(message)
+    }
+
+    fn not_found(message: String) -> Self {
+        Self::NotFound(message)
     }
 }
 
@@ -188,6 +193,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
             Self::Internal(error) => {
                 tracing::error!(error = %error, "request failed");
                 (

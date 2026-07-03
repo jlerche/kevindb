@@ -1,8 +1,9 @@
 # LangSmith SDK Integration Test
 
 This is a Python integration test for KevinDB's initial LangSmith-compatible
-read API. It starts `mockgres`, starts `kevindb-server`, ingests one OTLP trace,
-and verifies that `langsmith.Client.list_runs(...)` can read the stored runs.
+API. It starts `mockgres`, starts `kevindb-server`, ingests one OTLP trace,
+and verifies that `langsmith.Client` can create, update, list, and read stored
+runs.
 
 It is intentionally separate from `just check` because it launches external
 processes and exercises the server as a black box.
@@ -34,9 +35,12 @@ can reach `/readyz`.
 - KevinDB server startup against `mockgres`
 - startup migrations
 - OTLP protobuf ingest through `POST /v1/projects/{project_name}/traces`
+- LangSmith run creation through `POST /runs`
+- LangSmith run updates through `PATCH /runs/{run_id}`
 - LangSmith project lookup through `GET /sessions`
 - LangSmith run query through `POST /runs/query`
+- LangSmith run lookup through `GET /runs/{run_id}`
 - LangSmith SDK model parsing of KevinDB's project and run responses
 
-This test does not cover LangSmith write APIs, feedback APIs, cursor pagination,
-or frontend-specific query APIs.
+This test does not cover feedback APIs, real cursor pagination, attachments, or
+frontend-specific query APIs.

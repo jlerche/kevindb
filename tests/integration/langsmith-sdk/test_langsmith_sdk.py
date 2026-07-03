@@ -123,6 +123,16 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
         assert sdk_runs[1].parent_run_id == sdk_root_id
         assert sdk_runs[0].end_time is not None
         assert sdk_runs[1].end_time is not None
+
+        read_child = client.read_run(sdk_child_id)
+        assert read_child.inputs == {"messages": ["hello"]}
+        assert read_child.outputs == {"text": "world"}
+        assert read_child.parent_run_id == sdk_root_id
+        assert str(read_child.trace_id) == str(sdk_root_id)
+
+        read_root = client.read_run(sdk_root_id)
+        assert read_root.inputs == {"prompt": "hello"}
+        assert read_root.outputs == {"answer": "world"}
     finally:
         stop_process(server)
         stop_process(mockgres)

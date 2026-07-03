@@ -107,6 +107,18 @@ pub(super) async fn update_run(
     Ok(StatusCode::OK)
 }
 
+pub(super) async fn read_run(
+    State(state): State<ServerState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<RunResponse>, ApiError> {
+    let run_id = canonical_uuid(&run_id, "run_id")?;
+    let run = state
+        .load_run_summary_by_id(&run_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("run not found".to_owned()))?;
+    Ok(Json(RunResponse::from(run)))
+}
+
 pub(super) async fn list_sessions(
     State(state): State<ServerState>,
     Query(query): Query<ListSessionsQuery>,
@@ -156,9 +168,9 @@ pub(super) async fn query_runs(
         .await
         .context("query runs")?;
 
-    Ok(Json(RunsResponse {
-        runs: runs.into_iter().map(RunResponse::from).collect(),
-    }))
+    Ok(Json(RunsResponse::new(
+        runs.into_iter().map(RunResponse::from).collect(),
+    )))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -201,6 +213,11 @@ impl RunWriteRequest {
             "run id",
         )?;
         let existing = state.load_run_head(&run_id).await?;
+        let existing_payload = if let Some(existing) = &existing {
+            state.load_run_payload(&run_id, existing).await?
+        } else {
+            LangSmithPayload::default()
+        };
         let project_name = state
             .resolve_write_project_name(
                 self.session_name.as_deref(),
@@ -239,7 +256,8 @@ impl RunWriteRequest {
         let end_time_unix_nano = parse_time_nanos(self.end_time.as_deref())?
             .or_else(|| existing.as_ref().map(|run| run.end_time_unix_nano))
             .unwrap_or(0);
-        let status_code = if self.error.is_some() {
+        let payload = existing_payload.merge(self.inputs, self.outputs, self.extra, self.error);
+        let status_code = if payload.error.is_some() {
             2
         } else if end_time_unix_nano == 0 {
             0
@@ -260,13 +278,7 @@ impl RunWriteRequest {
             start_time_unix_nano,
             end_time_unix_nano,
             status_code,
-            attributes_json: json!({
-                "langsmith.inputs": self.inputs.unwrap_or_else(|| json!({})),
-                "langsmith.outputs": self.outputs,
-                "langsmith.extra": self.extra.unwrap_or_else(|| json!({})),
-                "langsmith.error": self.error,
-            })
-            .to_string(),
+            attributes_json: payload.to_attributes_json(),
         })
     }
 }
@@ -341,6 +353,114 @@ impl ServerState {
             end_time_unix_nano: row.get(7),
         }))
     }
+
+    async fn load_run_summary_by_id(&self, run_id: &str) -> Result<Option<RunSummary>, ApiError> {
+        let existing = match self.load_run_head(run_id).await? {
+            Some(existing) => existing,
+            None => return Ok(None),
+        };
+        let runs = self
+            .query_engine()
+            .list_runs(RunQuery {
+                project_names: vec![existing.project_name],
+                trace_id: Some(existing.trace_id),
+                run_type: None,
+                is_root: None,
+                error: None,
+                limit: None,
+            })
+            .await
+            .context("load run summary by id")?;
+
+        Ok(runs
+            .into_iter()
+            .find(|run| run.run_id.as_deref() == Some(run_id)))
+    }
+
+    async fn load_run_payload(
+        &self,
+        run_id: &str,
+        existing: &StoredRunHead,
+    ) -> Result<LangSmithPayload, ApiError> {
+        let runs = self
+            .query_engine()
+            .list_runs(RunQuery {
+                project_names: vec![existing.project_name.clone()],
+                trace_id: Some(existing.trace_id.clone()),
+                run_type: None,
+                is_root: None,
+                error: None,
+                limit: None,
+            })
+            .await
+            .context("load run payload")?;
+
+        Ok(runs
+            .into_iter()
+            .find(|run| run.run_id.as_deref() == Some(run_id))
+            .map(|run| LangSmithPayload::from_attributes_json(&run.attributes_json))
+            .unwrap_or_default())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct LangSmithPayload {
+    inputs: Option<Value>,
+    outputs: Option<Value>,
+    extra: Option<Value>,
+    error: Option<String>,
+}
+
+impl LangSmithPayload {
+    fn from_attributes_json(attributes_json: &str) -> Self {
+        let Ok(Value::Object(attributes)) = serde_json::from_str(attributes_json) else {
+            return Self::default();
+        };
+
+        Self {
+            inputs: attributes
+                .get("langsmith.inputs")
+                .filter(|value| !value.is_null())
+                .cloned(),
+            outputs: attributes
+                .get("langsmith.outputs")
+                .filter(|value| !value.is_null())
+                .cloned(),
+            extra: attributes
+                .get("langsmith.extra")
+                .filter(|value| !value.is_null())
+                .cloned(),
+            error: attributes
+                .get("langsmith.error")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        }
+    }
+
+    fn merge(
+        self,
+        inputs: Option<Value>,
+        outputs: Option<Value>,
+        extra: Option<Value>,
+        error: Option<String>,
+    ) -> Self {
+        Self {
+            inputs: inputs.or(self.inputs),
+            outputs: outputs.or(self.outputs),
+            extra: extra.or(self.extra),
+            error: error.or(self.error),
+        }
+    }
+
+    fn to_attributes_json(&self) -> String {
+        json!({
+            "langsmith.inputs": self.inputs.clone().unwrap_or_else(|| json!({})),
+            "langsmith.outputs": self.outputs,
+            "langsmith.extra": self.extra.clone().unwrap_or_else(|| json!({})),
+            "langsmith.error": self.error,
+        })
+        .to_string()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,6 +523,22 @@ impl StringList {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunsResponse {
     pub runs: Vec<RunResponse>,
+    #[serde(default)]
+    pub cursors: CursorResponse,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorResponse {
+    pub next: Option<String>,
+}
+
+impl RunsResponse {
+    pub fn new(runs: Vec<RunResponse>) -> Self {
+        Self {
+            runs,
+            cursors: CursorResponse { next: None },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,6 +582,7 @@ impl From<RunSummary> for RunResponse {
             (run.end_time_unix_nano > 0).then(|| unix_nano_to_rfc3339(run.end_time_unix_nano));
         let error = (run.status == "error").then(|| "error".to_owned());
         let dotted_order = format!("{:020}.{}", run.start_time_unix_nano.max(0), run.span_id);
+        let payload = LangSmithPayload::from_attributes_json(&run.attributes_json);
 
         Self {
             id,
@@ -463,10 +600,10 @@ impl From<RunSummary> for RunResponse {
             start_time_unix_nano: run.start_time_unix_nano,
             end_time_unix_nano: run.end_time_unix_nano,
             is_root: run.is_root,
-            inputs: json!({}),
-            outputs: None,
-            extra: json!({}),
-            error,
+            inputs: payload.inputs.unwrap_or_else(|| json!({})),
+            outputs: payload.outputs,
+            extra: payload.extra.unwrap_or_else(|| json!({})),
+            error: payload.error.or(error),
             dotted_order,
             child_run_ids: Vec::new(),
         }
@@ -601,6 +738,13 @@ mod tests {
             start_time_unix_nano: 1,
             end_time_unix_nano: 2,
             is_root: false,
+            attributes_json: json!({
+                "langsmith.inputs": {"messages": ["hello"]},
+                "langsmith.outputs": {"text": "world"},
+                "langsmith.extra": {"metadata": {"key": "value"}},
+                "langsmith.error": "boom",
+            })
+            .to_string(),
         });
 
         assert_eq!(response.id, run_id);
@@ -611,7 +755,27 @@ mod tests {
             response.end_time.as_deref(),
             Some("1970-01-01T00:00:00.000000002Z")
         );
-        assert_eq!(response.error.as_deref(), Some("error"));
-        assert_eq!(response.inputs, json!({}));
+        assert_eq!(response.error.as_deref(), Some("boom"));
+        assert_eq!(response.inputs, json!({"messages": ["hello"]}));
+        assert_eq!(response.outputs, Some(json!({"text": "world"})));
+        assert_eq!(response.extra, json!({"metadata": {"key": "value"}}));
+    }
+
+    #[test]
+    fn merges_partial_langsmith_payload_updates() {
+        let payload = LangSmithPayload {
+            inputs: Some(json!({"prompt": "hello"})),
+            outputs: None,
+            extra: Some(json!({"metadata": {"version": 1}})),
+            error: None,
+        }
+        .merge(None, Some(json!({"answer": "world"})), None, None);
+
+        assert_eq!(payload.inputs, Some(json!({"prompt": "hello"})));
+        assert_eq!(payload.outputs, Some(json!({"answer": "world"})));
+        assert_eq!(payload.extra, Some(json!({"metadata": {"version": 1}})));
+
+        let round_trip = LangSmithPayload::from_attributes_json(&payload.to_attributes_json());
+        assert_eq!(round_trip, payload);
     }
 }
