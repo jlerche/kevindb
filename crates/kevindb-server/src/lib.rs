@@ -51,6 +51,10 @@ impl ServerState {
         QueryEngine::new(self.postgres_url.clone(), Arc::clone(&self.object_store))
     }
 
+    pub async fn flush_pending_ingest(&self) -> anyhow::Result<Vec<FlushReceipt>> {
+        self.ingestor.flush().await
+    }
+
     async fn check_ready(&self) -> anyhow::Result<()> {
         let (client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
             .await
@@ -137,6 +141,7 @@ pub struct IngestResponse {
     pub accepted_spans: usize,
     pub flushed_segments: usize,
     pub flush: Option<FlushResponse>,
+    pub flushes: Vec<FlushResponse>,
 }
 
 impl From<IngestReceipt> for IngestResponse {
@@ -145,6 +150,11 @@ impl From<IngestReceipt> for IngestResponse {
             accepted_spans: receipt.accepted_spans,
             flushed_segments: receipt.flushed_segments,
             flush: receipt.flush.map(FlushResponse::from),
+            flushes: receipt
+                .flushes
+                .into_iter()
+                .map(FlushResponse::from)
+                .collect(),
         }
     }
 }
@@ -244,7 +254,7 @@ mod tests {
             Arc::new(InMemory::new()),
             IngestConfig {
                 max_spans_per_segment: 64,
-                flush_interval: std::time::Duration::ZERO,
+                max_flush_delay: std::time::Duration::ZERO,
             },
         );
         let app = app(state);
@@ -288,6 +298,7 @@ mod tests {
         let ingest_body: IngestResponse = decode_response(ingest_response.into_body()).await?;
         assert_eq!(ingest_body.accepted_spans, 2);
         assert_eq!(ingest_body.flushed_segments, 1);
+        assert_eq!(ingest_body.flushes.len(), 1);
 
         let sessions_response = app
             .clone()
@@ -387,7 +398,7 @@ mod tests {
             Arc::new(InMemory::new()),
             IngestConfig {
                 max_spans_per_segment: 64,
-                flush_interval: std::time::Duration::ZERO,
+                max_flush_delay: std::time::Duration::ZERO,
             },
         );
 

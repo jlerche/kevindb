@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -7,6 +8,8 @@ use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
+use tokio::sync::oneshot;
 use tokio::time::{Duration, sleep};
 use tokio_postgres::NoTls;
 
@@ -16,14 +19,14 @@ use crate::segment::encode_span_records;
 #[derive(Debug, Clone)]
 pub struct IngestConfig {
     pub max_spans_per_segment: usize,
-    pub flush_interval: Duration,
+    pub max_flush_delay: Duration,
 }
 
 impl Default for IngestConfig {
     fn default() -> Self {
         Self {
             max_spans_per_segment: 1024,
-            flush_interval: Duration::from_millis(500),
+            max_flush_delay: Duration::from_millis(500),
         }
     }
 }
@@ -33,6 +36,7 @@ pub struct IngestReceipt {
     pub accepted_spans: usize,
     pub flushed_segments: usize,
     pub flush: Option<FlushReceipt>,
+    pub flushes: Vec<FlushReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +49,16 @@ pub struct FlushReceipt {
 #[derive(Debug, Default)]
 struct PendingBuffer {
     records: Vec<SpanRecord>,
+    waiters: Vec<FlushWaiter>,
+    flushing: bool,
+}
+
+type FlushWaiter = oneshot::Sender<WaiterFlushResult>;
+type WaiterFlushResult = std::result::Result<Vec<FlushReceipt>, String>;
+
+struct FlushBatch {
+    records: Vec<SpanRecord>,
+    waiters: Vec<FlushWaiter>,
 }
 
 pub struct Ingestor {
@@ -52,6 +66,7 @@ pub struct Ingestor {
     object_store: Arc<dyn ObjectStore>,
     config: IngestConfig,
     pending: Mutex<PendingBuffer>,
+    flush_finished: Notify,
 }
 
 impl Ingestor {
@@ -65,6 +80,7 @@ impl Ingestor {
             object_store,
             config,
             pending: Mutex::new(PendingBuffer::default()),
+            flush_finished: Notify::new(),
         }
     }
 
@@ -92,51 +108,123 @@ impl Ingestor {
                 accepted_spans: 0,
                 flushed_segments: 0,
                 flush: None,
+                flushes: Vec::new(),
             });
         }
 
-        let should_flush_now = {
+        let (mut flush_finished, should_flush_now) = {
             let mut pending = self.pending.lock().await;
             pending.records.extend(records);
-            pending.records.len() >= self.config.max_spans_per_segment
+            let (sender, receiver) = oneshot::channel();
+            pending.waiters.push(sender);
+
+            (
+                receiver,
+                pending.records.len() >= self.max_spans_per_segment()
+                    || self.config.max_flush_delay.is_zero(),
+            )
         };
 
-        if !should_flush_now && !self.config.flush_interval.is_zero() {
-            sleep(self.config.flush_interval).await;
+        if should_flush_now {
+            self.flush().await?;
+        } else if !self.config.max_flush_delay.is_zero() {
+            tokio::select! {
+                result = &mut flush_finished => {
+                    let flushes = flushes_from_waiter_result(result)?;
+                    return Ok(receipt_from_flushes(accepted_spans, flushes));
+                }
+                _ = sleep(self.config.max_flush_delay) => {}
+            }
         }
 
-        let flush = self.flush().await?;
-        let flushed_segments = usize::from(flush.is_some());
-
-        Ok(IngestReceipt {
-            accepted_spans,
-            flushed_segments,
-            flush,
-        })
+        self.flush().await?;
+        let flushes = flushes_from_waiter_result(flush_finished.await)?;
+        Ok(receipt_from_flushes(accepted_spans, flushes))
     }
 
-    pub async fn flush(&self) -> Result<Option<FlushReceipt>> {
-        let records = {
-            let mut pending = self.pending.lock().await;
-            if pending.records.is_empty() {
-                return Ok(None);
-            }
-            std::mem::take(&mut pending.records)
-        };
+    pub async fn flush(&self) -> Result<Vec<FlushReceipt>> {
+        let mut receipts = Vec::new();
 
-        match self.persist_records(records).await {
-            Ok(receipt) => Ok(Some(receipt)),
-            Err(err) => {
+        loop {
+            let batch = {
                 let mut pending = self.pending.lock().await;
-                let mut unflushed_records = err.records;
-                unflushed_records.append(&mut pending.records);
-                pending.records = unflushed_records;
-                Err(err.error)
+
+                if pending.flushing {
+                    let notified = self.flush_finished.notified();
+                    drop(pending);
+                    notified.await;
+                    continue;
+                }
+
+                if pending.records.is_empty() {
+                    return Ok(receipts);
+                }
+
+                pending.flushing = true;
+                FlushBatch {
+                    records: std::mem::take(&mut pending.records),
+                    waiters: std::mem::take(&mut pending.waiters),
+                }
+            };
+
+            match self.persist_records(batch.records).await {
+                Ok(batch_receipts) => {
+                    {
+                        let mut pending = self.pending.lock().await;
+                        pending.flushing = false;
+                    }
+                    self.flush_finished.notify_waiters();
+                    notify_waiters(batch.waiters, Ok(batch_receipts.clone()));
+                    receipts.extend(batch_receipts);
+                }
+                Err(err) => {
+                    let (waiters, error) = {
+                        let mut pending = self.pending.lock().await;
+                        let mut unflushed_records = err.records;
+                        unflushed_records.append(&mut pending.records);
+                        pending.records = unflushed_records;
+
+                        let mut waiters = batch.waiters;
+                        waiters.append(&mut pending.waiters);
+                        pending.flushing = false;
+
+                        (waiters, err.error)
+                    };
+
+                    self.flush_finished.notify_waiters();
+                    notify_waiters(waiters, Err(error.to_string()));
+                    return Err(error);
+                }
             }
         }
     }
 
     async fn persist_records(
+        &self,
+        records: Vec<SpanRecord>,
+    ) -> std::result::Result<Vec<FlushReceipt>, PersistError> {
+        let mut remaining_records = records;
+        let mut receipts = Vec::new();
+
+        while !remaining_records.is_empty() {
+            let segment_span_count = self.max_spans_per_segment().min(remaining_records.len());
+            let segment_records = remaining_records
+                .drain(..segment_span_count)
+                .collect::<Vec<_>>();
+
+            match self.persist_segment(segment_records).await {
+                Ok(receipt) => receipts.push(receipt),
+                Err(mut error) => {
+                    error.records.append(&mut remaining_records);
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(receipts)
+    }
+
+    async fn persist_segment(
         &self,
         records: Vec<SpanRecord>,
     ) -> std::result::Result<FlushReceipt, PersistError> {
@@ -208,11 +296,38 @@ impl Ingestor {
             total_bytes: payload.len(),
         })
     }
+
+    fn max_spans_per_segment(&self) -> usize {
+        self.config.max_spans_per_segment.max(1)
+    }
 }
 
 struct PersistError {
     records: Vec<SpanRecord>,
     error: anyhow::Error,
+}
+
+fn notify_waiters(waiters: Vec<FlushWaiter>, result: WaiterFlushResult) {
+    for waiter in waiters {
+        let _ = waiter.send(result.clone());
+    }
+}
+
+fn flushes_from_waiter_result(
+    result: std::result::Result<WaiterFlushResult, oneshot::error::RecvError>,
+) -> Result<Vec<FlushReceipt>> {
+    result
+        .context("ingest flush waiter dropped")?
+        .map_err(|error| anyhow!(error))
+}
+
+fn receipt_from_flushes(accepted_spans: usize, flushes: Vec<FlushReceipt>) -> IngestReceipt {
+    IngestReceipt {
+        accepted_spans,
+        flushed_segments: flushes.len(),
+        flush: flushes.first().cloned(),
+        flushes,
+    }
 }
 
 async fn persist_metadata(
@@ -352,17 +467,21 @@ fn status_from_record(record: &SpanRecord) -> String {
 }
 
 fn segment_uri(records: &[SpanRecord]) -> Result<String> {
+    static NEXT_SEGMENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
     let first = records
         .first()
         .ok_or_else(|| anyhow!("cannot build segment uri for empty records"))?;
-    let now_ms = SystemTime::now()
+    let now_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before unix epoch")?
-        .as_millis();
+        .as_nanos();
+    let sequence = NEXT_SEGMENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     Ok(format!(
-        "projects/{}/trace-segments/{}-{}.vortex",
+        "projects/{}/trace-segments/{}-{}-{}.vortex",
         escape_path_component(&first.project_name),
-        now_ms,
+        now_ns,
+        sequence,
         first.trace_id
     ))
 }
@@ -380,281 +499,4 @@ fn escape_path_component(value: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::net::TcpListener;
-    use std::process::Stdio;
-    use std::time::{Duration as StdDuration, Instant};
-
-    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
-    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
-    use opentelemetry_proto::tonic::resource::v1::Resource;
-    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, status};
-    use tokio::process::{Child, Command};
-    use tokio::time::sleep;
-
-    use super::*;
-    use crate::db::run_migrations;
-
-    #[tokio::test]
-    async fn ingest_otlp_flushes_to_object_store_and_postgres() {
-        let mockgres = Mockgres::start().await.expect("start mockgres");
-        run_migrations(mockgres.postgres_url())
-            .await
-            .expect("run migrations");
-
-        let object_store = Arc::new(InMemory::new());
-        let ingestor = Ingestor::new(
-            mockgres.postgres_url().to_owned(),
-            object_store.clone(),
-            IngestConfig {
-                max_spans_per_segment: 64,
-                flush_interval: Duration::ZERO,
-            },
-        );
-
-        let receipt = ingestor
-            .ingest_otlp("demo", sample_export())
-            .await
-            .expect("ingest otlp");
-        assert_eq!(receipt.accepted_spans, 2);
-        let flush = receipt.flush.expect("ingest should flush");
-        assert_eq!(flush.span_count, 2);
-        assert!(flush.total_bytes > 0);
-        assert!(
-            object_store
-                .head(&Path::from(flush.segment_uri.as_str()))
-                .await
-                .is_ok()
-        );
-
-        let (client, connection) = tokio_postgres::connect(mockgres.postgres_url(), NoTls)
-            .await
-            .expect("connect postgres");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-
-        let segment_count: i64 = client
-            .query_one("SELECT count(*) FROM trace_segments", &[])
-            .await
-            .expect("count segments")
-            .get(0);
-        let span_count: i64 = client
-            .query_one("SELECT count(*) FROM trace_segment_spans", &[])
-            .await
-            .expect("count spans")
-            .get(0);
-        let run_head_count: i64 = client
-            .query_one("SELECT count(*) FROM run_heads", &[])
-            .await
-            .expect("count run heads")
-            .get(0);
-
-        assert_eq!(segment_count, 1);
-        assert_eq!(span_count, 2);
-        assert_eq!(run_head_count, 2);
-
-        mockgres.stop().await.expect("stop mockgres");
-    }
-
-    #[tokio::test]
-    async fn empty_ingest_does_not_flush() {
-        let ingestor = Ingestor::in_memory("postgresql://127.0.0.1:1/postgres");
-
-        let receipt = ingestor
-            .ingest_otlp("demo", ExportTraceServiceRequest::default())
-            .await
-            .expect("empty ingest should not connect to postgres");
-
-        assert_eq!(
-            receipt,
-            IngestReceipt {
-                accepted_spans: 0,
-                flushed_segments: 0,
-                flush: None,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_flush_restores_pending_records() {
-        let ingestor = Ingestor::new(
-            "postgresql://127.0.0.1:1/postgres",
-            Arc::new(InMemory::new()),
-            IngestConfig {
-                max_spans_per_segment: 1,
-                flush_interval: Duration::ZERO,
-            },
-        );
-
-        let error = ingestor
-            .ingest_otlp("demo", sample_export())
-            .await
-            .expect_err("postgres connection should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("connect postgres for ingest metadata")
-        );
-
-        let pending = ingestor.pending.lock().await;
-        assert_eq!(pending.records.len(), 2);
-    }
-
-    #[test]
-    fn segment_uri_escapes_project_name() {
-        let uri = segment_uri(&[SpanRecord {
-            project_name: "demo/project".to_owned(),
-            run_id: String::new(),
-            trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-            span_id: "1111111111111111".to_owned(),
-            parent_run_id: None,
-            parent_span_id: None,
-            name: "root".to_owned(),
-            run_type: "span".to_owned(),
-            start_time_unix_nano: 1,
-            end_time_unix_nano: 2,
-            status_code: 1,
-            attributes_json: "{}".to_owned(),
-        }])
-        .expect("segment uri");
-
-        assert!(uri.starts_with("projects/demo%2Fproject/trace-segments/"));
-        assert!(uri.ends_with("-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.vortex"));
-    }
-
-    fn sample_export() -> ExportTraceServiceRequest {
-        ExportTraceServiceRequest {
-            resource_spans: vec![ResourceSpans {
-                resource: Some(Resource {
-                    attributes: vec![string_attr("service.name", "agent-api")],
-                    dropped_attributes_count: 0,
-                    entity_refs: vec![],
-                }),
-                scope_spans: vec![ScopeSpans {
-                    scope: None,
-                    spans: vec![
-                        Span {
-                            trace_id: repeated_bytes(0xAA, 16),
-                            span_id: repeated_bytes(0x11, 8),
-                            parent_span_id: vec![],
-                            name: "agent.run".to_owned(),
-                            start_time_unix_nano: 1,
-                            end_time_unix_nano: 10,
-                            status: Some(Status {
-                                message: String::new(),
-                                code: status::StatusCode::Ok as i32,
-                            }),
-                            ..Default::default()
-                        },
-                        Span {
-                            trace_id: repeated_bytes(0xAA, 16),
-                            span_id: repeated_bytes(0x22, 8),
-                            parent_span_id: repeated_bytes(0x11, 8),
-                            name: "llm.call".to_owned(),
-                            start_time_unix_nano: 2,
-                            end_time_unix_nano: 9,
-                            attributes: vec![string_attr("gen_ai.request.model", "gpt-test")],
-                            status: Some(Status {
-                                message: String::new(),
-                                code: status::StatusCode::Ok as i32,
-                            }),
-                            ..Default::default()
-                        },
-                    ],
-                    schema_url: String::new(),
-                }],
-                schema_url: String::new(),
-            }],
-        }
-    }
-
-    fn string_attr(key: &str, value: &str) -> KeyValue {
-        KeyValue {
-            key: key.to_owned(),
-            key_strindex: 0,
-            value: Some(AnyValue {
-                value: Some(any_value::Value::StringValue(value.to_owned())),
-            }),
-        }
-    }
-
-    fn repeated_bytes(byte: u8, len: usize) -> Vec<u8> {
-        vec![byte; len]
-    }
-
-    struct Mockgres {
-        child: Child,
-        postgres_url: String,
-    }
-
-    impl Mockgres {
-        async fn start() -> Result<Self> {
-            let port = portpicker::pick_unused_port()
-                .ok_or_else(|| anyhow!("could not reserve mockgres port"))?;
-            let postgres_url = format!("postgresql://127.0.0.1:{port}/postgres");
-            let child = Command::new("mockgres")
-                .arg("--host")
-                .arg("127.0.0.1")
-                .arg("--port")
-                .arg(port.to_string())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .context("spawn mockgres")?;
-            let mockgres = Self {
-                child,
-                postgres_url,
-            };
-            mockgres.wait_until_ready().await?;
-            Ok(mockgres)
-        }
-
-        fn postgres_url(&self) -> &str {
-            &self.postgres_url
-        }
-
-        async fn stop(mut self) -> Result<()> {
-            self.child.start_kill()?;
-            let _ = self.child.wait().await?;
-            Ok(())
-        }
-
-        async fn wait_until_ready(&self) -> Result<()> {
-            let deadline = Instant::now() + StdDuration::from_secs(5);
-            loop {
-                match tokio_postgres::connect(&self.postgres_url, NoTls).await {
-                    Ok((client, connection)) => {
-                        tokio::spawn(async move {
-                            let _ = connection.await;
-                        });
-                        if client.simple_query("SELECT 1").await.is_ok() {
-                            return Ok(());
-                        }
-                    }
-                    Err(_) if Instant::now() >= deadline => {
-                        return Err(anyhow!(
-                            "mockgres did not become ready on {}",
-                            self.postgres_url
-                        ));
-                    }
-                    Err(_) => {}
-                }
-
-                sleep(Duration::from_millis(50)).await;
-            }
-        }
-    }
-
-    impl Drop for Mockgres {
-        fn drop(&mut self) {
-            let _ = self.child.start_kill();
-        }
-    }
-
-    #[test]
-    fn reserve_port_smoke_test() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        assert!(listener.local_addr().expect("local addr").port() > 0);
-    }
-}
+mod tests;

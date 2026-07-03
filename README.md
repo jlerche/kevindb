@@ -23,6 +23,10 @@ Optional environment variables:
 
 - `KEVINDB_BIND_ADDR`: socket address to bind, default `127.0.0.1:3000`.
 - `KEVINDB_OBJECT_STORE`: object store backend, currently only `memory`.
+- `KEVINDB_INGEST_MAX_SPANS_PER_SEGMENT`: max spans per Vortex segment,
+  default `1024`.
+- `KEVINDB_INGEST_MAX_FLUSH_DELAY_MS`: max time an underfilled ingest batch
+  waits before a durable flush, default `500`.
 
 The server always runs migrations on startup.
 

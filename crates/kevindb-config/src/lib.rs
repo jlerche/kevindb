@@ -2,10 +2,15 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
+use std::time::Duration;
 
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
+pub const DEFAULT_INGEST_MAX_FLUSH_DELAY_MS: u64 = 500;
+pub const DEFAULT_INGEST_MAX_SPANS_PER_SEGMENT: usize = 1024;
 pub const DEFAULT_OBJECT_STORE: &str = "memory";
 pub const ENV_BIND_ADDR: &str = "KEVINDB_BIND_ADDR";
+pub const ENV_INGEST_MAX_FLUSH_DELAY_MS: &str = "KEVINDB_INGEST_MAX_FLUSH_DELAY_MS";
+pub const ENV_INGEST_MAX_SPANS_PER_SEGMENT: &str = "KEVINDB_INGEST_MAX_SPANS_PER_SEGMENT";
 pub const ENV_OBJECT_STORE: &str = "KEVINDB_OBJECT_STORE";
 pub const ENV_POSTGRES_URL: &str = "KEVINDB_POSTGRES_URL";
 
@@ -14,6 +19,7 @@ pub struct ServerConfig {
     pub postgres_url: String,
     pub bind_addr: SocketAddr,
     pub object_store: ObjectStoreConfig,
+    pub ingest: IngestConfig,
 }
 
 impl ServerConfig {
@@ -46,13 +52,32 @@ impl ServerConfig {
         let object_store = ObjectStoreConfig::parse(
             &lookup(ENV_OBJECT_STORE).unwrap_or_else(|| DEFAULT_OBJECT_STORE.to_owned()),
         )?;
+        let ingest = IngestConfig {
+            max_spans_per_segment: parse_positive_usize(
+                ENV_INGEST_MAX_SPANS_PER_SEGMENT,
+                lookup(ENV_INGEST_MAX_SPANS_PER_SEGMENT)
+                    .unwrap_or_else(|| DEFAULT_INGEST_MAX_SPANS_PER_SEGMENT.to_string()),
+            )?,
+            max_flush_delay: Duration::from_millis(parse_u64(
+                ENV_INGEST_MAX_FLUSH_DELAY_MS,
+                lookup(ENV_INGEST_MAX_FLUSH_DELAY_MS)
+                    .unwrap_or_else(|| DEFAULT_INGEST_MAX_FLUSH_DELAY_MS.to_string()),
+            )?),
+        };
 
         Ok(Self {
             postgres_url,
             bind_addr,
             object_store,
+            ingest,
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestConfig {
+    pub max_spans_per_segment: usize,
+    pub max_flush_delay: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +100,8 @@ impl ObjectStoreConfig {
 pub enum ConfigError {
     MissingEnv { name: &'static str },
     InvalidBindAddr { value: String },
+    InvalidPositiveInteger { name: &'static str, value: String },
+    InvalidUnsignedInteger { name: &'static str, value: String },
     UnsupportedObjectStore { value: String },
 }
 
@@ -84,6 +111,12 @@ impl Display for ConfigError {
             Self::MissingEnv { name } => write!(f, "{name} must be set"),
             Self::InvalidBindAddr { value } => {
                 write!(f, "{ENV_BIND_ADDR} must be a socket address, got {value}")
+            }
+            Self::InvalidPositiveInteger { name, value } => {
+                write!(f, "{name} must be a positive integer, got {value}")
+            }
+            Self::InvalidUnsignedInteger { name, value } => {
+                write!(f, "{name} must be an unsigned integer, got {value}")
             }
             Self::UnsupportedObjectStore { value } => {
                 write!(f, "{ENV_OBJECT_STORE}={value} is not supported")
@@ -98,6 +131,19 @@ fn parse_bind_addr(value: String) -> Result<SocketAddr, ConfigError> {
     value
         .parse()
         .map_err(|_| ConfigError::InvalidBindAddr { value })
+}
+
+fn parse_positive_usize(name: &'static str, value: String) -> Result<usize, ConfigError> {
+    match value.parse::<usize>() {
+        Ok(parsed) if parsed > 0 => Ok(parsed),
+        _ => Err(ConfigError::InvalidPositiveInteger { name, value }),
+    }
+}
+
+fn parse_u64(name: &'static str, value: String) -> Result<u64, ConfigError> {
+    value
+        .parse()
+        .map_err(|_| ConfigError::InvalidUnsignedInteger { name, value })
 }
 
 #[cfg(test)]
@@ -115,6 +161,13 @@ mod tests {
             DEFAULT_BIND_ADDR.parse::<SocketAddr>().expect("bind addr")
         );
         assert_eq!(config.object_store, ObjectStoreConfig::Memory);
+        assert_eq!(
+            config.ingest,
+            IngestConfig {
+                max_spans_per_segment: DEFAULT_INGEST_MAX_SPANS_PER_SEGMENT,
+                max_flush_delay: Duration::from_millis(DEFAULT_INGEST_MAX_FLUSH_DELAY_MS),
+            }
+        );
     }
 
     #[test]
@@ -123,11 +176,20 @@ mod tests {
             (ENV_POSTGRES_URL, "postgresql://db/postgres"),
             (ENV_BIND_ADDR, "0.0.0.0:8080"),
             (ENV_OBJECT_STORE, "MEMORY"),
+            (ENV_INGEST_MAX_SPANS_PER_SEGMENT, "2048"),
+            (ENV_INGEST_MAX_FLUSH_DELAY_MS, "25"),
         ])
         .expect("parse config");
 
         assert_eq!(config.bind_addr, "0.0.0.0:8080".parse().expect("bind addr"));
         assert_eq!(config.object_store, ObjectStoreConfig::Memory);
+        assert_eq!(
+            config.ingest,
+            IngestConfig {
+                max_spans_per_segment: 2048,
+                max_flush_delay: Duration::from_millis(25),
+            }
+        );
     }
 
     #[test]
@@ -171,6 +233,40 @@ mod tests {
             error,
             ConfigError::UnsupportedObjectStore {
                 value: "local".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_zero_ingest_segment_size() {
+        let error = ServerConfig::from_env_vars([
+            (ENV_POSTGRES_URL, "postgresql://db/postgres"),
+            (ENV_INGEST_MAX_SPANS_PER_SEGMENT, "0"),
+        ])
+        .expect_err("zero segment size");
+
+        assert_eq!(
+            error,
+            ConfigError::InvalidPositiveInteger {
+                name: ENV_INGEST_MAX_SPANS_PER_SEGMENT,
+                value: "0".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_ingest_flush_delay() {
+        let error = ServerConfig::from_env_vars([
+            (ENV_POSTGRES_URL, "postgresql://db/postgres"),
+            (ENV_INGEST_MAX_FLUSH_DELAY_MS, "soon"),
+        ])
+        .expect_err("invalid flush delay");
+
+        assert_eq!(
+            error,
+            ConfigError::InvalidUnsignedInteger {
+                name: ENV_INGEST_MAX_FLUSH_DELAY_MS,
+                value: "soon".to_owned(),
             }
         );
     }

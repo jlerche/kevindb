@@ -28,13 +28,14 @@ async fn ingests_otlp_spans_to_vortex_segment_and_postgres_indexes() -> Result<(
         object_store.clone(),
         IngestConfig {
             max_spans_per_segment: 64,
-            flush_interval: Duration::ZERO,
+            max_flush_delay: Duration::ZERO,
         },
     );
 
     let receipt = ingestor.ingest_otlp("demo", sample_export()).await?;
     assert_eq!(receipt.accepted_spans, 2);
     assert_eq!(receipt.flushed_segments, 1);
+    assert_eq!(receipt.flushes.len(), 1);
 
     let flush = receipt.flush.expect("ingest should flush before returning");
     assert_eq!(flush.span_count, 2);
