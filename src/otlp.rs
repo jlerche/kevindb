@@ -19,7 +19,27 @@ pub struct SpanRecord {
     pub start_time_unix_nano: i64,
     pub end_time_unix_nano: i64,
     pub status_code: i32,
+    pub event_kind: RunEventKind,
     pub attributes_json: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunEventKind {
+    Start,
+    Update,
+    End,
+    Compact,
+}
+
+impl RunEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Update => "update",
+            Self::End => "end",
+            Self::Compact => "compact",
+        }
+    }
 }
 
 pub fn span_records_from_export(
@@ -67,6 +87,11 @@ fn span_record_from_span(
     let end_time_unix_nano = i64::try_from(span.end_time_unix_nano)
         .context("span end_time_unix_nano does not fit in postgres BIGINT")?;
     let status_code = span.status.as_ref().map(|status| status.code).unwrap_or(0);
+    let event_kind = if end_time_unix_nano > 0 || status_code == 2 {
+        RunEventKind::End
+    } else {
+        RunEventKind::Start
+    };
 
     let span_attributes = attributes_to_json_map(span.attributes);
     let run_type = infer_run_type(&span.name, &span_attributes);
@@ -91,6 +116,7 @@ fn span_record_from_span(
         start_time_unix_nano,
         end_time_unix_nano,
         status_code,
+        event_kind,
         attributes_json: Value::Object(attributes).to_string(),
     })
 }
@@ -233,6 +259,7 @@ mod tests {
         assert_eq!(record.start_time_unix_nano, 1);
         assert_eq!(record.end_time_unix_nano, 2);
         assert_eq!(record.status_code, status::StatusCode::Ok as i32);
+        assert_eq!(record.event_kind, RunEventKind::End);
         assert!(record.attributes_json.contains("resource.service.name"));
         assert!(record.attributes_json.contains("gen_ai.request.model"));
     }

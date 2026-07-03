@@ -56,6 +56,8 @@ pub struct RunQuery {
     pub start_time_max_unix_nano: Option<i64>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    pub retention_cutoff_unix_nano: Option<i64>,
+    pub include_deleted: bool,
 }
 
 impl RunQuery {
@@ -72,6 +74,8 @@ impl RunQuery {
             start_time_max_unix_nano: None,
             limit: None,
             offset: None,
+            retention_cutoff_unix_nano: None,
+            include_deleted: false,
         }
     }
 }
@@ -106,19 +110,136 @@ impl QueryEngine {
             start_time_max_unix_nano: None,
             limit: None,
             offset: None,
+            retention_cutoff_unix_nano: None,
+            include_deleted: false,
         })
         .await
     }
 
     pub async fn list_runs(&self, query: RunQuery) -> Result<Vec<RunSummary>> {
         let segment_uris = load_run_query_segment_uris(&self.postgres_url, &query).await?;
-        query_trace_segments_with_datafusion(Arc::clone(&self.object_store), segment_uris, &query)
-            .await
+        let deleted_runs = if query.include_deleted {
+            HashSet::new()
+        } else {
+            load_deleted_run_keys(&self.postgres_url, &query).await?
+        };
+        let runs = query_trace_segments_with_datafusion(
+            Arc::clone(&self.object_store),
+            segment_uris,
+            &query,
+        )
+        .await?;
+        Ok(runs
+            .into_iter()
+            .filter(|run| !deleted_runs.contains(&RunKey::from(run)))
+            .filter(|run| run_matches_retention_filter(run, &query))
+            .collect())
     }
 
     pub async fn load_trace_tree(&self, project_name: &str, trace_id: &str) -> Result<TraceTree> {
         let runs = self.list_runs_in_trace(project_name, trace_id).await?;
         Ok(trace_tree_from_runs(project_name, trace_id, runs))
+    }
+
+    pub async fn delete_run(
+        &self,
+        project_name: &str,
+        trace_id: &str,
+        span_id: &str,
+        reason: Option<&str>,
+    ) -> Result<bool> {
+        let deleted_at_unix_nano = current_time_unix_nano()?;
+        let (mut client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
+            .await
+            .context("connect postgres for run delete")?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::warn!(error = %err, "postgres run delete connection failed");
+            }
+        });
+
+        let tx = client.transaction().await.context("begin run delete")?;
+        let deleted = delete_run_in_tx(
+            &tx,
+            project_name,
+            trace_id,
+            span_id,
+            deleted_at_unix_nano,
+            reason,
+        )
+        .await?;
+        tx.commit().await.context("commit run delete")?;
+        Ok(deleted)
+    }
+
+    pub async fn expire_project_runs_before(
+        &self,
+        project_name: &str,
+        cutoff_unix_nano: i64,
+    ) -> Result<usize> {
+        let (mut client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
+            .await
+            .context("connect postgres for retention expiration")?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::warn!(error = %err, "postgres retention expiration connection failed");
+            }
+        });
+
+        let rows = client
+            .query(
+                "SELECT trace_id, span_id
+                FROM run_heads
+                WHERE project_name = $1
+                    AND start_time_unix_nano < $2
+                    AND deleted_at_unix_nano IS NULL
+                ORDER BY trace_id, span_id",
+                &[&project_name, &cutoff_unix_nano],
+            )
+            .await
+            .context("load retention expiration candidates")?;
+
+        let tx = client
+            .transaction()
+            .await
+            .context("begin retention expiration")?;
+        let deleted_at_unix_nano = current_time_unix_nano()?;
+        let mut deleted = 0;
+        for row in rows {
+            let trace_id: String = row.get(0);
+            let span_id: String = row.get(1);
+            if delete_run_in_tx(
+                &tx,
+                project_name,
+                &trace_id,
+                &span_id,
+                deleted_at_unix_nano,
+                Some("retention_expired"),
+            )
+            .await?
+            {
+                deleted += 1;
+            }
+        }
+        tx.commit().await.context("commit retention expiration")?;
+        Ok(deleted)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RunKey {
+    project_name: String,
+    trace_id: String,
+    span_id: String,
+}
+
+impl From<&RunSummary> for RunKey {
+    fn from(run: &RunSummary) -> Self {
+        Self {
+            project_name: run.project_name.clone(),
+            trace_id: run.trace_id.clone(),
+            span_id: run.span_id.clone(),
+        }
     }
 }
 
@@ -136,41 +257,203 @@ async fn load_run_query_segment_uris(postgres_url: &str, query: &RunQuery) -> Re
         }
     });
 
-    let mut uris = Vec::new();
-    for project_name in &query.project_names {
-        let rows = if let Some(trace_id) = &query.trace_id {
-            client
-                .query(
-                    "SELECT DISTINCT trace_segments.uri
-                    FROM run_heads
-                    INNER JOIN trace_segments
-                        ON trace_segments.id = run_heads.last_trace_segment_id
-                    WHERE run_heads.project_name = $1
-                        AND run_heads.trace_id = $2
-                    ORDER BY trace_segments.uri",
-                    &[project_name, trace_id],
-                )
-                .await
-        } else {
-            client
-                .query(
-                    "SELECT DISTINCT trace_segments.uri
-                    FROM trace_segments
-                    INNER JOIN run_heads
-                        ON run_heads.last_trace_segment_id = trace_segments.id
-                    WHERE run_heads.project_name = $1
-                    ORDER BY trace_segments.uri",
-                    &[project_name],
-                )
-                .await
-        }
+    let rows = client
+        .query(run_candidate_segments_sql(query).as_str(), &[])
+        .await
         .context("load run query segment uris")?;
-
-        uris.extend(rows.into_iter().map(|row| row.get(0)));
-    }
+    let mut uris = rows.into_iter().map(|row| row.get(0)).collect::<Vec<_>>();
     uris.sort();
     uris.dedup();
     Ok(uris)
+}
+
+fn run_candidate_segments_sql(query: &RunQuery) -> String {
+    let where_sql = run_head_where_sql(query);
+    let candidate_limit = query
+        .limit
+        .map(|limit| limit.saturating_add(query.offset.unwrap_or(0)))
+        .filter(|limit| *limit > 0)
+        .map(|limit| format!(" LIMIT {limit}"))
+        .unwrap_or_default();
+
+    format!(
+        "SELECT DISTINCT candidate.uri
+        FROM (
+            SELECT trace_segments.uri, run_heads.start_time_unix_nano, run_heads.span_id
+            FROM run_heads
+            INNER JOIN trace_segments
+                ON trace_segments.id = run_heads.last_trace_segment_id
+            {joins}
+            WHERE {where_sql}
+            ORDER BY run_heads.start_time_unix_nano ASC, run_heads.span_id ASC{candidate_limit}
+        ) AS candidate
+        ORDER BY candidate.uri",
+        joins = run_head_join_sql(query),
+    )
+}
+
+fn run_head_join_sql(query: &RunQuery) -> String {
+    let mut joins = Vec::new();
+    if !query.include_deleted {
+        joins.push(
+            "LEFT JOIN run_deletions
+                ON run_deletions.project_name = run_heads.project_name
+                AND run_deletions.trace_id = run_heads.trace_id
+                AND run_deletions.span_id = run_heads.span_id"
+                .to_owned(),
+        );
+    }
+
+    if joins.is_empty() {
+        String::new()
+    } else {
+        format!("\n            {}", joins.join("\n            "))
+    }
+}
+
+fn run_head_where_sql(query: &RunQuery) -> String {
+    let mut predicates = run_query_predicates(query, "run_heads");
+    predicates.push("trace_segments.compacted_at IS NULL".to_owned());
+
+    if !query.include_deleted {
+        predicates.push("run_heads.deleted_at_unix_nano IS NULL".to_owned());
+        predicates.push("run_deletions.span_id IS NULL".to_owned());
+    }
+
+    if let Some(cutoff) = query.retention_cutoff_unix_nano {
+        predicates.push(format!("run_heads.start_time_unix_nano >= {cutoff}"));
+    }
+
+    predicates.join(" AND ")
+}
+
+async fn load_deleted_run_keys(postgres_url: &str, query: &RunQuery) -> Result<HashSet<RunKey>> {
+    if query.project_names.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let (client, connection) = tokio_postgres::connect(postgres_url, NoTls)
+        .await
+        .context("connect postgres for deleted run lookup")?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "postgres deleted run lookup connection failed");
+        }
+    });
+
+    let mut predicates = vec![format!(
+        "project_name IN ({})",
+        query
+            .project_names
+            .iter()
+            .map(|project_name| sql_string_literal(project_name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )];
+    if let Some(trace_id) = &query.trace_id {
+        predicates.push(format!("trace_id = {}", sql_string_literal(trace_id)));
+    }
+
+    let rows = client
+        .query(
+            format!(
+                "SELECT project_name, trace_id, span_id
+                FROM run_deletions
+                WHERE {}",
+                predicates.join(" AND ")
+            )
+            .as_str(),
+            &[],
+        )
+        .await
+        .context("load deleted runs")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| RunKey {
+            project_name: row.get(0),
+            trace_id: row.get(1),
+            span_id: row.get(2),
+        })
+        .collect())
+}
+
+async fn delete_run_in_tx(
+    tx: &tokio_postgres::Transaction<'_>,
+    project_name: &str,
+    trace_id: &str,
+    span_id: &str,
+    deleted_at_unix_nano: i64,
+    reason: Option<&str>,
+) -> Result<bool> {
+    let updated = tx
+        .execute(
+            "UPDATE run_heads
+            SET deleted_at_unix_nano = $4,
+                deletion_reason = $5,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE project_name = $1
+                AND trace_id = $2
+                AND span_id = $3
+                AND deleted_at_unix_nano IS NULL",
+            &[
+                &project_name,
+                &trace_id,
+                &span_id,
+                &deleted_at_unix_nano,
+                &reason,
+            ],
+        )
+        .await
+        .context("mark run head deleted")?;
+
+    if updated == 0 {
+        return Ok(false);
+    }
+
+    tx.execute(
+        "INSERT INTO run_deletions(
+            project_name, trace_id, span_id, deleted_at_unix_nano, reason
+        )
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (project_name, trace_id, span_id)
+        DO UPDATE SET
+            deleted_at_unix_nano = EXCLUDED.deleted_at_unix_nano,
+            reason = EXCLUDED.reason",
+        &[
+            &project_name,
+            &trace_id,
+            &span_id,
+            &deleted_at_unix_nano,
+            &reason,
+        ],
+    )
+    .await
+    .context("upsert run deletion")?;
+
+    tx.execute(
+        "INSERT INTO trace_segment_delete_vectors(
+            trace_segment_id, project_name, trace_id, span_id, deleted_at_unix_nano, reason
+        )
+        SELECT DISTINCT trace_segment_id, project_name, trace_id, span_id, $4::BIGINT, $5::TEXT
+        FROM trace_segment_spans
+        WHERE project_name = $1 AND trace_id = $2 AND span_id = $3
+        ON CONFLICT (trace_segment_id, project_name, trace_id, span_id)
+        DO UPDATE SET
+            deleted_at_unix_nano = EXCLUDED.deleted_at_unix_nano,
+            reason = EXCLUDED.reason",
+        &[
+            &project_name,
+            &trace_id,
+            &span_id,
+            &deleted_at_unix_nano,
+            &reason,
+        ],
+    )
+    .await
+    .context("write trace segment delete vectors")?;
+
+    Ok(true)
 }
 
 async fn query_trace_segments_with_datafusion(
@@ -209,7 +492,7 @@ async fn query_trace_segments_with_datafusion(
                 *,
                 ROW_NUMBER() OVER (
                     PARTITION BY project_name, trace_id, span_id
-                    ORDER BY end_time_unix_nano DESC, start_time_unix_nano DESC
+                    ORDER BY event_time_unix_nano DESC, end_time_unix_nano DESC, start_time_unix_nano DESC
                 ) AS run_version
             FROM (
                 SELECT
@@ -228,6 +511,7 @@ async fn query_trace_segments_with_datafusion(
                     END AS status,
                     start_time_unix_nano,
                     end_time_unix_nano,
+                    event_time_unix_nano,
                     parent_span_id IS NULL AS is_root,
                     attributes_json
                 FROM ({source_sql}) AS segment_spans
@@ -249,10 +533,27 @@ async fn query_trace_segments_with_datafusion(
 }
 
 fn run_query_where_sql(query: &RunQuery) -> String {
+    let predicates = run_query_predicates(query, "");
+    if predicates.is_empty() {
+        "true".to_owned()
+    } else {
+        predicates.join(" AND ")
+    }
+}
+
+fn run_query_predicates(query: &RunQuery, table_alias: &str) -> Vec<String> {
+    let column = |name: &str| {
+        if table_alias.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{table_alias}.{name}")
+        }
+    };
     let mut predicates = Vec::new();
     if !query.project_names.is_empty() {
         predicates.push(format!(
-            "project_name IN ({})",
+            "{} IN ({})",
+            column("project_name"),
             query
                 .project_names
                 .iter()
@@ -262,52 +563,61 @@ fn run_query_where_sql(query: &RunQuery) -> String {
         ));
     }
     if let Some(trace_id) = &query.trace_id {
-        predicates.push(format!("trace_id = {}", sql_string_literal(trace_id)));
+        predicates.push(format!(
+            "{} = {}",
+            column("trace_id"),
+            sql_string_literal(trace_id)
+        ));
     }
     if let Some(parent_run_id) = &query.parent_run_id {
         predicates.push(format!(
-            "parent_run_id = {}",
+            "{} = {}",
+            column("parent_run_id"),
             sql_string_literal(parent_run_id)
         ));
     }
     if let Some(parent_span_id) = &query.parent_span_id {
         predicates.push(format!(
-            "parent_span_id = {}",
+            "{} = {}",
+            column("parent_span_id"),
             sql_string_literal(parent_span_id)
         ));
     }
     if let Some(run_type) = &query.run_type {
-        predicates.push(format!("run_type = {}", sql_string_literal(run_type)));
+        predicates.push(format!(
+            "{} = {}",
+            column("run_type"),
+            sql_string_literal(run_type)
+        ));
     }
     if let Some(is_root) = query.is_root {
         predicates.push(format!(
-            "is_root = {}",
+            "{} = {}",
+            column("is_root"),
             if is_root { "true" } else { "false" }
         ));
     }
     if let Some(error) = query.error {
         if error {
-            predicates.push("status = 'error'".to_owned());
+            predicates.push(format!("{} = 'error'", column("status")));
         } else {
-            predicates.push("status <> 'error'".to_owned());
+            predicates.push(format!("{} <> 'error'", column("status")));
         }
     }
     if let Some(start_time_min_unix_nano) = query.start_time_min_unix_nano {
         predicates.push(format!(
-            "start_time_unix_nano >= {start_time_min_unix_nano}"
+            "{} >= {start_time_min_unix_nano}",
+            column("start_time_unix_nano")
         ));
     }
     if let Some(start_time_max_unix_nano) = query.start_time_max_unix_nano {
         predicates.push(format!(
-            "start_time_unix_nano <= {start_time_max_unix_nano}"
+            "{} <= {start_time_max_unix_nano}",
+            column("start_time_unix_nano")
         ));
     }
 
-    if predicates.is_empty() {
-        "true".to_owned()
-    } else {
-        predicates.join(" AND ")
-    }
+    predicates
 }
 
 fn vortex_session_context(object_store: Arc<dyn ObjectStore>) -> Result<SessionContext> {
@@ -455,6 +765,16 @@ fn run_summaries_from_batches(batches: &[RecordBatch]) -> Result<Vec<RunSummary>
     Ok(runs)
 }
 
+fn run_matches_retention_filter(run: &RunSummary, query: &RunQuery) -> bool {
+    if let Some(cutoff) = query.retention_cutoff_unix_nano
+        && run.start_time_unix_nano < cutoff
+    {
+        return false;
+    }
+
+    true
+}
+
 fn optional_string_value(column: &StringColumn<'_>, row: usize) -> Option<String> {
     if column.is_null(row) {
         None
@@ -525,280 +845,13 @@ fn sql_object_store_path(uri: &str) -> String {
     sql_string_literal(&path)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use object_store::memory::InMemory;
-    use object_store::path::Path;
-    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-
-    use crate::otlp::SpanRecord;
-    use crate::segment::encode_span_records;
-
-    const TRACE_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-    #[tokio::test]
-    async fn datafusion_scans_vortex_segments() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let segment_uri = "projects/demo/trace-segments/test.vortex";
-        let records = vec![
-            span_record("ignored-project", "other-project", TRACE_ID, None, 1, 2, 1),
-            span_record(
-                "ignored-trace",
-                "demo",
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                None,
-                2,
-                3,
-                1,
-            ),
-            span_record("child", "demo", TRACE_ID, Some("root"), 20, 30, 2),
-            span_record("root", "demo", TRACE_ID, None, 10, 40, 1),
-        ];
-        let payload = encode_span_records(&records)
-            .await
-            .expect("encode Vortex segment");
-        object_store
-            .put(&Path::from(segment_uri), PutPayload::from_bytes(payload))
-            .await
-            .expect("write Vortex segment");
-
-        let result = query_trace_segments_with_datafusion(
-            object_store,
-            vec![segment_uri.to_owned()],
-            &RunQuery {
-                project_names: vec!["demo".to_owned()],
-                trace_id: Some(TRACE_ID.to_owned()),
-                parent_run_id: None,
-                parent_span_id: None,
-                run_type: None,
-                is_root: None,
-                error: None,
-                start_time_min_unix_nano: None,
-                start_time_max_unix_nano: None,
-                limit: None,
-                offset: None,
-            },
-        )
-        .await
-        .expect("query trace segments");
-
-        assert_eq!(
-            result
-                .iter()
-                .map(|run| run.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["root", "child"]
-        );
-        assert_eq!(result[0].run_type, "chain");
-        assert_eq!(result[0].status, "success");
-        assert!(result[0].is_root);
-        assert_eq!(result[1].parent_span_id.as_deref(), Some("root"));
-        assert_eq!(result[1].run_type, "llm");
-        assert_eq!(result[1].status, "error");
-    }
-
-    #[tokio::test]
-    async fn datafusion_applies_run_query_filters() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let segment_uri = "projects/demo/trace-segments/filtered.vortex";
-        let records = vec![
-            span_record("root", "demo", TRACE_ID, None, 10, 40, 1),
-            span_record("child", "demo", TRACE_ID, Some("root"), 20, 30, 2),
-        ];
-        let payload = encode_span_records(&records)
-            .await
-            .expect("encode Vortex segment");
-        object_store
-            .put(&Path::from(segment_uri), PutPayload::from_bytes(payload))
-            .await
-            .expect("write Vortex segment");
-
-        let result = query_trace_segments_with_datafusion(
-            object_store,
-            vec![segment_uri.to_owned()],
-            &RunQuery {
-                project_names: vec!["demo".to_owned()],
-                trace_id: None,
-                parent_run_id: None,
-                parent_span_id: None,
-                run_type: Some("llm".to_owned()),
-                is_root: Some(false),
-                error: Some(true),
-                start_time_min_unix_nano: None,
-                start_time_max_unix_nano: None,
-                limit: Some(1),
-                offset: None,
-            },
-        )
-        .await
-        .expect("query trace segments");
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].name, "child");
-    }
-
-    #[tokio::test]
-    async fn datafusion_filters_latest_run_versions() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let segment_uri = "projects/demo/trace-segments/updates.vortex";
-        let records = vec![
-            span_record("root", "demo", TRACE_ID, None, 10, 0, 1),
-            span_record("root", "demo", TRACE_ID, None, 10, 40, 2),
-        ];
-        let payload = encode_span_records(&records)
-            .await
-            .expect("encode Vortex segment");
-        object_store
-            .put(&Path::from(segment_uri), PutPayload::from_bytes(payload))
-            .await
-            .expect("write Vortex segment");
-
-        let successful_runs = query_trace_segments_with_datafusion(
-            Arc::clone(&object_store),
-            vec![segment_uri.to_owned()],
-            &RunQuery {
-                project_names: vec!["demo".to_owned()],
-                trace_id: Some(TRACE_ID.to_owned()),
-                parent_run_id: None,
-                parent_span_id: None,
-                run_type: None,
-                is_root: None,
-                error: Some(false),
-                start_time_min_unix_nano: None,
-                start_time_max_unix_nano: None,
-                limit: None,
-                offset: None,
-            },
-        )
-        .await
-        .expect("query successful runs");
-        assert!(successful_runs.is_empty());
-
-        let error_runs = query_trace_segments_with_datafusion(
-            object_store,
-            vec![segment_uri.to_owned()],
-            &RunQuery {
-                project_names: vec!["demo".to_owned()],
-                trace_id: Some(TRACE_ID.to_owned()),
-                parent_run_id: None,
-                parent_span_id: None,
-                run_type: None,
-                is_root: None,
-                error: Some(true),
-                start_time_min_unix_nano: None,
-                start_time_max_unix_nano: None,
-                limit: None,
-                offset: None,
-            },
-        )
-        .await
-        .expect("query error runs");
-        assert_eq!(error_runs.len(), 1);
-        assert_eq!(error_runs[0].status, "error");
-        assert_eq!(error_runs[0].end_time_unix_nano, 40);
-    }
-
-    #[test]
-    fn builds_trace_tree_from_runs() {
-        let tree = trace_tree_from_runs(
-            "demo",
-            TRACE_ID,
-            vec![
-                run("demo", TRACE_ID, "child", Some("root"), 20),
-                run("demo", TRACE_ID, "root", None, 10),
-                run("demo", TRACE_ID, "orphan", Some("missing"), 30),
-            ],
-        );
-
-        assert_eq!(tree.project_name, "demo");
-        assert_eq!(tree.trace_id, TRACE_ID);
-        assert_eq!(tree.roots.len(), 2);
-        assert_eq!(tree.roots[0].run.name, "root");
-        assert_eq!(tree.roots[0].children.len(), 1);
-        assert_eq!(tree.roots[0].children[0].run.name, "child");
-        assert_eq!(tree.roots[1].run.name, "orphan");
-    }
-
-    #[test]
-    fn escapes_sql_string_literals() {
-        assert_eq!(sql_string_literal("project's trace"), "'project''s trace'");
-        assert_eq!(
-            sql_object_store_path("projects/project's/test.vortex"),
-            "'/projects/project''s/test.vortex'"
-        );
-        assert_eq!(
-            run_query_where_sql(&RunQuery {
-                project_names: vec!["demo".to_owned()],
-                trace_id: Some("trace".to_owned()),
-                parent_run_id: Some("parent-run".to_owned()),
-                parent_span_id: Some("parent-span".to_owned()),
-                run_type: Some("llm".to_owned()),
-                is_root: Some(false),
-                error: Some(false),
-                start_time_min_unix_nano: Some(10),
-                start_time_max_unix_nano: Some(20),
-                limit: None,
-                offset: None,
-            }),
-            "project_name IN ('demo') AND trace_id = 'trace' AND parent_run_id = 'parent-run' AND parent_span_id = 'parent-span' AND run_type = 'llm' AND is_root = false AND status <> 'error' AND start_time_unix_nano >= 10 AND start_time_unix_nano <= 20"
-        );
-    }
-
-    fn run(
-        project_name: &str,
-        trace_id: &str,
-        name: &str,
-        parent_span_id: Option<&str>,
-        start_time_unix_nano: i64,
-    ) -> RunSummary {
-        RunSummary {
-            project_name: project_name.to_owned(),
-            run_id: None,
-            trace_id: trace_id.to_owned(),
-            span_id: name.to_owned(),
-            parent_run_id: None,
-            parent_span_id: parent_span_id.map(str::to_owned),
-            name: name.to_owned(),
-            run_type: if parent_span_id.is_some() {
-                "llm".to_owned()
-            } else {
-                "chain".to_owned()
-            },
-            status: "success".to_owned(),
-            start_time_unix_nano,
-            end_time_unix_nano: start_time_unix_nano + 10,
-            is_root: parent_span_id.is_none(),
-            attributes_json: "{}".to_owned(),
-        }
-    }
-
-    fn span_record(
-        name: &str,
-        project_name: &str,
-        trace_id: &str,
-        parent_span_id: Option<&str>,
-        start_time_unix_nano: i64,
-        end_time_unix_nano: i64,
-        status_code: i32,
-    ) -> SpanRecord {
-        SpanRecord {
-            project_name: project_name.to_owned(),
-            run_id: String::new(),
-            trace_id: trace_id.to_owned(),
-            span_id: name.to_owned(),
-            parent_run_id: None,
-            parent_span_id: parent_span_id.map(str::to_owned),
-            name: name.to_owned(),
-            run_type: if parent_span_id.is_some() {
-                "llm".to_owned()
-            } else {
-                "chain".to_owned()
-            },
-            start_time_unix_nano,
-            end_time_unix_nano,
-            status_code,
-            attributes_json: "{}".to_owned(),
-        }
-    }
+fn current_time_unix_nano() -> Result<i64> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before unix epoch")?
+        .as_nanos();
+    i64::try_from(nanos).context("current time does not fit in i64 nanos")
 }
+
+#[cfg(test)]
+mod tests;

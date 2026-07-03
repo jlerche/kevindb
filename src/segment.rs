@@ -59,6 +59,8 @@ fn records_to_batch(records: &[SpanRecord]) -> Result<RecordBatch> {
         Field::new("start_time_unix_nano", DataType::Int64, false),
         Field::new("end_time_unix_nano", DataType::Int64, false),
         Field::new("status_code", DataType::Int32, false),
+        Field::new("event_type", DataType::Utf8, false),
+        Field::new("event_time_unix_nano", DataType::Int64, false),
         Field::new("attributes_json", DataType::Utf8, false),
     ]));
 
@@ -130,12 +132,29 @@ fn records_to_batch(records: &[SpanRecord]) -> Result<RecordBatch> {
         Arc::new(StringArray::from(
             records
                 .iter()
+                .map(|record| record.event_kind.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            records.iter().map(event_time_unix_nano).collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            records
+                .iter()
                 .map(|record| record.attributes_json.as_str())
                 .collect::<Vec<_>>(),
         )),
     ];
 
     RecordBatch::try_new(schema, columns).context("build Arrow span batch")
+}
+
+fn event_time_unix_nano(record: &SpanRecord) -> i64 {
+    if record.end_time_unix_nano > 0 {
+        record.end_time_unix_nano
+    } else {
+        record.start_time_unix_nano
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +195,7 @@ mod tests {
             start_time_unix_nano: 1,
             end_time_unix_nano: 2,
             status_code: 1,
+            event_kind: crate::otlp::RunEventKind::End,
             attributes_json: "{}".to_owned(),
         }
     }

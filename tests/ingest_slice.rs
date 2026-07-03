@@ -14,8 +14,8 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Sta
 use tokio_postgres::NoTls;
 
 use kevindb::ingest::{IngestConfig, Ingestor};
-use kevindb::otlp::SpanRecord;
-use kevindb::query::QueryEngine;
+use kevindb::otlp::{RunEventKind, SpanRecord};
+use kevindb::query::{QueryEngine, RunQuery};
 use kevindb::segment::read_span_count;
 use mockgres_support::start_mockgres_with_migrations;
 use tokio::time::Duration;
@@ -98,6 +98,116 @@ async fn ingests_otlp_spans_to_vortex_segment_and_postgres_indexes() -> Result<(
     assert_eq!(trace.roots[0].run.name, "agent.run");
     assert_eq!(trace.roots[0].children.len(), 1);
     assert_eq!(trace.roots[0].children[0].run.name, "llm.call");
+
+    mockgres.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn compaction_deletes_and_retention_work_together() -> Result<()> {
+    let mockgres = start_mockgres_with_migrations().await?;
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 1,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+
+    ingestor
+        .ingest_records(vec![
+            span_record_with_attrs(
+                "agent.run",
+                "1111111111111111",
+                10,
+                20,
+                1,
+                r#"{"langsmith.extra":{"tier":"gold"},"prompt":"hello world"}"#,
+            ),
+            span_record_with_attrs(
+                "tool.run",
+                "2222222222222222",
+                30,
+                40,
+                1,
+                r#"{"langsmith.extra":{"tier":"silver"},"prompt":"goodbye"}"#,
+            ),
+        ])
+        .await?;
+
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store.clone());
+    let initial = query_engine
+        .list_runs(RunQuery {
+            project_names: vec!["demo".to_owned()],
+            trace_id: Some(TRACE_ID.to_owned()),
+            parent_run_id: None,
+            parent_span_id: None,
+            run_type: None,
+            is_root: None,
+            error: None,
+            start_time_min_unix_nano: None,
+            start_time_max_unix_nano: None,
+            limit: None,
+            offset: None,
+            retention_cutoff_unix_nano: None,
+            include_deleted: false,
+        })
+        .await?;
+    assert_eq!(
+        initial
+            .iter()
+            .map(|run| run.span_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["1111111111111111", "2222222222222222"]
+    );
+
+    let compacted = ingestor.compact_project("demo").await?;
+    assert_eq!(compacted.compacted_runs, 2);
+    assert_eq!(compacted.compacted_segments, 2);
+    assert_eq!(compacted.written_segments, 2);
+
+    assert!(
+        query_engine
+            .delete_run("demo", TRACE_ID, "1111111111111111", Some("test-delete"))
+            .await?
+    );
+    let after_delete = query_engine
+        .list_runs_in_trace("demo", TRACE_ID)
+        .await?
+        .into_iter()
+        .map(|run| run.span_id)
+        .collect::<Vec<_>>();
+    assert_eq!(after_delete, vec!["2222222222222222"]);
+
+    let expired = query_engine.expire_project_runs_before("demo", 50).await?;
+    assert_eq!(expired, 1);
+    assert!(
+        query_engine
+            .list_runs_in_trace("demo", TRACE_ID)
+            .await?
+            .is_empty()
+    );
+
+    let inclusive = query_engine
+        .list_runs(RunQuery {
+            project_names: vec!["demo".to_owned()],
+            trace_id: Some(TRACE_ID.to_owned()),
+            parent_run_id: None,
+            parent_span_id: None,
+            run_type: None,
+            is_root: None,
+            error: None,
+            start_time_min_unix_nano: None,
+            start_time_max_unix_nano: None,
+            limit: None,
+            offset: None,
+            retention_cutoff_unix_nano: None,
+            include_deleted: true,
+        })
+        .await?;
+    assert_eq!(inclusive.len(), 2);
 
     mockgres.stop().await?;
     Ok(())
@@ -223,6 +333,27 @@ fn span_record(
         start_time_unix_nano,
         end_time_unix_nano,
         status_code,
+        event_kind: RunEventKind::End,
         attributes_json: "{}".to_owned(),
     }
+}
+
+fn span_record_with_attrs(
+    name: &str,
+    span_id: &str,
+    start_time_unix_nano: i64,
+    end_time_unix_nano: i64,
+    status_code: i32,
+    attributes_json: &str,
+) -> SpanRecord {
+    let mut record = span_record(name, start_time_unix_nano, end_time_unix_nano, status_code);
+    record.span_id = span_id.to_owned();
+    record.run_id = span_id.to_owned();
+    record.attributes_json = attributes_json.to_owned();
+    record.event_kind = if end_time_unix_nano > 0 {
+        RunEventKind::End
+    } else {
+        RunEventKind::Start
+    };
+    record
 }

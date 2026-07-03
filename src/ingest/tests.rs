@@ -12,6 +12,7 @@ use tokio::time::{sleep, timeout};
 
 use super::*;
 use crate::db::run_migrations;
+use crate::query::{QueryEngine, RunQuery};
 
 #[tokio::test]
 async fn ingest_otlp_flushes_to_object_store_and_postgres() {
@@ -252,12 +253,19 @@ async fn failed_flush_restores_pending_records() {
     );
 
     let pending = ingestor.pending.lock().await;
-    assert_eq!(pending.records.len(), 2);
+    assert_eq!(
+        pending
+            .buffers
+            .values()
+            .map(|buffer| buffer.records.len())
+            .sum::<usize>(),
+        2
+    );
 }
 
 #[test]
 fn segment_uri_escapes_project_name() {
-    let uri = segment_uri(&[SpanRecord {
+    let record = SpanRecord {
         project_name: "demo/project".to_owned(),
         run_id: String::new(),
         trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
@@ -269,12 +277,161 @@ fn segment_uri_escapes_project_name() {
         start_time_unix_nano: 1,
         end_time_unix_nano: 2,
         status_code: 1,
+        event_kind: RunEventKind::End,
         attributes_json: "{}".to_owned(),
-    }])
-    .expect("segment uri");
+    };
+    let partition = record_partition_key(&record);
+    let uri = segment_uri(&partition, &[record]).expect("segment uri");
 
-    assert!(uri.starts_with("projects/demo%2Fproject/trace-segments/"));
+    assert!(uri.starts_with("projects/demo%2Fproject/time-buckets/0/trace-segments/"));
     assert!(uri.ends_with("-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.vortex"));
+}
+
+#[tokio::test]
+async fn partitions_flushes_by_project() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        Arc::new(InMemory::new()),
+        IngestConfig {
+            max_spans_per_segment: 64,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+
+    let mut other_project = sample_record("2222222222222222", 2);
+    other_project.project_name = "other".to_owned();
+    let receipt = ingestor
+        .ingest_records(vec![sample_record("1111111111111111", 1), other_project])
+        .await
+        .expect("ingest partitioned records");
+
+    assert_eq!(receipt.accepted_spans, 2);
+    assert_eq!(receipt.flushed_segments, 2);
+
+    let (client, connection) = tokio_postgres::connect(mockgres.postgres_url(), NoTls)
+        .await
+        .expect("connect postgres");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let projects = client
+        .query(
+            "SELECT project_name, span_count FROM trace_segments ORDER BY project_name",
+            &[],
+        )
+        .await
+        .expect("load trace segments")
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        projects,
+        vec![("demo".to_owned(), 1), ("other".to_owned(), 1)]
+    );
+
+    mockgres.stop().await.expect("stop mockgres");
+}
+
+#[tokio::test]
+async fn compacts_and_respects_deletes_and_retention() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 1,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+
+    let mut first = sample_record("1111111111111111", 10);
+    first.attributes_json =
+        r#"{"langsmith.extra":{"tier":"gold"},"prompt":"hello world"}"#.to_owned();
+    let mut second = sample_record("2222222222222222", 30);
+    second.name = "tool.run".to_owned();
+    second.attributes_json =
+        r#"{"langsmith.extra":{"tier":"silver"},"prompt":"goodbye"}"#.to_owned();
+
+    ingestor
+        .ingest_records(vec![first, second])
+        .await
+        .expect("ingest indexed records");
+
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store);
+    let initial = query_engine
+        .list_runs(RunQuery {
+            project_names: vec!["demo".to_owned()],
+            trace_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+            parent_run_id: None,
+            parent_span_id: None,
+            run_type: None,
+            is_root: None,
+            error: None,
+            start_time_min_unix_nano: None,
+            start_time_max_unix_nano: None,
+            limit: None,
+            offset: None,
+            retention_cutoff_unix_nano: None,
+            include_deleted: false,
+        })
+        .await
+        .expect("query initial runs");
+    assert_eq!(initial.len(), 2);
+
+    let compacted = ingestor
+        .compact_project("demo")
+        .await
+        .expect("compact project");
+    assert_eq!(compacted.compacted_runs, 2);
+    assert_eq!(compacted.compacted_segments, 2);
+    assert_eq!(compacted.written_segments, 2);
+
+    assert!(
+        query_engine
+            .delete_run(
+                "demo",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "1111111111111111",
+                Some("unit-test"),
+            )
+            .await
+            .expect("delete run")
+    );
+    let active = query_engine
+        .list_runs_in_trace("demo", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .await
+        .expect("query active runs");
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].span_id, "2222222222222222");
+
+    assert_eq!(
+        query_engine
+            .expire_project_runs_before("demo", 50)
+            .await
+            .expect("expire runs"),
+        1
+    );
+    assert!(
+        query_engine
+            .list_runs_in_trace("demo", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .await
+            .expect("query after expiration")
+            .is_empty()
+    );
+
+    mockgres.stop().await.expect("stop mockgres");
 }
 
 async fn wait_for_pending_records(ingestor: &Ingestor, expected_records: usize) {
@@ -282,7 +439,12 @@ async fn wait_for_pending_records(ingestor: &Ingestor, expected_records: usize) 
     loop {
         {
             let pending = ingestor.pending.lock().await;
-            if pending.records.len() == expected_records {
+            let pending_records = pending
+                .buffers
+                .values()
+                .map(|buffer| buffer.records.len())
+                .sum::<usize>();
+            if pending_records == expected_records {
                 return;
             }
         }
@@ -308,6 +470,7 @@ fn sample_record(span_id: &str, start_time_unix_nano: i64) -> SpanRecord {
         start_time_unix_nano,
         end_time_unix_nano: start_time_unix_nano + 1,
         status_code: 1,
+        event_kind: RunEventKind::End,
         attributes_json: "{}".to_owned(),
     }
 }
