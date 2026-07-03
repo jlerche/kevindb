@@ -40,6 +40,29 @@ pub struct TraceTree {
     pub roots: Vec<RunNode>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunQuery {
+    pub project_names: Vec<String>,
+    pub trace_id: Option<String>,
+    pub run_type: Option<String>,
+    pub is_root: Option<bool>,
+    pub error: Option<bool>,
+    pub limit: Option<usize>,
+}
+
+impl RunQuery {
+    pub fn new(project_name: impl Into<String>) -> Self {
+        Self {
+            project_names: vec![project_name.into()],
+            trace_id: None,
+            run_type: None,
+            is_root: None,
+            error: None,
+            limit: None,
+        }
+    }
+}
+
 pub struct QueryEngine {
     postgres_url: String,
     object_store: Arc<dyn ObjectStore>,
@@ -58,15 +81,21 @@ impl QueryEngine {
         project_name: &str,
         trace_id: &str,
     ) -> Result<Vec<RunSummary>> {
-        let segment_uris =
-            load_trace_segment_uris(&self.postgres_url, project_name, trace_id).await?;
-        query_trace_segments_with_datafusion(
-            Arc::clone(&self.object_store),
-            segment_uris,
-            project_name,
-            trace_id,
-        )
+        self.list_runs(RunQuery {
+            project_names: vec![project_name.to_owned()],
+            trace_id: Some(trace_id.to_owned()),
+            run_type: None,
+            is_root: None,
+            error: None,
+            limit: None,
+        })
         .await
+    }
+
+    pub async fn list_runs(&self, query: RunQuery) -> Result<Vec<RunSummary>> {
+        let segment_uris = load_run_query_segment_uris(&self.postgres_url, &query).await?;
+        query_trace_segments_with_datafusion(Arc::clone(&self.object_store), segment_uris, &query)
+            .await
     }
 
     pub async fn load_trace_tree(&self, project_name: &str, trace_id: &str) -> Result<TraceTree> {
@@ -75,11 +104,11 @@ impl QueryEngine {
     }
 }
 
-async fn load_trace_segment_uris(
-    postgres_url: &str,
-    project_name: &str,
-    trace_id: &str,
-) -> Result<Vec<String>> {
+async fn load_run_query_segment_uris(postgres_url: &str, query: &RunQuery) -> Result<Vec<String>> {
+    if query.project_names.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let (client, connection) = tokio_postgres::connect(postgres_url, NoTls)
         .await
         .context("connect postgres for query metadata")?;
@@ -89,24 +118,39 @@ async fn load_trace_segment_uris(
         }
     });
 
-    let rows = client
-        .query(
-            "SELECT DISTINCT trace_segments.uri
-            FROM trace_segments
-            INNER JOIN trace_segment_spans
-                ON trace_segment_spans.trace_segment_id = trace_segments.id
-            WHERE trace_segment_spans.project_name = $1
-                AND trace_segment_spans.trace_id = $2
-            ORDER BY trace_segments.uri",
-            &[&project_name, &trace_id],
-        )
-        .await
-        .context("load trace segment uris")?;
+    let mut uris = Vec::new();
+    for project_name in &query.project_names {
+        let rows = if let Some(trace_id) = &query.trace_id {
+            client
+                .query(
+                    "SELECT DISTINCT trace_segments.uri
+                    FROM trace_segments
+                    INNER JOIN trace_segment_spans
+                        ON trace_segment_spans.trace_segment_id = trace_segments.id
+                    WHERE trace_segment_spans.project_name = $1
+                        AND trace_segment_spans.trace_id = $2
+                    ORDER BY trace_segments.uri",
+                    &[project_name, trace_id],
+                )
+                .await
+        } else {
+            client
+                .query(
+                    "SELECT DISTINCT trace_segments.uri
+                    FROM trace_segments
+                    INNER JOIN trace_segment_spans
+                        ON trace_segment_spans.trace_segment_id = trace_segments.id
+                    WHERE trace_segment_spans.project_name = $1
+                    ORDER BY trace_segments.uri",
+                    &[project_name],
+                )
+                .await
+        }
+        .context("load run query segment uris")?;
 
-    let mut uris = rows
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect::<Vec<String>>();
+        uris.extend(rows.into_iter().map(|row| row.get(0)));
+    }
+    uris.sort();
     uris.dedup();
     Ok(uris)
 }
@@ -114,8 +158,7 @@ async fn load_trace_segment_uris(
 async fn query_trace_segments_with_datafusion(
     object_store: Arc<dyn ObjectStore>,
     segment_uris: Vec<String>,
-    project_name: &str,
-    trace_id: &str,
+    query: &RunQuery,
 ) -> Result<Vec<RunSummary>> {
     if segment_uris.is_empty() {
         return Ok(Vec::new());
@@ -127,6 +170,11 @@ async fn query_trace_segments_with_datafusion(
         .map(|uri| format!("SELECT * FROM {}", sql_object_store_path(uri)))
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
+    let where_sql = run_query_where_sql(query);
+    let limit_sql = query
+        .limit
+        .map(|limit| format!(" LIMIT {limit}"))
+        .unwrap_or_default();
 
     let sql = format!(
         "SELECT
@@ -150,10 +198,8 @@ async fn query_trace_segments_with_datafusion(
                 parent_span_id IS NULL AS is_root
             FROM ({source_sql}) AS segment_spans
         ) AS runs
-        WHERE project_name = {} AND trace_id = {}
-        ORDER BY start_time_unix_nano ASC, span_id ASC",
-        sql_string_literal(project_name),
-        sql_string_literal(trace_id)
+        WHERE {where_sql}
+        ORDER BY start_time_unix_nano ASC, span_id ASC{limit_sql}",
     );
     let dataframe = context
         .sql(&sql)
@@ -165,6 +211,46 @@ async fn query_trace_segments_with_datafusion(
         .context("execute DataFusion run head query")?;
 
     run_summaries_from_batches(&batches)
+}
+
+fn run_query_where_sql(query: &RunQuery) -> String {
+    let mut predicates = Vec::new();
+    if !query.project_names.is_empty() {
+        predicates.push(format!(
+            "project_name IN ({})",
+            query
+                .project_names
+                .iter()
+                .map(|project_name| sql_string_literal(project_name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(trace_id) = &query.trace_id {
+        predicates.push(format!("trace_id = {}", sql_string_literal(trace_id)));
+    }
+    if let Some(run_type) = &query.run_type {
+        predicates.push(format!("run_type = {}", sql_string_literal(run_type)));
+    }
+    if let Some(is_root) = query.is_root {
+        predicates.push(format!(
+            "is_root = {}",
+            if is_root { "true" } else { "false" }
+        ));
+    }
+    if let Some(error) = query.error {
+        if error {
+            predicates.push("status = 'error'".to_owned());
+        } else {
+            predicates.push("status <> 'error'".to_owned());
+        }
+    }
+
+    if predicates.is_empty() {
+        "true".to_owned()
+    } else {
+        predicates.join(" AND ")
+    }
 }
 
 fn vortex_session_context(object_store: Arc<dyn ObjectStore>) -> Result<SessionContext> {
@@ -413,8 +499,14 @@ mod tests {
         let result = query_trace_segments_with_datafusion(
             object_store,
             vec![segment_uri.to_owned()],
-            "demo",
-            TRACE_ID,
+            &RunQuery {
+                project_names: vec!["demo".to_owned()],
+                trace_id: Some(TRACE_ID.to_owned()),
+                run_type: None,
+                is_root: None,
+                error: None,
+                limit: None,
+            },
         )
         .await
         .expect("query trace segments");
@@ -432,6 +524,41 @@ mod tests {
         assert_eq!(result[1].parent_span_id.as_deref(), Some("root"));
         assert_eq!(result[1].run_type, "llm");
         assert_eq!(result[1].status, "error");
+    }
+
+    #[tokio::test]
+    async fn datafusion_applies_run_query_filters() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let segment_uri = "projects/demo/trace-segments/filtered.vortex";
+        let records = vec![
+            span_record("root", "demo", TRACE_ID, None, 10, 40, 1),
+            span_record("child", "demo", TRACE_ID, Some("root"), 20, 30, 2),
+        ];
+        let payload = encode_span_records(&records)
+            .await
+            .expect("encode Vortex segment");
+        object_store
+            .put(&Path::from(segment_uri), PutPayload::from_bytes(payload))
+            .await
+            .expect("write Vortex segment");
+
+        let result = query_trace_segments_with_datafusion(
+            object_store,
+            vec![segment_uri.to_owned()],
+            &RunQuery {
+                project_names: vec!["demo".to_owned()],
+                trace_id: None,
+                run_type: Some("llm".to_owned()),
+                is_root: Some(false),
+                error: Some(true),
+                limit: Some(1),
+            },
+        )
+        .await
+        .expect("query trace segments");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "child");
     }
 
     #[test]
@@ -461,6 +588,17 @@ mod tests {
         assert_eq!(
             sql_object_store_path("projects/project's/test.vortex"),
             "'/projects/project''s/test.vortex'"
+        );
+        assert_eq!(
+            run_query_where_sql(&RunQuery {
+                project_names: vec!["demo".to_owned()],
+                trace_id: Some("trace".to_owned()),
+                run_type: Some("llm".to_owned()),
+                is_root: Some(false),
+                error: Some(false),
+                limit: None,
+            }),
+            "project_name IN ('demo') AND trace_id = 'trace' AND run_type = 'llm' AND is_root = false AND status <> 'error'"
         );
     }
 

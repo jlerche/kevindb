@@ -30,5 +30,11 @@ Current endpoints:
 
 - `GET /healthz`
 - `GET /readyz`
+- `GET /sessions`
+- `POST /runs/query`
+- `POST /v1/runs/query`
 - `POST /v1/projects/{project_name}/traces`
 - `GET /v1/projects/{project_name}/traces/{trace_id}/runs`
+
+`GET /sessions` and `POST /runs/query` are the initial LangSmith SDK
+compatibility surface for project lookup and `Client.list_runs(...)`.

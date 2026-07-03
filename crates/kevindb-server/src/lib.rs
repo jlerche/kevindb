@@ -8,12 +8,17 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use kevindb::ingest::{FlushReceipt, IngestConfig, IngestReceipt, Ingestor};
-use kevindb::query::{QueryEngine, RunSummary};
+use kevindb::query::QueryEngine;
 use object_store::ObjectStore;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use tokio_postgres::NoTls;
+
+mod langsmith;
+
+pub use langsmith::{ProjectResponse, RunResponse, RunsQueryRequest, RunsResponse, StringList};
+use langsmith::{list_sessions, query_runs};
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -68,6 +73,10 @@ pub fn app(state: ServerState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/sessions", get(list_sessions))
+        .route("/v1/sessions", get(list_sessions))
+        .route("/runs/query", post(query_runs))
+        .route("/v1/runs/query", post(query_runs))
         .route("/v1/projects/{project_name}/traces", post(ingest_trace))
         .route(
             "/v1/projects/{project_name}/traces/{trace_id}/runs",
@@ -153,42 +162,6 @@ impl From<FlushReceipt> for FlushResponse {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunsResponse {
-    pub runs: Vec<RunResponse>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunResponse {
-    pub project_name: String,
-    pub trace_id: String,
-    pub span_id: String,
-    pub parent_span_id: Option<String>,
-    pub name: String,
-    pub run_type: String,
-    pub status: String,
-    pub start_time_unix_nano: i64,
-    pub end_time_unix_nano: i64,
-    pub is_root: bool,
-}
-
-impl From<RunSummary> for RunResponse {
-    fn from(run: RunSummary) -> Self {
-        Self {
-            project_name: run.project_name,
-            trace_id: run.trace_id,
-            span_id: run.span_id,
-            parent_span_id: run.parent_span_id,
-            name: run.name,
-            run_type: run.run_type,
-            status: run.status,
-            start_time_unix_nano: run.start_time_unix_nano,
-            end_time_unix_nano: run.end_time_unix_nano,
-            is_root: run.is_root,
-        }
-    }
-}
-
 #[derive(Debug)]
 enum ApiError {
     BadRequest(String),
@@ -242,9 +215,11 @@ mod tests {
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, status};
+    use serde_json::{Value, json};
     use tokio::process::{Child, Command};
     use tokio::time::sleep;
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     use super::*;
     use kevindb::db::run_migrations;
@@ -304,7 +279,24 @@ mod tests {
         assert_eq!(ingest_body.accepted_spans, 2);
         assert_eq!(ingest_body.flushed_segments, 1);
 
+        let sessions_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/sessions?name=demo&limit=1&include_stats=false")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(sessions_response.status(), StatusCode::OK);
+        let sessions_body: Vec<ProjectResponse> =
+            decode_response(sessions_response.into_body()).await?;
+        assert_eq!(sessions_body.len(), 1);
+        assert_eq!(sessions_body[0].name, "demo");
+        assert!(Uuid::parse_str(&sessions_body[0].tenant_id).is_ok());
+
         let runs_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -322,9 +314,56 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["agent.run", "llm.call"]
         );
+        assert!(Uuid::parse_str(&runs_body.runs[0].id).is_ok());
+        assert_eq!(runs_body.runs[0].session_id, sessions_body[0].id);
+        assert!(runs_body.runs[0].start_time.starts_with("1970-01-01T"));
         assert_eq!(
             runs_body.runs[1].parent_span_id.as_deref(),
             Some("1111111111111111")
+        );
+        assert!(runs_body.runs[1].parent_run_id.is_some());
+
+        let langsmith_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runs/query")
+                    .header("content-type", "application/json")
+                    .body(json_body(json!({
+                        "session": [sessions_body[0].id],
+                        "run_type": "llm",
+                        "limit": 1
+                    })))?,
+            )
+            .await?;
+        assert_eq!(langsmith_response.status(), StatusCode::OK);
+        let langsmith_body: RunsResponse = decode_response(langsmith_response.into_body()).await?;
+        assert_eq!(langsmith_body.runs.len(), 1);
+        assert_eq!(langsmith_body.runs[0].name, "llm.call");
+        assert_eq!(langsmith_body.runs[0].inputs, json!({}));
+
+        let root_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/runs/query")
+                    .header("content-type", "application/json")
+                    .body(json_body(json!({
+                        "project_name": "demo",
+                        "is_root": true
+                    })))?,
+            )
+            .await?;
+        assert_eq!(root_response.status(), StatusCode::OK);
+        let root_body: RunsResponse = decode_response(root_response.into_body()).await?;
+        assert_eq!(
+            root_body
+                .runs
+                .iter()
+                .map(|run| run.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent.run"]
         );
 
         mockgres.stop().await?;
@@ -363,6 +402,10 @@ mod tests {
     {
         let bytes = to_bytes(body, usize::MAX).await?;
         Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    fn json_body(value: Value) -> Body {
+        Body::from(serde_json::to_vec(&value).expect("serialize json request body"))
     }
 
     fn sample_export() -> ExportTraceServiceRequest {
