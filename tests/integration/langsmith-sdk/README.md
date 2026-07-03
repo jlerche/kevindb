@@ -36,10 +36,15 @@ can reach `/readyz`.
 - startup migrations
 - OTLP protobuf ingest through `POST /v1/projects/{project_name}/traces`
 - LangSmith run creation through `POST /runs`
-- LangSmith run updates through `PATCH /runs/{run_id}`
+- LangSmith run updates through `PATCH /runs/{run_id}`, including preserved
+  inputs and hydrated outputs
 - LangSmith project lookup through `GET /sessions`
-- LangSmith run query through `POST /runs/query`
-- LangSmith run lookup through `GET /runs/{run_id}`
+- LangSmith run query through `POST /runs/query`, including the minimal cursor
+  envelope
+- LangSmith run lookup through `GET /runs/{run_id}`, including not-found
+  responses
+- LangSmith error filtering
+- `/v1` run create, update, read, and query aliases
 - LangSmith SDK model parsing of KevinDB's project and run responses
 
 This test does not cover feedback APIs, real cursor pagination, attachments, or
