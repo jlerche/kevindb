@@ -15,6 +15,7 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use tokio_postgres::NoTls;
 
+pub mod cache;
 mod langsmith;
 
 pub use langsmith::{

@@ -3,7 +3,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use kevindb::db::run_migrations;
 use kevindb::ingest::IngestConfig as RuntimeIngestConfig;
-use kevindb_config::{ObjectStoreConfig, ServerConfig};
+use kevindb_config::{CacheConfig, CacheMode, ObjectStoreConfig, ServerConfig};
+use kevindb_server::cache::CachedObjectStore;
 use kevindb_server::{ServerState, app};
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
@@ -27,7 +28,7 @@ async fn main() -> Result<()> {
 
     let state = ServerState::new(
         config.postgres_url,
-        object_store_from_config(config.object_store),
+        object_store_from_config(config.object_store, config.cache).await?,
         ingest_config,
     );
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
@@ -48,9 +49,34 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn object_store_from_config(config: ObjectStoreConfig) -> Arc<dyn ObjectStore> {
-    match config {
+async fn object_store_from_config(
+    object_store_config: ObjectStoreConfig,
+    cache_config: CacheConfig,
+) -> Result<Arc<dyn ObjectStore>> {
+    let object_store: Arc<dyn ObjectStore> = match object_store_config {
         ObjectStoreConfig::Memory => Arc::new(InMemory::new()),
+    };
+
+    match cache_config.mode {
+        CacheMode::Memory => Ok(Arc::new(CachedObjectStore::memory(
+            object_store,
+            cache_config.memory_capacity_bytes,
+        ))),
+        CacheMode::Hybrid => {
+            let cache_dir = cache_config
+                .hybrid_dir
+                .expect("hybrid cache config requires a directory");
+            Ok(Arc::new(
+                CachedObjectStore::hybrid(
+                    object_store,
+                    cache_config.memory_capacity_bytes,
+                    cache_dir,
+                    cache_config.disk_capacity_bytes,
+                    cache_config.disk_block_bytes,
+                )
+                .await?,
+            ))
+        }
     }
 }
 

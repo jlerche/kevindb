@@ -23,6 +23,16 @@ Optional environment variables:
 
 - `KEVINDB_BIND_ADDR`: socket address to bind, default `127.0.0.1:3000`.
 - `KEVINDB_OBJECT_STORE`: object store backend, currently only `memory`.
+- `KEVINDB_CACHE_MODE`: object-store cache mode, `memory` or `hybrid`,
+  default `memory`.
+- `KEVINDB_CACHE_MEMORY_CAPACITY_BYTES`: in-memory cache capacity, default
+  `67108864`.
+- `KEVINDB_CACHE_HYBRID_DIR`: directory for hybrid cache files, required when
+  `KEVINDB_CACHE_MODE=hybrid`.
+- `KEVINDB_CACHE_DISK_CAPACITY_BYTES`: hybrid cache disk capacity, default
+  `1073741824`.
+- `KEVINDB_CACHE_DISK_BLOCK_BYTES`: hybrid cache block size, default
+  `16777216`.
 - `KEVINDB_INGEST_MAX_SPANS_PER_SEGMENT`: max spans per Vortex segment,
   default `1024`.
 - `KEVINDB_INGEST_MAX_FLUSH_DELAY_MS`: max time an underfilled ingest batch

@@ -6,9 +6,12 @@ rust-version = "1.92"
 
 [dependencies]
 anyhow = "1.0.100"
+async-trait = "0.1.89"
 axum = "0.8.7"
 bytes = "1.11.0"
 chrono = "0.4.42"
+foyer = { version = "0.22.3", features = ["serde"] }
+futures-util = "0.3.31"
 kevindb = { path = "../.." }
 kevindb-config = { path = "../kevindb-config" }
 kevindb-metastore-postgres = { path = "../kevindb-metastore-postgres" }
