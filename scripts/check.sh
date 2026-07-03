@@ -14,7 +14,13 @@ while IFS= read -r -d '' file; do
   fi
 done < <(
   find . \
-    \( -path './.git' -o -path './target' \) -prune -o \
+    \( \
+      -path './.git' -o \
+      -path './target' -o \
+      -path '*/.venv' -o \
+      -path '*/.pytest_cache' -o \
+      -path '*/__pycache__' \
+    \) -prune -o \
     -type f \
     ! -name 'Cargo.lock' \
     ! -name '*.lock' \

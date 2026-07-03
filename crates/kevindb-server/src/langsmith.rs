@@ -144,7 +144,7 @@ pub(super) struct ListSessionsQuery {
     name: Option<String>,
     limit: Option<usize>,
     #[allow(dead_code)]
-    include_stats: Option<bool>,
+    include_stats: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

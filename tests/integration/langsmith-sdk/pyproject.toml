@@ -1,0 +1,14 @@
+[project]
+name = "kevindb-langsmith-sdk-integration"
+version = "0.0.1"
+description = "LangSmith SDK integration test for KevinDB"
+requires-python = ">=3.11"
+dependencies = [
+    "langsmith>=0.4,<0.5",
+    "opentelemetry-proto>=1.38,<2",
+    "pytest>=8,<9",
+    "requests>=2.32,<3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["test_langsmith_sdk.py"]
