@@ -78,6 +78,105 @@ async fn ingest_otlp_flushes_to_object_store_and_postgres() {
 }
 
 #[tokio::test]
+async fn query_diagnostics_report_segment_fanout() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 64,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+    ingestor
+        .ingest_otlp("demo", sample_export())
+        .await
+        .expect("ingest otlp");
+
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store);
+    let result = query_engine
+        .list_runs_with_diagnostics(RunQuery {
+            project_names: vec!["demo".to_owned()],
+            trace_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+            parent_run_id: None,
+            parent_span_id: None,
+            run_type: None,
+            is_root: None,
+            error: None,
+            start_time_min_unix_nano: None,
+            start_time_max_unix_nano: None,
+            limit: None,
+            offset: None,
+            retention_cutoff_unix_nano: None,
+            include_deleted: false,
+        })
+        .await
+        .expect("query with diagnostics");
+
+    assert_eq!(result.runs.len(), 2);
+    assert_eq!(result.diagnostics.rows_returned, 2);
+    assert_eq!(result.diagnostics.candidate_segments, 1);
+    assert_eq!(result.diagnostics.vortex_files_opened, 1);
+
+    mockgres.stop().await.expect("stop mockgres");
+}
+
+#[tokio::test]
+async fn trace_query_diagnostics_reject_project_wide_fanout_when_trace_is_known() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 1,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+    let first = sample_record("1111111111111111", 10);
+    let mut second = sample_record("2222222222222222", 20);
+    second.trace_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned();
+    ingestor
+        .ingest_records(vec![first, second])
+        .await
+        .expect("ingest traces");
+
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store);
+    let result = query_engine
+        .list_runs_with_diagnostics(RunQuery {
+            project_names: vec!["demo".to_owned()],
+            trace_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+            parent_run_id: None,
+            parent_span_id: None,
+            run_type: None,
+            is_root: None,
+            error: None,
+            start_time_min_unix_nano: None,
+            start_time_max_unix_nano: None,
+            limit: None,
+            offset: None,
+            retention_cutoff_unix_nano: None,
+            include_deleted: false,
+        })
+        .await
+        .expect("query trace diagnostics");
+
+    assert_eq!(result.runs.len(), 1);
+    assert_eq!(result.diagnostics.candidate_segments, 1);
+
+    mockgres.stop().await.expect("stop mockgres");
+}
+
+#[tokio::test]
 async fn empty_ingest_does_not_flush() {
     let ingestor = Ingestor::in_memory("postgresql://127.0.0.1:1/postgres");
 

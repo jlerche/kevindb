@@ -2303,6 +2303,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kevindb-bench"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "kevindb",
+ "kevindb-metastore-postgres",
+ "object_store",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "kevindb-config"
 version = "0.0.1"
 

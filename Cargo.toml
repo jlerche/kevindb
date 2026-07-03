@@ -7,6 +7,7 @@ rust-version = "1.92"
 [workspace]
 members = [
     ".",
+    "crates/kevindb-bench",
     "crates/kevindb-config",
     "crates/kevindb-metastore-postgres",
     "crates/kevindb-server",
