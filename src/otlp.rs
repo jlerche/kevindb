@@ -29,6 +29,7 @@ pub enum RunEventKind {
     Update,
     End,
     Compact,
+    Tombstone,
 }
 
 impl RunEventKind {
@@ -38,6 +39,7 @@ impl RunEventKind {
             Self::Update => "update",
             Self::End => "end",
             Self::Compact => "compact",
+            Self::Tombstone => "tombstone",
         }
     }
 }

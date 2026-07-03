@@ -2489,6 +2489,7 @@ dependencies = [
  "tokio-postgres",
  "tracing",
  "url",
+ "uuid",
  "vortex",
  "vortex-datafusion",
 ]

@@ -35,6 +35,8 @@ can reach `/readyz`.
 - KevinDB server startup against `mockgres`
 - startup migrations
 - OTLP protobuf ingest through `POST /v1/projects/{project_name}/traces`
+- OTLP ingest idempotency for retried payloads
+- generated LangSmith-compatible run IDs for OTLP spans
 - LangSmith run creation through `POST /runs`
 - LangSmith run updates through `PATCH /runs/{run_id}`, including preserved
   inputs and hydrated outputs
@@ -42,7 +44,7 @@ can reach `/readyz`.
 - LangSmith run query through `POST /runs/query`, including the minimal cursor
   envelope and cursor pagination
 - LangSmith run lookup through `GET /runs/{run_id}`, including not-found
-  responses
+  responses and generated OTLP run IDs
 - trace lookup through `GET /v1/projects/{project_name}/traces/{trace_id}`
 - parent and time-window run query filters
 - LangSmith error filtering

@@ -14,6 +14,9 @@ use vortex::session::VortexSession;
 
 use crate::otlp::SpanRecord;
 
+pub const SPAN_SEGMENT_SCHEMA_VERSION: i64 = 2;
+pub const ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION: i64 = 2;
+
 pub async fn encode_span_records(records: &[SpanRecord]) -> Result<Bytes> {
     let batch = records_to_batch(records)?;
     let vortex_array =
@@ -61,6 +64,7 @@ fn records_to_batch(records: &[SpanRecord]) -> Result<RecordBatch> {
         Field::new("status_code", DataType::Int32, false),
         Field::new("event_type", DataType::Utf8, false),
         Field::new("event_time_unix_nano", DataType::Int64, false),
+        Field::new("row_index", DataType::Int64, false),
         Field::new("attributes_json", DataType::Utf8, false),
     ]));
 
@@ -137,6 +141,13 @@ fn records_to_batch(records: &[SpanRecord]) -> Result<RecordBatch> {
         )),
         Arc::new(Int64Array::from(
             records.iter().map(event_time_unix_nano).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            records
+                .iter()
+                .enumerate()
+                .map(|(row_index, _)| row_index as i64)
+                .collect::<Vec<_>>(),
         )),
         Arc::new(StringArray::from(
             records

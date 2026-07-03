@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use kevindb::ingest::{IngestConfig, Ingestor};
 use kevindb::query::{QueryEngine, RunQuery, RunQueryDiagnostics};
 use kevindb_metastore_postgres::{FeedbackFilter, FeedbackRecord, PostgresMetastore};
@@ -141,7 +141,7 @@ async fn run_ingest_workload(
 
 async fn run_single_run_load_current(
     query_engine: &QueryEngine,
-    postgres_url: &str,
+    _postgres_url: &str,
     dataset: &SyntheticDataset,
     store: &CountingObjectStore,
 ) -> Result<WorkloadResult> {
@@ -149,44 +149,20 @@ async fn run_single_run_load_current(
     for _ in 0..dataset.config.iterations {
         let before = store.counters().snapshot();
         let started = Instant::now();
-        let pg_started = Instant::now();
-        let scope = load_run_scope(postgres_url, &dataset.selected_run_id).await?;
-        let postgres_lookup_time = pg_started.elapsed();
         let result = query_engine
-            .list_runs_with_diagnostics(RunQuery {
-                project_names: vec![scope.project_name],
-                trace_id: Some(scope.trace_id),
-                parent_run_id: None,
-                parent_span_id: None,
-                run_type: None,
-                is_root: None,
-                error: None,
-                start_time_min_unix_nano: None,
-                start_time_max_unix_nano: None,
-                limit: None,
-                offset: None,
-                retention_cutoff_unix_nano: None,
-                include_deleted: false,
-            })
+            .load_run_by_id_with_diagnostics(&dataset.selected_run_id)
             .await?;
-        let rows = usize::from(
-            result
-                .runs
-                .iter()
-                .any(|run| run.run_id.as_deref() == Some(dataset.selected_run_id.as_str())),
-        );
+        let rows = usize::from(result.run.is_some());
         let object_delta = store.counters().snapshot().delta_since(before);
         stats.record(
             started.elapsed(),
             rows,
             &result.diagnostics,
             object_delta,
-            postgres_lookup_time,
+            Duration::ZERO,
         );
     }
-    Ok(stats.finish(Some(
-        "current path loads the containing trace; direct row-locator access is Phase 1",
-    )))
+    Ok(stats.finish(None))
 }
 
 async fn run_trace_tree_load(
@@ -413,32 +389,6 @@ async fn load_segment_count(postgres_url: &str) -> Result<usize> {
         .await?
         .get(0);
     Ok(count as usize)
-}
-
-#[derive(Debug)]
-struct RunScope {
-    project_name: String,
-    trace_id: String,
-}
-
-async fn load_run_scope(postgres_url: &str, run_id: &str) -> Result<RunScope> {
-    let (client, connection) = tokio_postgres::connect(postgres_url, NoTls)
-        .await
-        .context("connect postgres for run lookup")?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    let row = client
-        .query_opt(
-            "SELECT project_name, trace_id FROM run_heads WHERE run_id = $1",
-            &[&run_id],
-        )
-        .await?
-        .ok_or_else(|| anyhow!("selected synthetic run was not found: {run_id}"))?;
-    Ok(RunScope {
-        project_name: row.get(0),
-        trace_id: row.get(1),
-    })
 }
 
 #[derive(Debug)]

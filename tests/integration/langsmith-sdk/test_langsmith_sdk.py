@@ -6,7 +6,7 @@ import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 import requests
@@ -63,22 +63,37 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
         )
         wait_for_readyz(server_url, server)
 
-        ingest_sample_trace(server_url)
+        ingest_receipt = ingest_sample_trace(server_url)
+        assert ingest_receipt["accepted_spans"] == 2
+        assert ingest_receipt["flushed_segments"] == 1
+
+        retry_receipt = ingest_sample_trace(server_url)
+        assert retry_receipt["accepted_spans"] == 2
+        assert retry_receipt["flushed_segments"] == 0
+        assert retry_receipt["flushes"] == []
 
         client = Client(
             api_url=server_url,
             api_key="test-key",
             auto_batch_tracing=False,
         )
+        otlp_root_id = generated_run_id(PROJECT_NAME, TRACE_ID, ROOT_SPAN_ID)
+        otlp_child_id = generated_run_id(PROJECT_NAME, TRACE_ID, CHILD_SPAN_ID)
         llm_runs = list(
             client.list_runs(project_name=PROJECT_NAME, run_type="llm", limit=1)
         )
         assert [run.name for run in llm_runs] == ["llm.call"]
-        assert llm_runs[0].parent_run_id is not None
+        assert llm_runs[0].id == otlp_child_id
+        assert llm_runs[0].parent_run_id == otlp_root_id
         assert str(llm_runs[0].trace_id) == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        otlp_child = client.read_run(otlp_child_id)
+        assert otlp_child.name == "llm.call"
+        assert otlp_child.parent_run_id == otlp_root_id
+        assert otlp_child.run_type == "llm"
 
         root_runs = list(client.list_runs(project_name=PROJECT_NAME, is_root=True))
         assert [run.name for run in root_runs] == ["agent.run"]
+        assert root_runs[0].id == otlp_root_id
 
         sdk_root_id = uuid4()
         sdk_child_id = uuid4()
@@ -293,7 +308,7 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
         stop_process(mockgres)
 
 
-def ingest_sample_trace(server_url: str) -> None:
+def ingest_sample_trace(server_url: str) -> dict[str, object]:
     request = ExportTraceServiceRequest(
         resource_spans=[
             ResourceSpans(
@@ -340,6 +355,14 @@ def ingest_sample_trace(server_url: str) -> None:
         timeout=5,
     )
     response.raise_for_status()
+    return response.json()
+
+
+def generated_run_id(project_name: str, trace_id: bytes, span_id: bytes) -> UUID:
+    return uuid5(
+        NAMESPACE_URL,
+        f"kevindb:run:{project_name}:{trace_id.hex()}:{span_id.hex()}",
+    )
 
 
 def string_attr(key: str, value: str) -> KeyValue:

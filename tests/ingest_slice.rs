@@ -15,7 +15,7 @@ use tokio_postgres::NoTls;
 
 use kevindb::ingest::{IngestConfig, Ingestor};
 use kevindb::otlp::{RunEventKind, SpanRecord};
-use kevindb::query::{QueryEngine, RunQuery};
+use kevindb::query::{QueryEngine, RunQuery, generated_run_id};
 use kevindb::segment::read_span_count;
 use mockgres_support::start_mockgres_with_migrations;
 use tokio::time::Duration;
@@ -66,10 +66,41 @@ async fn ingests_otlp_spans_to_vortex_segment_and_postgres_indexes() -> Result<(
         .query_one("SELECT count(*) FROM run_heads", &[])
         .await?
         .get(0);
+    let run_locator_count: i64 = client
+        .query_one("SELECT count(*) FROM run_locators", &[])
+        .await?
+        .get(0);
+    let trace_locator_count: i64 = client
+        .query_one("SELECT count(*) FROM trace_locators", &[])
+        .await?
+        .get(0);
+    let schema_version: i64 = client
+        .query_one("SELECT schema_version FROM trace_segments", &[])
+        .await?
+        .get(0);
+    let (child_last_row_index, child_last_run_event_id): (i64, Option<i64>) = {
+        let row = client
+            .query_one(
+                "SELECT last_row_index, last_run_event_id
+                FROM run_heads
+                WHERE span_id = '2222222222222222'",
+                &[],
+            )
+            .await?;
+        (row.get(0), row.get(1))
+    };
 
     assert_eq!(segment_count, 1);
     assert_eq!(span_count, 2);
     assert_eq!(run_head_count, 2);
+    assert_eq!(run_locator_count, 2);
+    assert_eq!(trace_locator_count, 2);
+    assert_eq!(
+        schema_version,
+        kevindb::segment::SPAN_SEGMENT_SCHEMA_VERSION
+    );
+    assert_eq!(child_last_row_index, 1);
+    assert!(child_last_run_event_id.is_some());
 
     let parent: Option<String> = client
         .query_one(
@@ -91,6 +122,35 @@ async fn ingests_otlp_spans_to_vortex_segment_and_postgres_indexes() -> Result<(
     assert_eq!(runs[0].status, "success");
     assert_eq!(runs[1].run_type, "llm");
 
+    let trace_result = query_engine
+        .load_trace_with_diagnostics("demo", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .await?;
+    assert_eq!(trace_result.runs.len(), 2);
+    assert_eq!(trace_result.diagnostics.candidate_segments, 1);
+    assert_eq!(trace_result.diagnostics.vortex_files_opened, 1);
+
+    let generated_child_id = generated_run_id(
+        "demo",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "2222222222222222",
+    );
+    let child = query_engine
+        .load_run_by_id_with_diagnostics(&generated_child_id)
+        .await?;
+    assert_eq!(child.diagnostics.candidate_segments, 1);
+    assert_eq!(child.diagnostics.vortex_files_opened, 1);
+    let child = child.run.expect("generated child run should exist");
+    assert_eq!(child.run_id, None);
+    assert_eq!(child.name, "llm.call");
+
+    let child_events = query_engine
+        .load_run_events_by_id(&generated_child_id)
+        .await?;
+    assert_eq!(child_events.len(), 1);
+    assert_eq!(child_events[0].generated_run_id, generated_child_id);
+    assert_eq!(child_events[0].run_id, None);
+    assert_eq!(child_events[0].row_index, 1);
+
     let trace = query_engine
         .load_trace_tree("demo", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         .await?;
@@ -98,6 +158,63 @@ async fn ingests_otlp_spans_to_vortex_segment_and_postgres_indexes() -> Result<(
     assert_eq!(trace.roots[0].run.name, "agent.run");
     assert_eq!(trace.roots[0].children.len(), 1);
     assert_eq!(trace.roots[0].children[0].run.name, "llm.call");
+
+    mockgres.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn duplicate_retry_skips_duplicate_metadata_and_object_write() -> Result<()> {
+    let mockgres = start_mockgres_with_migrations().await?;
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 1,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+    let record = span_record("agent.run", 10, 20, 1);
+
+    let first = ingestor.ingest_records(vec![record.clone()]).await?;
+    let retry = ingestor.ingest_records(vec![record]).await?;
+
+    assert_eq!(first.accepted_spans, 1);
+    assert_eq!(first.flushed_segments, 1);
+    assert_eq!(retry.accepted_spans, 1);
+    assert_eq!(retry.flushed_segments, 0);
+    assert!(retry.flushes.is_empty());
+
+    let first_uri = first.flush.expect("first ingest should flush").segment_uri;
+    object_store.head(&Path::from(first_uri.as_str())).await?;
+
+    let (client, connection) = tokio_postgres::connect(mockgres.postgres_url(), NoTls).await?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let segment_count: i64 = client
+        .query_one("SELECT count(*) FROM trace_segments", &[])
+        .await?
+        .get(0);
+    let event_count: i64 = client
+        .query_one("SELECT count(*) FROM run_events", &[])
+        .await?
+        .get(0);
+    let span_index_count: i64 = client
+        .query_one("SELECT count(*) FROM trace_segment_spans", &[])
+        .await?
+        .get(0);
+    let run_locator_count: i64 = client
+        .query_one("SELECT count(*) FROM run_locators", &[])
+        .await?
+        .get(0);
+
+    assert_eq!(segment_count, 1);
+    assert_eq!(event_count, 1);
+    assert_eq!(span_index_count, 1);
+    assert_eq!(run_locator_count, 1);
 
     mockgres.stop().await?;
     Ok(())
@@ -226,16 +343,16 @@ async fn query_uses_run_head_manifests_to_skip_stale_segments() -> Result<()> {
         },
     );
 
-    let first_receipt = ingestor
-        .ingest_records(vec![span_record("agent.run", 10, 0, 1)])
-        .await?;
+    let mut start = span_record("agent.run", 10, 0, 0);
+    start.event_kind = RunEventKind::Start;
+    let first_receipt = ingestor.ingest_records(vec![start]).await?;
     let stale_segment_uri = first_receipt
         .flush
         .expect("first ingest should flush")
         .segment_uri;
-    ingestor
-        .ingest_records(vec![span_record("agent.run", 10, 40, 2)])
-        .await?;
+    let mut end = span_record("agent.run", 10, 40, 2);
+    end.event_kind = RunEventKind::End;
+    ingestor.ingest_records(vec![end]).await?;
 
     object_store
         .delete(&Path::from(stale_segment_uri.as_str()))
@@ -248,6 +365,37 @@ async fn query_uses_run_head_manifests_to_skip_stale_segments() -> Result<()> {
     assert_eq!(runs[0].name, "agent.run");
     assert_eq!(runs[0].status, "error");
     assert_eq!(runs[0].end_time_unix_nano, 40);
+
+    let direct = query_engine
+        .load_run_by_id_with_diagnostics("11111111-1111-1111-1111-111111111111")
+        .await?;
+    assert_eq!(direct.diagnostics.candidate_segments, 1);
+    assert_eq!(direct.diagnostics.vortex_files_opened, 1);
+    assert_eq!(direct.diagnostics.rows_returned, 1);
+    assert_eq!(direct.run.as_ref(), runs.first());
+
+    let events = query_engine
+        .load_run_events_by_id("11111111-1111-1111-1111-111111111111")
+        .await?;
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["start", "end"]
+    );
+
+    let replayed = query_engine
+        .replay_run_by_id("11111111-1111-1111-1111-111111111111")
+        .await?;
+    assert_eq!(replayed.as_ref(), runs.first());
+
+    let trace_result = query_engine
+        .load_trace_with_diagnostics("demo", TRACE_ID)
+        .await?;
+    assert_eq!(trace_result.runs, runs);
+    assert_eq!(trace_result.diagnostics.candidate_segments, 1);
+    assert_eq!(trace_result.diagnostics.vortex_files_opened, 1);
 
     mockgres.stop().await?;
     Ok(())

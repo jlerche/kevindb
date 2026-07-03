@@ -7,7 +7,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use chrono::{DateTime, SecondsFormat, Utc};
 use kevindb::otlp::{RunEventKind, SpanRecord};
-use kevindb::query::{RunQuery, RunSummary};
+use kevindb::query::{RunQuery, RunSummary, generated_run_id};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_postgres::NoTls;
@@ -263,8 +263,8 @@ impl RunWriteRequest {
             "run id",
         )?;
         let existing = state.load_run_head(&run_id).await?;
-        let existing_payload = if let Some(existing) = &existing {
-            state.load_run_payload(&run_id, existing).await?
+        let existing_payload = if existing.is_some() {
+            state.load_run_payload(&run_id).await?
         } else {
             LangSmithPayload::default()
         };
@@ -414,33 +414,16 @@ impl ServerState {
     }
 
     async fn load_run_summary_by_id(&self, run_id: &str) -> Result<Option<RunSummary>, ApiError> {
-        let existing = match self.load_run_head(run_id).await? {
-            Some(existing) => existing,
-            None => return self.load_generated_run_summary_by_id(run_id).await,
-        };
-        let runs = self
+        if let Some(run) = self
             .query_engine()
-            .list_runs(RunQuery {
-                project_names: vec![existing.project_name],
-                trace_id: Some(existing.trace_id),
-                parent_run_id: None,
-                parent_span_id: None,
-                run_type: None,
-                is_root: None,
-                error: None,
-                start_time_min_unix_nano: None,
-                start_time_max_unix_nano: None,
-                limit: None,
-                offset: None,
-                retention_cutoff_unix_nano: None,
-                include_deleted: false,
-            })
+            .load_run_by_id(run_id)
             .await
-            .context("load run summary by id")?;
+            .context("load run summary by id")?
+        {
+            return Ok(Some(run));
+        }
 
-        Ok(runs
-            .into_iter()
-            .find(|run| run.run_id.as_deref() == Some(run_id)))
+        self.load_generated_run_summary_by_id(run_id).await
     }
 
     async fn load_generated_run_summary_by_id(
@@ -481,34 +464,12 @@ impl ServerState {
         Ok(None)
     }
 
-    async fn load_run_payload(
-        &self,
-        run_id: &str,
-        existing: &StoredRunHead,
-    ) -> Result<LangSmithPayload, ApiError> {
-        let runs = self
+    async fn load_run_payload(&self, run_id: &str) -> Result<LangSmithPayload, ApiError> {
+        Ok(self
             .query_engine()
-            .list_runs(RunQuery {
-                project_names: vec![existing.project_name.clone()],
-                trace_id: Some(existing.trace_id.clone()),
-                parent_run_id: None,
-                parent_span_id: None,
-                run_type: None,
-                is_root: None,
-                error: None,
-                start_time_min_unix_nano: None,
-                start_time_max_unix_nano: None,
-                limit: None,
-                offset: None,
-                retention_cutoff_unix_nano: None,
-                include_deleted: false,
-            })
+            .load_run_by_id(run_id)
             .await
-            .context("load run payload")?;
-
-        Ok(runs
-            .into_iter()
-            .find(|run| run.run_id.as_deref() == Some(run_id))
+            .context("load run payload")?
             .map(|run| LangSmithPayload::from_attributes_json(&run.attributes_json))
             .unwrap_or_default())
     }
@@ -755,13 +716,14 @@ pub struct RunResponse {
 
 impl From<RunSummary> for RunResponse {
     fn from(run: RunSummary) -> Self {
-        let id = run.run_id.clone().unwrap_or_else(|| {
-            run_uuid(&run.project_name, &run.trace_id, &run.span_id).to_string()
-        });
+        let id = run
+            .run_id
+            .clone()
+            .unwrap_or_else(|| generated_run_id(&run.project_name, &run.trace_id, &run.span_id));
         let session_id = project_uuid(&run.project_name).to_string();
         let parent_run_id = run.parent_run_id.clone().or_else(|| {
             run.parent_span_id.as_ref().map(|parent_span_id| {
-                run_uuid(&run.project_name, &run.trace_id, parent_span_id).to_string()
+                generated_run_id(&run.project_name, &run.trace_id, parent_span_id)
             })
         });
         let start_time = unix_nano_to_rfc3339(run.start_time_unix_nano);
@@ -818,7 +780,7 @@ fn runs_with_children(mut runs: Vec<RunResponse>) -> Vec<RunResponse> {
 fn response_run_id(run: &RunSummary) -> String {
     run.run_id
         .clone()
-        .unwrap_or_else(|| run_uuid(&run.project_name, &run.trace_id, &run.span_id).to_string())
+        .unwrap_or_else(|| generated_run_id(&run.project_name, &run.trace_id, &run.span_id))
 }
 
 fn tenant_uuid() -> Uuid {
@@ -829,13 +791,6 @@ fn project_uuid(project_name: &str) -> Uuid {
     Uuid::new_v5(
         &Uuid::NAMESPACE_URL,
         format!("kevindb:project:{project_name}").as_bytes(),
-    )
-}
-
-fn run_uuid(project_name: &str, trace_id: &str, span_id: &str) -> Uuid {
-    Uuid::new_v5(
-        &Uuid::NAMESPACE_URL,
-        format!("kevindb:run:{project_name}:{trace_id}:{span_id}").as_bytes(),
     )
 }
 

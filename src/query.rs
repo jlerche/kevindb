@@ -12,9 +12,14 @@ use datafusion::prelude::SessionContext;
 use object_store::ObjectStore;
 use tokio_postgres::NoTls;
 use url::Url;
+use uuid::Uuid;
 use vortex_datafusion::VortexFormatFactory;
 
+use crate::otlp::RunEventKind;
+
+mod random_access;
 mod tree;
+pub use random_access::{RunEventSummary, RunLoadResult};
 pub(crate) use tree::trace_tree_from_runs;
 pub use tree::{RunNode, TraceTree};
 
@@ -112,22 +117,7 @@ impl QueryEngine {
         project_name: &str,
         trace_id: &str,
     ) -> Result<Vec<RunSummary>> {
-        self.list_runs(RunQuery {
-            project_names: vec![project_name.to_owned()],
-            trace_id: Some(trace_id.to_owned()),
-            parent_run_id: None,
-            parent_span_id: None,
-            run_type: None,
-            is_root: None,
-            error: None,
-            start_time_min_unix_nano: None,
-            start_time_max_unix_nano: None,
-            limit: None,
-            offset: None,
-            retention_cutoff_unix_nano: None,
-            include_deleted: false,
-        })
-        .await
+        self.load_trace(project_name, trace_id).await
     }
 
     pub async fn list_runs(&self, query: RunQuery) -> Result<Vec<RunSummary>> {
@@ -187,7 +177,7 @@ impl QueryEngine {
     }
 
     pub async fn load_trace_tree(&self, project_name: &str, trace_id: &str) -> Result<TraceTree> {
-        let runs = self.list_runs_in_trace(project_name, trace_id).await?;
+        let runs = self.load_trace(project_name, trace_id).await?;
         Ok(trace_tree_from_runs(project_name, trace_id, runs))
     }
 
@@ -197,21 +187,7 @@ impl QueryEngine {
         trace_id: &str,
     ) -> Result<TraceTreeQueryResult> {
         let result = self
-            .list_runs_with_diagnostics(RunQuery {
-                project_names: vec![project_name.to_owned()],
-                trace_id: Some(trace_id.to_owned()),
-                parent_run_id: None,
-                parent_span_id: None,
-                run_type: None,
-                is_root: None,
-                error: None,
-                start_time_min_unix_nano: None,
-                start_time_max_unix_nano: None,
-                limit: None,
-                offset: None,
-                retention_cutoff_unix_nano: None,
-                include_deleted: false,
-            })
+            .load_trace_with_diagnostics(project_name, trace_id)
             .await?;
         Ok(TraceTreeQueryResult {
             trace_tree: trace_tree_from_runs(project_name, trace_id, result.runs),
@@ -302,6 +278,14 @@ impl QueryEngine {
         tx.commit().await.context("commit retention expiration")?;
         Ok(deleted)
     }
+}
+
+pub fn generated_run_id(project_name: &str, trace_id: &str, span_id: &str) -> String {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("kevindb:run:{project_name}:{trace_id}:{span_id}").as_bytes(),
+    )
+    .to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -464,8 +448,8 @@ async fn delete_run_in_tx(
     deleted_at_unix_nano: i64,
     reason: Option<&str>,
 ) -> Result<bool> {
-    let updated = tx
-        .execute(
+    let deleted_row = tx
+        .query_opt(
             "UPDATE run_heads
             SET deleted_at_unix_nano = $4,
                 deletion_reason = $5,
@@ -473,7 +457,8 @@ async fn delete_run_in_tx(
             WHERE project_name = $1
                 AND trace_id = $2
                 AND span_id = $3
-                AND deleted_at_unix_nano IS NULL",
+                AND deleted_at_unix_nano IS NULL
+            RETURNING run_id, generated_run_id, last_trace_segment_id, last_row_index",
             &[
                 &project_name,
                 &trace_id,
@@ -485,9 +470,42 @@ async fn delete_run_in_tx(
         .await
         .context("mark run head deleted")?;
 
-    if updated == 0 {
+    let Some(deleted_row) = deleted_row else {
         return Ok(false);
-    }
+    };
+    let run_id: String = deleted_row.get(0);
+    let _generated_run_id: String = deleted_row.get(1);
+    let trace_segment_id: i64 = deleted_row.get(2);
+    let row_index: i64 = deleted_row.get(3);
+
+    let event_type = RunEventKind::Tombstone.as_str();
+    let idempotency_key =
+        format!("tombstone:{project_name}:{trace_id}:{span_id}:{deleted_at_unix_nano}");
+    let event_row = tx
+        .query_one(
+            "INSERT INTO run_events(
+                trace_segment_id, project_name, run_id, trace_id, span_id,
+                event_type, event_time_unix_nano, row_index, idempotency_key
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (project_name, idempotency_key)
+            DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
+            RETURNING id",
+            &[
+                &trace_segment_id,
+                &project_name,
+                &run_id,
+                &trace_id,
+                &span_id,
+                &event_type,
+                &deleted_at_unix_nano,
+                &row_index,
+                &idempotency_key,
+            ],
+        )
+        .await
+        .context("insert tombstone run event")?;
+    let run_event_id: i64 = event_row.get(0);
 
     tx.execute(
         "INSERT INTO run_deletions(
@@ -530,6 +548,69 @@ async fn delete_run_in_tx(
     )
     .await
     .context("write trace segment delete vectors")?;
+
+    tx.execute(
+        "UPDATE run_heads
+        SET last_event_type = $4,
+            last_event_time_unix_nano = $5,
+            last_run_event_id = $6,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE project_name = $1
+            AND trace_id = $2
+            AND span_id = $3",
+        &[
+            &project_name,
+            &trace_id,
+            &span_id,
+            &event_type,
+            &deleted_at_unix_nano,
+            &run_event_id,
+        ],
+    )
+    .await
+    .context("advance deleted run head tombstone")?;
+
+    tx.execute(
+        "UPDATE run_locators
+        SET event_type = $4,
+            event_time_unix_nano = $5,
+            run_event_id = $6,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE project_name = $1
+            AND trace_id = $2
+            AND span_id = $3",
+        &[
+            &project_name,
+            &trace_id,
+            &span_id,
+            &event_type,
+            &deleted_at_unix_nano,
+            &run_event_id,
+        ],
+    )
+    .await
+    .context("advance deleted run locator tombstone")?;
+
+    tx.execute(
+        "UPDATE trace_locators
+        SET event_type = $4,
+            event_time_unix_nano = $5,
+            run_event_id = $6,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE project_name = $1
+            AND trace_id = $2
+            AND span_id = $3",
+        &[
+            &project_name,
+            &trace_id,
+            &span_id,
+            &event_type,
+            &deleted_at_unix_nano,
+            &run_event_id,
+        ],
+    )
+    .await
+    .context("advance deleted trace locator tombstone")?;
 
     Ok(true)
 }
@@ -601,7 +682,7 @@ async fn query_trace_segments_with_datafusion_timed(
 fn run_head_datafusion_sql(segment_uris: &[String], query: &RunQuery) -> String {
     let source_sql = segment_uris
         .iter()
-        .map(|uri| format!("SELECT * FROM {}", sql_object_store_path(uri)))
+        .map(|uri| segment_source_sql(uri))
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
     let where_sql = run_query_where_sql(query);
@@ -652,6 +733,28 @@ fn run_head_datafusion_sql(segment_uris: &[String], query: &RunQuery) -> String 
         ) AS runs
         WHERE run_version = 1 AND {where_sql}
         ORDER BY start_time_unix_nano ASC, span_id ASC{limit_sql}{offset_sql}",
+    )
+}
+
+fn segment_source_sql(uri: &str) -> String {
+    format!(
+        "SELECT
+            project_name,
+            run_id,
+            trace_id,
+            span_id,
+            parent_run_id,
+            parent_span_id,
+            name,
+            run_type,
+            start_time_unix_nano,
+            end_time_unix_nano,
+            status_code,
+            event_type,
+            event_time_unix_nano,
+            attributes_json
+        FROM {}",
+        sql_object_store_path(uri)
     )
 }
 

@@ -12,7 +12,9 @@ use tokio::time::{sleep, timeout};
 
 use super::*;
 use crate::db::run_migrations;
-use crate::query::{QueryEngine, RunQuery};
+use crate::query::{QueryEngine, RunQuery, generated_run_id};
+
+mod phase1;
 
 #[tokio::test]
 async fn ingest_otlp_flushes_to_object_store_and_postgres() {
@@ -69,10 +71,56 @@ async fn ingest_otlp_flushes_to_object_store_and_postgres() {
         .await
         .expect("count run heads")
         .get(0);
+    let run_locator_count: i64 = client
+        .query_one("SELECT count(*) FROM run_locators", &[])
+        .await
+        .expect("count run locators")
+        .get(0);
+    let trace_locator_count: i64 = client
+        .query_one("SELECT count(*) FROM trace_locators", &[])
+        .await
+        .expect("count trace locators")
+        .get(0);
+    let schema_version: i64 = client
+        .query_one("SELECT schema_version FROM trace_segments", &[])
+        .await
+        .expect("load trace segment schema version")
+        .get(0);
+    let (last_row_index, last_run_event_id): (i64, Option<i64>) = {
+        let row = client
+            .query_one(
+                "SELECT last_row_index, last_run_event_id
+                FROM run_heads
+                WHERE span_id = '2222222222222222'",
+                &[],
+            )
+            .await
+            .expect("load run head locator");
+        (row.get(0), row.get(1))
+    };
 
     assert_eq!(segment_count, 1);
     assert_eq!(span_count, 2);
     assert_eq!(run_head_count, 2);
+    assert_eq!(run_locator_count, 2);
+    assert_eq!(trace_locator_count, 2);
+    assert_eq!(schema_version, crate::segment::SPAN_SEGMENT_SCHEMA_VERSION);
+    assert_eq!(last_row_index, 1);
+    assert!(last_run_event_id.is_some());
+
+    let generated_child_id = generated_run_id(
+        "demo",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "2222222222222222",
+    );
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store);
+    let child = query_engine
+        .load_run_by_id(&generated_child_id)
+        .await
+        .expect("load generated run id")
+        .expect("generated run should exist");
+    assert_eq!(child.run_id, None);
+    assert_eq!(child.span_id, "2222222222222222");
 
     mockgres.stop().await.expect("stop mockgres");
 }
@@ -152,25 +200,63 @@ async fn trace_query_diagnostics_reject_project_wide_fanout_when_trace_is_known(
 
     let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store);
     let result = query_engine
+        .load_trace_with_diagnostics("demo", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .await
+        .expect("query trace diagnostics");
+
+    assert_eq!(result.runs.len(), 1);
+    assert_eq!(result.diagnostics.candidate_segments, 1);
+
+    mockgres.stop().await.expect("stop mockgres");
+}
+
+#[tokio::test]
+async fn project_time_filter_diagnostics_reject_full_project_fanout() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 1,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+    ingestor
+        .ingest_records(vec![
+            sample_record("1111111111111111", 10),
+            sample_record("2222222222222222", 20),
+            sample_record("3333333333333333", 30),
+        ])
+        .await
+        .expect("ingest project runs");
+
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store);
+    let result = query_engine
         .list_runs_with_diagnostics(RunQuery {
             project_names: vec!["demo".to_owned()],
-            trace_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+            trace_id: None,
             parent_run_id: None,
             parent_span_id: None,
             run_type: None,
             is_root: None,
             error: None,
-            start_time_min_unix_nano: None,
-            start_time_max_unix_nano: None,
+            start_time_min_unix_nano: Some(20),
+            start_time_max_unix_nano: Some(20),
             limit: None,
             offset: None,
             retention_cutoff_unix_nano: None,
             include_deleted: false,
         })
         .await
-        .expect("query trace diagnostics");
+        .expect("query project time filter diagnostics");
 
     assert_eq!(result.runs.len(), 1);
+    assert_eq!(result.runs[0].span_id, "2222222222222222");
     assert_eq!(result.diagnostics.candidate_segments, 1);
 
     mockgres.stop().await.expect("stop mockgres");
@@ -348,7 +434,7 @@ async fn failed_flush_restores_pending_records() {
     assert!(
         error
             .to_string()
-            .contains("connect postgres for ingest metadata")
+            .contains("connect postgres for ingest idempotency check")
     );
 
     let pending = ingestor.pending.lock().await;
@@ -496,6 +582,19 @@ async fn compacts_and_respects_deletes_and_retention() {
     assert_eq!(compacted.compacted_runs, 2);
     assert_eq!(compacted.compacted_segments, 2);
     assert_eq!(compacted.written_segments, 2);
+
+    let compacted_run = query_engine
+        .load_run_by_id("2222222222222222")
+        .await
+        .expect("load run after compaction")
+        .expect("compacted run should exist");
+    assert_eq!(compacted_run.span_id, "2222222222222222");
+    let compacted_trace = query_engine
+        .load_trace_with_diagnostics("demo", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .await
+        .expect("load trace after compaction");
+    assert_eq!(compacted_trace.runs.len(), 2);
+    assert_eq!(compacted_trace.diagnostics.candidate_segments, 2);
 
     assert!(
         query_engine
