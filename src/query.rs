@@ -127,11 +127,11 @@ async fn load_run_query_segment_uris(postgres_url: &str, query: &RunQuery) -> Re
             client
                 .query(
                     "SELECT DISTINCT trace_segments.uri
-                    FROM trace_segments
-                    INNER JOIN trace_segment_spans
-                        ON trace_segment_spans.trace_segment_id = trace_segments.id
-                    WHERE trace_segment_spans.project_name = $1
-                        AND trace_segment_spans.trace_id = $2
+                    FROM run_heads
+                    INNER JOIN trace_segments
+                        ON trace_segments.id = run_heads.last_trace_segment_id
+                    WHERE run_heads.project_name = $1
+                        AND run_heads.trace_id = $2
                     ORDER BY trace_segments.uri",
                     &[project_name, trace_id],
                 )
@@ -141,9 +141,9 @@ async fn load_run_query_segment_uris(postgres_url: &str, query: &RunQuery) -> Re
                 .query(
                     "SELECT DISTINCT trace_segments.uri
                     FROM trace_segments
-                    INNER JOIN trace_segment_spans
-                        ON trace_segment_spans.trace_segment_id = trace_segments.id
-                    WHERE trace_segment_spans.project_name = $1
+                    INNER JOIN run_heads
+                        ON run_heads.last_trace_segment_id = trace_segments.id
+                    WHERE run_heads.project_name = $1
                     ORDER BY trace_segments.uri",
                     &[project_name],
                 )

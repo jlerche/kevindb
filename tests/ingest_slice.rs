@@ -14,10 +14,13 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Sta
 use tokio_postgres::NoTls;
 
 use kevindb::ingest::{IngestConfig, Ingestor};
+use kevindb::otlp::SpanRecord;
 use kevindb::query::QueryEngine;
 use kevindb::segment::read_span_count;
 use mockgres_support::start_mockgres_with_migrations;
 use tokio::time::Duration;
+
+const TRACE_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 #[tokio::test]
 async fn ingests_otlp_spans_to_vortex_segment_and_postgres_indexes() -> Result<()> {
@@ -100,6 +103,46 @@ async fn ingests_otlp_spans_to_vortex_segment_and_postgres_indexes() -> Result<(
     Ok(())
 }
 
+#[tokio::test]
+async fn query_uses_run_head_manifests_to_skip_stale_segments() -> Result<()> {
+    let mockgres = start_mockgres_with_migrations().await?;
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 64,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+
+    let first_receipt = ingestor
+        .ingest_records(vec![span_record("agent.run", 10, 0, 1)])
+        .await?;
+    let stale_segment_uri = first_receipt
+        .flush
+        .expect("first ingest should flush")
+        .segment_uri;
+    ingestor
+        .ingest_records(vec![span_record("agent.run", 10, 40, 2)])
+        .await?;
+
+    object_store
+        .delete(&Path::from(stale_segment_uri.as_str()))
+        .await?;
+
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store);
+    let runs = query_engine.list_runs_in_trace("demo", TRACE_ID).await?;
+
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].name, "agent.run");
+    assert_eq!(runs[0].status, "error");
+    assert_eq!(runs[0].end_time_unix_nano, 40);
+
+    mockgres.stop().await?;
+    Ok(())
+}
+
 fn sample_export() -> ExportTraceServiceRequest {
     ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
@@ -160,4 +203,26 @@ fn sample_export() -> ExportTraceServiceRequest {
 
 fn repeated_bytes(byte: u8, len: usize) -> Vec<u8> {
     vec![byte; len]
+}
+
+fn span_record(
+    name: &str,
+    start_time_unix_nano: i64,
+    end_time_unix_nano: i64,
+    status_code: i32,
+) -> SpanRecord {
+    SpanRecord {
+        project_name: "demo".to_owned(),
+        run_id: "11111111-1111-1111-1111-111111111111".to_owned(),
+        trace_id: TRACE_ID.to_owned(),
+        span_id: "1111111111111111".to_owned(),
+        parent_run_id: None,
+        parent_span_id: None,
+        name: name.to_owned(),
+        run_type: "chain".to_owned(),
+        start_time_unix_nano,
+        end_time_unix_nano,
+        status_code,
+        attributes_json: "{}".to_owned(),
+    }
 }
