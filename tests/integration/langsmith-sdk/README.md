@@ -40,12 +40,14 @@ can reach `/readyz`.
   inputs and hydrated outputs
 - LangSmith project lookup through `GET /sessions`
 - LangSmith run query through `POST /runs/query`, including the minimal cursor
-  envelope
+  envelope and cursor pagination
 - LangSmith run lookup through `GET /runs/{run_id}`, including not-found
   responses
+- trace lookup through `GET /v1/projects/{project_name}/traces/{trace_id}`
+- parent and time-window run query filters
 - LangSmith error filtering
+- LangSmith feedback creation, listing, lookup, and run-scoped lookup
 - `/v1` run create, update, read, and query aliases
 - LangSmith SDK model parsing of KevinDB's project and run responses
 
-This test does not cover feedback APIs, real cursor pagination, attachments, or
-frontend-specific query APIs.
+This test does not cover attachments or frontend-specific query APIs.

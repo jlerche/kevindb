@@ -134,6 +134,38 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
         assert read_root.inputs == {"prompt": "hello"}
         assert read_root.outputs == {"answer": "world"}
 
+        feedback = client.create_feedback(
+            sdk_child_id,
+            key="quality",
+            score=1.0,
+            comment="looks good",
+        )
+        assert feedback.run_id == sdk_child_id
+        listed_feedback = list(
+            client.list_feedback(
+                run_ids=[sdk_child_id],
+                feedback_key=["quality"],
+                limit=1,
+            )
+        )
+        assert len(listed_feedback) == 1
+        assert listed_feedback[0].run_id == sdk_child_id
+        assert listed_feedback[0].key == "quality"
+        assert listed_feedback[0].score == 1.0
+        assert listed_feedback[0].comment == "looks good"
+        feedback_response = requests.get(
+            f"{server_url}/feedback/{feedback.id}",
+            timeout=5,
+        )
+        feedback_response.raise_for_status()
+        assert feedback_response.json()["id"] == str(feedback.id)
+        run_feedback_response = requests.get(
+            f"{server_url}/runs/{sdk_child_id}/feedback",
+            timeout=5,
+        )
+        run_feedback_response.raise_for_status()
+        assert [item["key"] for item in run_feedback_response.json()] == ["quality"]
+
         failed_run_id = uuid4()
         client.create_run(
             id=failed_run_id,
@@ -165,6 +197,54 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
         assert query_body["runs"][0]["outputs"] == {"answer": "world"}
         assert query_body["runs"][1]["inputs"] == {"messages": ["hello"]}
         assert query_body["runs"][1]["outputs"] == {"text": "world"}
+        assert query_body["runs"][0]["child_run_ids"] == [str(sdk_child_id)]
+
+        trace_response = requests.get(
+            f"{server_url}/v1/projects/{PROJECT_NAME}/traces/{sdk_root_id}",
+            timeout=5,
+        )
+        trace_response.raise_for_status()
+        trace_body = trace_response.json()
+        assert trace_body["root_run_ids"] == [str(sdk_root_id)]
+        assert [run["name"] for run in trace_body["runs"]] == ["sdk.agent", "sdk.llm"]
+
+        filtered_response = requests.post(
+            f"{server_url}/runs/query",
+            json={
+                "project_name": PROJECT_NAME,
+                "parent_run_id": str(sdk_root_id),
+                "start_time_gte": (
+                    sdk_start + timedelta(milliseconds=50)
+                ).isoformat(),
+            },
+            timeout=5,
+        )
+        filtered_response.raise_for_status()
+        assert [run["name"] for run in filtered_response.json()["runs"]] == ["sdk.llm"]
+
+        first_page_response = requests.post(
+            f"{server_url}/runs/query",
+            json={"project_name": PROJECT_NAME, "trace": str(sdk_root_id), "limit": 1},
+            timeout=5,
+        )
+        first_page_response.raise_for_status()
+        first_page = first_page_response.json()
+        assert [run["name"] for run in first_page["runs"]] == ["sdk.agent"]
+        assert first_page["cursors"] == {"next": "1"}
+        second_page_response = requests.post(
+            f"{server_url}/runs/query",
+            json={
+                "project_name": PROJECT_NAME,
+                "trace": str(sdk_root_id),
+                "limit": 1,
+                "cursor": first_page["cursors"]["next"],
+            },
+            timeout=5,
+        )
+        second_page_response.raise_for_status()
+        second_page = second_page_response.json()
+        assert [run["name"] for run in second_page["runs"]] == ["sdk.llm"]
+        assert second_page["cursors"] == {"next": None}
 
         v1_run_id = uuid4()
         v1_trace_id = uuid4()

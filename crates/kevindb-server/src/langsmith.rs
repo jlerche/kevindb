@@ -15,6 +15,10 @@ use uuid::Uuid;
 
 use crate::{ApiError, ServerState};
 
+mod feedback;
+pub use feedback::FeedbackResponse;
+pub(crate) use feedback::{create_feedback, list_feedback, list_run_feedback, read_feedback};
+
 impl ServerState {
     async fn list_project_names(
         &self,
@@ -401,7 +405,7 @@ impl ServerState {
     async fn load_run_summary_by_id(&self, run_id: &str) -> Result<Option<RunSummary>, ApiError> {
         let existing = match self.load_run_head(run_id).await? {
             Some(existing) => existing,
-            None => return Ok(None),
+            None => return self.load_generated_run_summary_by_id(run_id).await,
         };
         let runs = self
             .query_engine()
@@ -424,6 +428,44 @@ impl ServerState {
         Ok(runs
             .into_iter()
             .find(|run| run.run_id.as_deref() == Some(run_id)))
+    }
+
+    async fn load_generated_run_summary_by_id(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<RunSummary>, ApiError> {
+        let (client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
+            .await
+            .context("connect postgres for generated run lookup")?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::warn!(error = %err, "postgres generated run lookup connection failed");
+            }
+        });
+
+        let scopes = client
+            .query(
+                "SELECT DISTINCT project_name, trace_id FROM run_heads ORDER BY project_name, trace_id",
+                &[],
+            )
+            .await
+            .context("load run lookup scopes")?;
+
+        for scope in scopes {
+            let project_name: String = scope.get(0);
+            let trace_id: String = scope.get(1);
+            let runs = self
+                .query_engine()
+                .list_runs_in_trace(&project_name, &trace_id)
+                .await
+                .context("load generated run lookup trace")?;
+
+            if let Some(run) = runs.into_iter().find(|run| response_run_id(run) == run_id) {
+                return Ok(Some(run));
+            }
+        }
+
+        Ok(None)
     }
 
     async fn load_run_payload(
@@ -758,6 +800,12 @@ fn runs_with_children(mut runs: Vec<RunResponse>) -> Vec<RunResponse> {
     runs
 }
 
+fn response_run_id(run: &RunSummary) -> String {
+    run.run_id
+        .clone()
+        .unwrap_or_else(|| run_uuid(&run.project_name, &run.trace_id, &run.span_id).to_string())
+}
+
 fn tenant_uuid() -> Uuid {
     Uuid::from_u128(0x4b4556494e4440008000000000000001)
 }
@@ -796,6 +844,24 @@ fn uuid_simple(value: &str) -> String {
 
 fn uuid_to_span_id(value: &str) -> String {
     uuid_simple(value).chars().take(16).collect()
+}
+
+fn otel_trace_id_to_uuid(trace_id: &str) -> String {
+    if let Ok(uuid) = Uuid::parse_str(trace_id) {
+        return uuid.to_string();
+    }
+    if trace_id.len() == 32 && trace_id.chars().all(|char| char.is_ascii_hexdigit()) {
+        return format!(
+            "{}-{}-{}-{}-{}",
+            &trace_id[0..8],
+            &trace_id[8..12],
+            &trace_id[12..16],
+            &trace_id[16..20],
+            &trace_id[20..32]
+        );
+    }
+
+    trace_id.to_owned()
 }
 
 fn normalize_trace_filter(trace_id: Option<String>) -> Option<String> {

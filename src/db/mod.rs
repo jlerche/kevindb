@@ -4,6 +4,7 @@ use tokio_postgres::NoTls;
 
 mod embedded {
     use super::embed_migrations;
+    // Keep this module in the same crate as migrations so new files are embedded.
     embed_migrations!("src/db/migrations");
 }
 

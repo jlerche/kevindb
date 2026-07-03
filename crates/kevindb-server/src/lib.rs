@@ -18,9 +18,13 @@ use tokio_postgres::NoTls;
 mod langsmith;
 
 pub use langsmith::{
-    ProjectResponse, RunResponse, RunsQueryRequest, RunsResponse, StringList, TraceResponse,
+    FeedbackResponse, ProjectResponse, RunResponse, RunsQueryRequest, RunsResponse, StringList,
+    TraceResponse,
 };
-use langsmith::{create_run, list_sessions, query_runs, read_project_trace, read_run, update_run};
+use langsmith::{
+    create_feedback, create_run, list_feedback, list_run_feedback, list_sessions, query_runs,
+    read_feedback, read_project_trace, read_run, update_run,
+};
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -85,8 +89,14 @@ pub fn app(state: ServerState) -> Router {
         .route("/v1/runs", post(create_run))
         .route("/runs/{run_id}", get(read_run).patch(update_run))
         .route("/v1/runs/{run_id}", get(read_run).patch(update_run))
+        .route("/runs/{run_id}/feedback", get(list_run_feedback))
+        .route("/v1/runs/{run_id}/feedback", get(list_run_feedback))
         .route("/runs/query", post(query_runs))
         .route("/v1/runs/query", post(query_runs))
+        .route("/feedback", get(list_feedback).post(create_feedback))
+        .route("/v1/feedback", get(list_feedback).post(create_feedback))
+        .route("/feedback/{feedback_id}", get(read_feedback))
+        .route("/v1/feedback/{feedback_id}", get(read_feedback))
         .route("/v1/projects/{project_name}/traces", post(ingest_trace))
         .route(
             "/v1/projects/{project_name}/traces/{trace_id}",
@@ -252,6 +262,7 @@ mod tests {
 
     #[tokio::test]
     async fn serves_otlp_ingest_and_trace_run_query() -> Result<()> {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let mockgres = Mockgres::start().await?;
         run_migrations(mockgres.postgres_url()).await?;
 
@@ -366,6 +377,71 @@ mod tests {
             trace_body.runs[0].child_run_ids,
             vec![trace_body.runs[1].id.clone()]
         );
+        let child_run_id = trace_body.runs[1].id.clone();
+
+        let create_feedback_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/feedback")
+                    .header("content-type", "application/json")
+                    .body(json_body(json!({
+                        "run_id": child_run_id.clone(),
+                        "key": "quality",
+                        "score": 1.0,
+                        "comment": "looks good",
+                        "extra": {"source": "unit-test"}
+                    })))?,
+            )
+            .await?;
+        assert_eq!(create_feedback_response.status(), StatusCode::ACCEPTED);
+
+        let feedback_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/feedback?run={child_run_id}&key=quality"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(feedback_response.status(), StatusCode::OK);
+        let feedback_body: Vec<FeedbackResponse> =
+            decode_response(feedback_response.into_body()).await?;
+        assert_eq!(feedback_body.len(), 1);
+        assert_eq!(
+            feedback_body[0].run_id.as_deref(),
+            Some(child_run_id.as_str())
+        );
+        assert_eq!(feedback_body[0].key, "quality");
+        assert_eq!(feedback_body[0].score, Some(json!(1.0)));
+        assert_eq!(feedback_body[0].comment.as_deref(), Some("looks good"));
+
+        let read_feedback_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/feedback/{}", feedback_body[0].id))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(read_feedback_response.status(), StatusCode::OK);
+
+        let run_feedback_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/runs/{child_run_id}/feedback"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(run_feedback_response.status(), StatusCode::OK);
+        let run_feedback_body: Vec<FeedbackResponse> =
+            decode_response(run_feedback_response.into_body()).await?;
+        assert_eq!(run_feedback_body.len(), 1);
 
         let langsmith_response = app
             .clone()
