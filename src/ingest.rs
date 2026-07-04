@@ -22,6 +22,7 @@ const INGEST_TIME_BUCKET_UNIX_NANOS: i64 = 60 * 60 * 1_000_000_000;
 
 mod indexes;
 mod metadata;
+mod thread;
 mod tree;
 use metadata::persist_metadata;
 

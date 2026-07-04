@@ -20,6 +20,7 @@ mod object_store_stats;
 mod planner;
 mod random_access;
 mod rows;
+mod threads;
 mod tree;
 mod tree_access;
 mod tree_filter;
@@ -35,6 +36,10 @@ pub(crate) use planner::{
 };
 pub use random_access::{RunEventSummary, RunLoadResult, RunProjection, TraceLoadResult};
 pub(crate) use rows::run_summaries_from_batches;
+pub use threads::{
+    ThreadListPage, ThreadListQuery, ThreadMessageSummary, ThreadSummary, ThreadTracePage,
+    ThreadTraceQuery, ThreadTraceSummary,
+};
 pub(crate) use tree::trace_tree_from_runs;
 pub use tree::{RunNode, TraceTree};
 pub use tree_filter::{TreeFilterExpr, TreeFilterMode, TreeFilterScope};

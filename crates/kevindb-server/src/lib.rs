@@ -20,11 +20,12 @@ mod langsmith;
 
 pub use langsmith::{
     FeedbackResponse, ProjectResponse, RunResponse, RunsQueryRequest, RunsResponse, StringList,
-    TraceResponse,
+    ThreadResponse, ThreadTraceResponse, ThreadTracesResponse, ThreadsQueryRequest,
+    ThreadsQueryResponse, TraceResponse,
 };
 use langsmith::{
     create_feedback, create_run, list_feedback, list_run_feedback, list_sessions, query_runs,
-    read_feedback, read_project_trace, read_run, update_run,
+    query_thread_traces, query_threads, read_feedback, read_project_trace, read_run, update_run,
 };
 
 #[derive(Clone)]
@@ -94,6 +95,8 @@ pub fn app(state: ServerState) -> Router {
         .route("/v1/runs/{run_id}/feedback", get(list_run_feedback))
         .route("/runs/query", post(query_runs))
         .route("/v1/runs/query", post(query_runs))
+        .route("/v2/threads/query", post(query_threads))
+        .route("/v2/threads/{thread_id}/traces", get(query_thread_traces))
         .route("/feedback", get(list_feedback).post(create_feedback))
         .route("/v1/feedback", get(list_feedback).post(create_feedback))
         .route("/feedback/{feedback_id}", get(read_feedback))
@@ -660,6 +663,165 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body: ErrorResponse = decode_response(response.into_body()).await?;
         assert!(body.error.contains("invalid OTLP protobuf"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serves_langsmith_thread_endpoints() -> Result<()> {
+        let mockgres = Mockgres::start().await?;
+        run_migrations(mockgres.postgres_url()).await?;
+
+        let state = ServerState::new(
+            mockgres.postgres_url().to_owned(),
+            Arc::new(InMemory::new()),
+            IngestConfig {
+                max_spans_per_segment: 64,
+                max_flush_delay: std::time::Duration::ZERO,
+            },
+        );
+        let app = app(state);
+
+        for (run_id, trace_id, start, tokens, input, output) in [
+            (
+                "11111111-1111-4111-8111-111111111111",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "2026-01-01T00:00:00Z",
+                42,
+                "hello one",
+                "answer one",
+            ),
+            (
+                "22222222-2222-4222-8222-222222222222",
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "2026-01-01T00:01:00Z",
+                58,
+                "hello two",
+                "answer two",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/runs")
+                        .header("content-type", "application/json")
+                        .body(json_body(json!({
+                            "id": run_id,
+                            "name": "chat",
+                            "run_type": "chain",
+                            "project_name": "demo",
+                            "trace_id": trace_id,
+                            "start_time": start,
+                            "end_time": "2026-01-01T00:02:00Z",
+                            "inputs": {
+                                "messages": [{"role": "user", "content": input}]
+                            },
+                            "outputs": {
+                                "choices": [{"message": {"role": "assistant", "content": output}}]
+                            },
+                            "extra": {
+                                "metadata": {
+                                    "thread_id": "thread-http",
+                                    "total_tokens": tokens,
+                                    "total_cost": 0.01
+                                }
+                            }
+                        })))?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+
+        let sessions_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/sessions?name=demo")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(sessions_response.status(), StatusCode::OK);
+        let sessions: Vec<ProjectResponse> = decode_response(sessions_response.into_body()).await?;
+        let project_id = sessions[0].id.clone();
+
+        let threads_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/threads/query")
+                    .header("content-type", "application/json")
+                    .body(json_body(json!({
+                        "project_id": project_id,
+                        "page_size": 20
+                    })))?,
+            )
+            .await?;
+        assert_eq!(threads_response.status(), StatusCode::OK);
+        let threads: ThreadsQueryResponse = decode_response(threads_response.into_body()).await?;
+        assert_eq!(threads.items.len(), 1);
+        assert_eq!(threads.items[0].thread_id, "thread-http");
+        assert_eq!(threads.items[0].count, 2);
+        assert_eq!(threads.items[0].total_tokens, Some(100));
+        assert_eq!(threads.items[0].first_inputs.as_deref(), Some("hello one"));
+        assert_eq!(threads.items[0].last_outputs.as_deref(), Some("answer two"));
+
+        let first_traces_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/v2/threads/thread-http/traces?project_id={project_id}&page_size=1&selects=TRACE_ID&selects=THREAD_ID&selects=INPUTS_PREVIEW&selects=TOTAL_TOKENS"
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(first_traces_response.status(), StatusCode::OK);
+        let first_traces: ThreadTracesResponse =
+            decode_response(first_traces_response.into_body()).await?;
+        assert_eq!(first_traces.items.len(), 1);
+        assert_eq!(
+            first_traces.items[0].trace_id,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        );
+        assert_eq!(
+            first_traces.items[0].thread_id.as_deref(),
+            Some("thread-http")
+        );
+        assert_eq!(
+            first_traces.items[0].inputs_preview.as_deref(),
+            Some("hello one")
+        );
+        assert_eq!(first_traces.items[0].total_tokens, Some(42));
+        assert_eq!(first_traces.items[0].outputs_preview, None);
+        let next_cursor = first_traces.next_cursor.expect("cursor");
+
+        let second_traces_response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/v2/threads/thread-http/traces?project_id={project_id}&page_size=1&cursor={next_cursor}"
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(second_traces_response.status(), StatusCode::OK);
+        let second_traces: ThreadTracesResponse =
+            decode_response(second_traces_response.into_body()).await?;
+        assert_eq!(
+            second_traces.items[0].trace_id,
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        );
+        assert_eq!(
+            second_traces.items[0].outputs_preview.as_deref(),
+            Some("answer two")
+        );
+
+        mockgres.stop().await?;
         Ok(())
     }
 

@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use kevindb::ingest::{IngestConfig, Ingestor};
 use kevindb::query::filter::FilterExpr;
-use kevindb::query::{QueryEngine, RunQuery, RunQueryDiagnostics, TreeFilterExpr};
+use kevindb::query::{
+    QueryEngine, RunQuery, RunQueryDiagnostics, ThreadTraceQuery, TreeFilterExpr,
+};
 use kevindb_metastore_postgres::{FeedbackFilter, FeedbackRecord, PostgresMetastore};
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
@@ -89,12 +91,7 @@ pub async fn run_core_benchmarks() -> Result<BenchReport> {
     results.push(run_feedback_filtering(&metastore, &dataset.config).await?);
     results.push(run_root_tree_predicate(&query_engine, &dataset, &counting_store).await?);
     results.push(run_child_tree_predicate(&query_engine, &dataset, &counting_store).await?);
-    results.push(run_unsupported_rejection(
-        "thread-trace-listing",
-        dataset.config.iterations,
-        &counting_store,
-        "thread materialization is not implemented; benchmark refuses to scan payload metadata",
-    ));
+    results.push(run_thread_trace_listing(&query_engine, &dataset, &counting_store).await?);
     results.push(run_unsupported_rejection(
         "aggregate-scans",
         dataset.config.iterations,
@@ -376,6 +373,73 @@ async fn run_feedback_filtering(
         datafusion_planning_nanos: 0,
         datafusion_execution_nanos: 0,
         note: Some("feedback filtering is metastore-only"),
+    })
+}
+
+async fn run_thread_trace_listing(
+    query_engine: &QueryEngine,
+    dataset: &SyntheticDataset,
+    store: &CountingObjectStore,
+) -> Result<WorkloadResult> {
+    let selected_trace_index = dataset.config.trace_count / 2;
+    let thread_id = format!(
+        "thread-{:04}",
+        (selected_trace_index / dataset.config.traces_per_thread)
+            .min(dataset.config.thread_count - 1)
+    );
+    let page_size = dataset.config.traces_per_thread.clamp(1, 10);
+    let mut latencies = Vec::new();
+    let mut rows_returned = 0;
+    let mut object_store_requests = 0;
+    let mut bytes_read = 0;
+    let mut bytes_written = 0;
+    let mut postgres_query_nanos = 0;
+
+    for _ in 0..dataset.config.iterations {
+        let before = store.counters().snapshot();
+        let started = Instant::now();
+        let mut cursor = None;
+        let mut iteration_rows = 0;
+        for _ in 0..2 {
+            let page = query_engine
+                .list_thread_traces(ThreadTraceQuery {
+                    project_name: dataset.config.project_name.clone(),
+                    thread_id: thread_id.clone(),
+                    filter: None,
+                    page_size,
+                    cursor,
+                })
+                .await?;
+            postgres_query_nanos += page.diagnostics.postgres_query_time.as_nanos();
+            iteration_rows += page.items.len();
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        latencies.push(started.elapsed());
+        rows_returned = iteration_rows;
+        let object_delta = store.counters().snapshot().delta_since(before);
+        object_store_requests += object_delta.request_count();
+        bytes_read += object_delta.bytes_read;
+        bytes_written += object_delta.bytes_written;
+    }
+
+    Ok(WorkloadResult {
+        name: "thread-trace-listing",
+        status: "ok",
+        iterations: dataset.config.iterations,
+        rows_returned,
+        latency_nanos: Some(latency_summary(&latencies)),
+        candidate_segments_max: 0,
+        vortex_files_opened_max: 0,
+        object_store_requests,
+        bytes_read,
+        bytes_written,
+        postgres_query_nanos,
+        datafusion_planning_nanos: 0,
+        datafusion_execution_nanos: 0,
+        note: Some("thread trace pagination is metastore-only"),
     })
 }
 

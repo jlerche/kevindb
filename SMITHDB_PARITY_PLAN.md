@@ -77,11 +77,14 @@ Implemented or in progress:
 - LangSmith filter-string parsing for indexed scalar fields, explicit rejection
   for deferred search/JSON filters, scalar metadata/tag/feedback indexes, and a
   fanout-aware run-query planner with debug diagnostics and hard limits.
+- Thread reconstruction through `threads`, `thread_traces`, and
+  `thread_messages`, including bounded previews, cursor pagination, and
+  LangSmith-compatible thread query endpoints.
 
-Important gaps: no thread materialization, aggregate API, rollup storage, or
-production full-text/JSON object-store index. Full-text and
-JSON filtering are intentionally deferred until we implement an object-store-aware
-inverted index design. Large payload scans are not an acceptable fallback.
+Important gaps: no aggregate API, rollup storage, or production full-text/JSON
+object-store index. Full-text and JSON filtering are intentionally deferred
+until we implement an object-store-aware inverted index design. Large payload
+scans are not an acceptable fallback.
 
 ## Design Principles
 
@@ -487,17 +490,17 @@ Phase 3 evidence:
 - `src/query/tree_filter.rs` and `src/query/planner.rs` compile tree filters into metastore candidate-key predicates before Vortex reads.
 - `src/ingest/tests/phase3.rs` covers late parent repair, multiple roots, descendant filters, and cycle guarding; bench workloads now use real tree filters.
 
-## [ ] Phase 4: Thread Reconstruction
+## [x] Phase 4: Thread Reconstruction
 
 Goal: rebuild long-running conversations across many traces quickly.
 
-### [ ] Epic 4.1: Thread Identity And Ingest
+### [x] Epic 4.1: Thread Identity And Ingest
 
 Tasks:
 
-- [ ] Extract `thread_id` from metadata/tags according to LangSmith
+- [x] Extract `thread_id` from metadata/tags according to LangSmith
   conventions.
-- [ ] Store thread membership in Postgres:
+- [x] Store thread membership in Postgres:
   - project
   - thread ID
   - trace ID
@@ -506,26 +509,26 @@ Tasks:
   - preview fields
   - cost/token summaries
   - error preview
-- [ ] Support traces without thread IDs as ordinary traces.
+- [x] Support traces without thread IDs as ordinary traces.
 
 Subtasks:
 
-- [ ] Add migration for `threads`, `thread_traces`, and thread-level summaries.
-- [ ] Add tests for multi-trace thread ingestion.
-- [ ] Add backfill from existing run metadata.
+- [x] Add migration for `threads`, `thread_traces`, and thread-level summaries.
+- [x] Add tests for multi-trace thread ingestion.
+- [x] Add backfill from existing run metadata.
 
 Exit criteria:
 
-- [ ] A thread can be listed without scanning all traces in a project.
+- [x] A thread can be listed without scanning all traces in a project.
 
-### [ ] Epic 4.2: Thread APIs
+### [x] Epic 4.2: Thread APIs
 
 Tasks:
 
-- [ ] Implement `GET /v2/threads/{thread_id}/traces`.
-- [ ] Add thread list/query endpoint compatible with public docs where
+- [x] Implement `GET /v2/threads/{thread_id}/traces`.
+- [x] Add thread list/query endpoint compatible with public docs where
   possible.
-- [ ] Return fields documented by the thread traces API:
+- [x] Return fields documented by the thread traces API:
   - token counts
   - cost fields
   - latency
@@ -535,33 +538,47 @@ Tasks:
 
 Subtasks:
 
-- [ ] Add SDK or HTTP integration tests.
-- [ ] Add cursor stability tests.
-- [ ] Add pagination benchmarks.
+- [x] Add SDK or HTTP integration tests.
+- [x] Add cursor stability tests.
+- [x] Add pagination benchmarks.
 
 Exit criteria:
 
-- [ ] Thread trace listing has bounded Postgres and segment fanout.
+- [x] Thread trace listing has bounded Postgres and segment fanout.
 
-### [ ] Epic 4.3: Message/Turn Reconstruction
+### [x] Epic 4.3: Message/Turn Reconstruction
 
 Tasks:
 
-- [ ] Materialize message previews from runs where possible.
-- [ ] Maintain turn ordering across traces in a thread.
-- [ ] Store enough metadata to render a Messages view without loading all
+- [x] Materialize message previews from runs where possible.
+- [x] Maintain turn ordering across traces in a thread.
+- [x] Store enough metadata to render a Messages view without loading all
   payloads.
 
 Subtasks:
 
-- [ ] Define message extraction rules for common LLM input/output formats.
-- [ ] Store preview and locator, not full payload, in Postgres.
-- [ ] Add tests for long threads.
+- [x] Define message extraction rules for common LLM input/output formats.
+- [x] Store preview and locator, not full payload, in Postgres.
+- [x] Add tests for long threads.
 
 Exit criteria:
 
-- [ ] A thread overview loads quickly while full payloads remain in object
+- [x] A thread overview loads quickly while full payloads remain in object
   storage.
+
+Phase 4 evidence:
+- `V13__add_phase4_thread_indexes.sql` adds thread tables, preview locators,
+  pagination indexes, and a best-effort backfill from `run_metadata`.
+- `src/ingest/thread.rs` extracts `thread_id`/`session_id`, bounded previews,
+  message previews, and thread summaries inside the ingest metadata transaction.
+- `src/query/threads.rs` implements metastore-only thread list, trace list, and
+  message listing with tuple cursors and zero Vortex/object-store fanout.
+- `crates/kevindb-server/src/langsmith/threads.rs` exposes the two `/v2/threads`
+  contracts with documented fields, select handling, and cursor pagination.
+- Phase 4 tests cover multi-trace ingestion, fallback IDs, ordinary traces,
+  cursor stability, root-run filtering, long threads, and HTTP compatibility.
+- The 2026-07-04 benchmark records real `thread-trace-listing`: p50 0.62 ms,
+  p99 1.12 ms, zero candidate segments, and zero object-store requests.
 
 ## [ ] Phase 5: Aggregations And Stats
 
@@ -906,25 +923,10 @@ frontends where public contracts are available.
 
 Tasks:
 
-- [ ] Expand `/runs/query` compatibility:
-  - IDs
-  - project/session selectors
-  - trace filters
-  - time filters
-  - root filters
-  - error filters
-  - run type
-  - tags
-  - metadata scalar filters
-  - feedback filters
-  - cursor pagination
-- [ ] Add response fields from the public run data format:
-  - inputs
-  - outputs
-  - extra
-  - events
-  - tags
-  - attachments if supported later
+- [ ] Expand `/runs/query` compatibility for IDs, project/session selectors,
+  trace/time/root/error/run-type/tag/metadata/feedback filters, and cursors.
+- [ ] Add public run response fields: inputs, outputs, extra, events, tags,
+  and attachments if supported later.
 
 Subtasks:
 
@@ -991,7 +993,6 @@ Exit criteria:
   queries, and KevinDB can run locally and in a basic self-hosted environment.
 
 ## Explicit Non-Goals Until Phase 6
-
 Until the Phase 6 index exists, do not add payload scan fallbacks for
 full-text search, Postgres JSONB storage for large `inputs` or `outputs`,
 production token tables, phrase search without positions, JSON path/value

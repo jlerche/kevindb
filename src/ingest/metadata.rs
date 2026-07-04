@@ -10,6 +10,7 @@ use super::indexes::{
     ScalarIndexes, refresh_project_filter_stats, replace_run_scalar_indexes,
     root_locator_for_record,
 };
+use super::thread::{refresh_trace_thread_metadata, replace_run_preview};
 use super::tree::refresh_trace_tree_metadata;
 use super::{PartitionKey, event_time_unix_nano, run_event_idempotency_key, status_from_record};
 
@@ -223,6 +224,7 @@ pub(super) async fn persist_metadata(
 
         if run_head_updated {
             replace_run_scalar_indexes(tx, record, &scalar_indexes).await?;
+            replace_run_preview(tx, record).await?;
             updated_projects.insert(record.project_name.clone());
             updated_traces.insert((record.project_name.clone(), record.trace_id.clone()));
         }
@@ -300,6 +302,7 @@ pub(super) async fn persist_metadata(
 
     for (project_name, trace_id) in updated_traces {
         refresh_trace_tree_metadata(tx, &project_name, &trace_id).await?;
+        refresh_trace_thread_metadata(tx, &project_name, &trace_id).await?;
     }
     for project_name in updated_projects {
         refresh_project_filter_stats(tx, &project_name).await?;

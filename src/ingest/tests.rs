@@ -17,6 +17,7 @@ use crate::query::{QueryEngine, RunProjection, RunQuery, generated_run_id};
 mod phase1;
 mod phase2;
 mod phase3;
+mod phase4;
 
 #[tokio::test]
 async fn ingest_otlp_flushes_to_object_store_and_postgres() {

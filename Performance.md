@@ -15,6 +15,7 @@ published parity claims.
 | Ingest batch ack | p99 <= 150 ms | Object PUTs <= flushed segments |
 | Single run load | p99 <= 150 ms | Candidate segments <= 1 |
 | Trace tree load | p99 <= 150 ms | Object-store requests = 0 |
+| Thread trace listing | p99 <= 20 ms | Object-store requests = 0 |
 | Selective project filter | p99 <= 200 ms | Candidate segments < project total when time filters narrow |
 | Selective scalar filter | p99 <= 200 ms | Candidate segments scale with indexed candidates |
 | Feedback filter | p99 <= 20 ms | Object-store requests = 0 |
@@ -148,6 +149,48 @@ Trace tree reconstruction now reads `run_tree_nodes` and current `run_heads`
 from Postgres and does not open Vortex or object storage. Root and child tree
 predicate workloads use trace-selective indexed metadata so their Vortex fanout
 reflects the matched trace instead of the whole synthetic project.
+
+## Phase 4 Thread Snapshot
+
+Command:
+
+```bash
+cargo run -p kevindb-bench --quiet -- core
+```
+
+Date: 2026-07-04
+
+Dataset:
+
+| Setting | Value |
+| --- | ---: |
+| traces | 24 |
+| runs per trace | 8 |
+| records | 192 |
+| active segments | 12 |
+| feedback records | 52 |
+| iterations | 5 |
+
+Results:
+
+| Workload | p50 | p95/p99 | Candidate segments | Vortex files | Object requests | Bytes read |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ingest ack | 256.8 ms | 496.7 ms | 12 | 0 | 12 | 0 |
+| single run load | 70.3 ms | 72.8 ms | 1 | 1 | 45 | 162,660 |
+| trace tree load | 67.6 ms | 69.0 ms | 0 | 0 | 0 | 0 |
+| project run filtering | 146.8 ms | 155.1 ms | 12 | 12 | 480 | 1,932,640 |
+| selective scalar filtering | 52.5 ms | 54.1 ms | 1 | 1 | 35 | 158,300 |
+| nonselective scalar filtering | 97.5 ms | 99.3 ms | 7 | 7 | 245 | 1,117,780 |
+| feedback filtering | 0.9 ms | 1.4 ms | 0 | 0 | 0 | 0 |
+| root tree predicate | 284.1 ms | 288.9 ms | 1 | 1 | 35 | 158,300 |
+| child tree predicate | 279.8 ms | 285.3 ms | 1 | 1 | 40 | 160,180 |
+| thread trace listing | 0.62 ms | 1.12 ms | 0 | 0 | 0 | 0 |
+| aggregate scan rejection | 0.00002 ms | 0.00005 ms | 0 | 0 | 0 | 0 |
+
+Thread trace listing now reads `threads`/`thread_traces` from Postgres using
+cursor pagination. It does not open Vortex files or read object storage; full
+payloads remain in object storage while previews and locators are materialized
+in Postgres.
 
 ## Planner Snapshots
 

@@ -20,9 +20,15 @@ use crate::{ApiError, ServerState};
 
 mod feedback;
 mod filter;
+mod threads;
 pub use feedback::FeedbackResponse;
 pub(crate) use feedback::{create_feedback, list_feedback, list_run_feedback, read_feedback};
 use filter::{parse_filter, parse_tree_filter};
+pub use threads::{
+    ThreadResponse, ThreadTraceResponse, ThreadTracesResponse, ThreadsQueryRequest,
+    ThreadsQueryResponse,
+};
+pub(crate) use threads::{query_thread_traces, query_threads};
 
 const MAX_RUN_QUERY_CANDIDATE_SEGMENTS: usize = 128;
 const ESTIMATED_OBJECT_STORE_REQUESTS_PER_VORTEX_FILE: usize = 48;
