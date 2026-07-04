@@ -78,8 +78,8 @@ Implemented or in progress:
   for deferred search/JSON filters, scalar metadata/tag/feedback indexes, and a
   fanout-aware run-query planner with debug diagnostics and hard limits.
 
-Important gaps: no tree predicate index, thread materialization, aggregate API,
-rollup storage, or production full-text/JSON object-store index. Full-text and
+Important gaps: no thread materialization, aggregate API, rollup storage, or
+production full-text/JSON object-store index. Full-text and
 JSON filtering are intentionally deferred until we implement an object-store-aware
 inverted index design. Large payload scans are not an acceptable fallback.
 
@@ -483,7 +483,7 @@ Exit criteria:
 
 Phase 3 evidence:
 - `V12__add_phase3_tree_indexes.sql` adds tree nodes, edges, intervals, depth, sibling order, descendant counts, and guard flags.
-- `src/ingest/tree.rs` refreshes trace tree metadata from current heads on ingest and compaction.
+- `src/ingest/tree.rs` refreshes trace tree metadata from current heads on ingest and compaction, and `src/query/tree_access.rs` reconstructs trace trees from metadata without Vortex reads.
 - `src/query/tree_filter.rs` and `src/query/planner.rs` compile tree filters into metastore candidate-key predicates before Vortex reads.
 - `src/ingest/tests/phase3.rs` covers late parent repair, multiple roots, descendant filters, and cycle guarding; bench workloads now use real tree filters.
 
