@@ -203,6 +203,10 @@ pub(super) async fn query_runs(
     let offset = request.cursor_offset().or(request.offset);
     let limit = request.limit;
     let include_payload = request.include_payload();
+    let max_candidate_runs = limit
+        .unwrap_or(1000)
+        .saturating_add(offset.unwrap_or(0))
+        .saturating_add(1);
     if !direct_run_ids.is_empty() {
         let projection = if include_payload {
             RunProjection::FullPayload
@@ -246,6 +250,7 @@ pub(super) async fn query_runs(
         newest_first: true,
         limits: RunQueryLimits {
             max_candidate_segments: Some(128),
+            max_candidate_runs: Some(max_candidate_runs),
             max_estimated_object_store_requests: Some(128),
             max_candidate_bytes: Some(128 * 1024 * 1024),
             max_wall_time: Some(Duration::from_secs(30)),

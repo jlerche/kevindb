@@ -114,6 +114,7 @@ pub(crate) async fn load_run_query_plan(
     enforce_limits(
         query,
         segments_by_uri.len(),
+        candidate_runs,
         estimated_object_store_requests,
         candidate_bytes,
     )?;
@@ -240,6 +241,7 @@ fn run_head_where_sql(query: &RunQuery) -> Result<String> {
 fn enforce_limits(
     query: &RunQuery,
     candidate_segments: usize,
+    candidate_runs: usize,
     estimated_object_store_requests: usize,
     candidate_bytes: i64,
 ) -> Result<()> {
@@ -248,6 +250,13 @@ fn enforce_limits(
     {
         return Err(anyhow!(
             "query rejected: candidate segments {candidate_segments} exceed limit {limit}"
+        ));
+    }
+    if let Some(limit) = query.limits.max_candidate_runs
+        && candidate_runs > limit
+    {
+        return Err(anyhow!(
+            "query rejected: candidate runs {candidate_runs} exceed limit {limit}"
         ));
     }
     if let Some(limit) = query.limits.max_estimated_object_store_requests

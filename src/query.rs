@@ -23,7 +23,7 @@ mod rows;
 mod tree;
 use filter::FilterExpr;
 use object_store_stats::{
-    MeasuringObjectStore, ObjectStoreReadSnapshot, datafusion_batch_query,
+    MeasuringObjectStore, ObjectStoreReadLimits, ObjectStoreReadSnapshot, datafusion_batch_query,
     enforce_runtime_object_store_limits, page_datafusion_runs,
 };
 pub(crate) use planner::{
@@ -78,6 +78,7 @@ pub struct RunQuery {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunQueryLimits {
     pub max_candidate_segments: Option<usize>,
+    pub max_candidate_runs: Option<usize>,
     pub max_estimated_object_store_requests: Option<usize>,
     pub max_candidate_bytes: Option<i64>,
     pub max_wall_time: Option<Duration>,
@@ -622,7 +623,10 @@ pub(crate) async fn query_segment_sources_with_datafusion_timed(
         ));
     }
 
-    let measured_store = Arc::new(MeasuringObjectStore::new(object_store));
+    let measured_store = Arc::new(MeasuringObjectStore::with_limits(
+        object_store,
+        ObjectStoreReadLimits::from_query(query),
+    ));
     let context = vortex_session_context(measured_store.clone())?;
     let datafusion_query = datafusion_batch_query(query);
     let mut runs = Vec::new();

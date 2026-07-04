@@ -412,9 +412,11 @@ Phase 2 evidence:
 - `src/ingest/indexes.rs` materializes bounded scalar indexes and refreshes
   `project_filter_stats` with `COUNT(DISTINCT ...)`.
 - `src/query/planner.rs` plans candidate runs, row locators, and segments in
-  Postgres, estimates fanout, and enforces pre-read segment/request/byte limits.
+  Postgres, estimates fanout, and enforces pre-read run/segment/request/byte
+  limits.
 - `src/query/object_store_stats.rs` records actual query read requests and bytes;
-  debug diagnostics expose both estimates and measured object-store IO.
+  debug diagnostics expose both estimates and measured object-store IO, and the
+  wrapper rejects over-budget reads while they are being consumed.
 - `src/query.rs` executes candidate segments in bounded DataFusion batches and
   pushes row-locator predicates into each segment source.
 - `crates/kevindb-server/src/langsmith.rs` accepts `filter`, `trace_filter`,

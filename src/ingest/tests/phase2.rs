@@ -167,6 +167,15 @@ async fn planner_rejects_queries_that_exceed_fanout_limits() {
             .contains("candidate segments 1 exceed limit 0")
     );
 
+    let mut run_limited = RunQuery::new("demo");
+    run_limited.limits.max_candidate_runs = Some(0);
+    let err = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store.clone())
+        .list_runs_with_diagnostics(run_limited)
+        .await
+        .expect_err("candidate run limit should reject");
+    assert!(err.to_string().contains("candidate runs"));
+    assert!(err.to_string().contains("exceed limit 0"));
+
     let mut request_limited = RunQuery::new("demo");
     request_limited.limits.max_estimated_object_store_requests = Some(0);
     let err = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store.clone())

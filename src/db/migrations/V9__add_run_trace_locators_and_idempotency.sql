@@ -4,6 +4,9 @@ ALTER TABLE run_heads
 ALTER TABLE run_events
     ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
 
+ALTER TABLE run_events
+    ALTER COLUMN idempotency_key SET NOT NULL;
+
 CREATE UNIQUE INDEX IF NOT EXISTS ux_run_events_project_idempotency
     ON run_events(project_name, idempotency_key);
 
