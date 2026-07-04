@@ -119,6 +119,26 @@ fn negative_key_filters_compile_as_anti_exists_predicates() {
 }
 
 #[test]
+fn planner_scoped_filters_bound_index_subqueries_by_project() {
+    let projects = vec!["demo".to_owned(), "other".to_owned()];
+    let compiled =
+        FilterExpr::parse(r#"and(has(tags, "production"), eq(metadata_key, "thread_id"))"#)
+            .and_then(|expr| expr.compile_run_head_filter_for_projects("run_heads", &projects))
+            .expect("compile project-scoped filter");
+
+    assert!(
+        compiled
+            .predicate_sql
+            .contains("tag_filter.project_name IN ('demo', 'other')")
+    );
+    assert!(
+        compiled
+            .predicate_sql
+            .contains("metadata_filter.project_name IN ('demo', 'other')")
+    );
+}
+
+#[test]
 fn anchored_negative_values_stay_on_the_same_index_row() {
     let compiled = FilterExpr::parse(
         r#"and(eq(metadata_key, "phone"), neq(metadata_value, "1234567890"), eq(feedback_key, "quality"), neq(feedback_score, 0))"#,

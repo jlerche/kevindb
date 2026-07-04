@@ -113,14 +113,28 @@ impl FilterExpr {
 
     pub fn compile_run_head_filter(&self, run_alias: &str) -> Result<CompiledFilter, FilterError> {
         Ok(CompiledFilter {
-            predicate_sql: compile_expr(self, run_alias)?,
+            predicate_sql: compile_expr(self, run_alias, None)?,
+        })
+    }
+
+    pub(crate) fn compile_run_head_filter_for_projects(
+        &self,
+        run_alias: &str,
+        project_names: &[String],
+    ) -> Result<CompiledFilter, FilterError> {
+        Ok(CompiledFilter {
+            predicate_sql: compile_expr(self, run_alias, Some(project_names))?,
         })
     }
 }
 
-fn compile_expr(expr: &FilterExpr, run_alias: &str) -> Result<String, FilterError> {
+fn compile_expr(
+    expr: &FilterExpr,
+    run_alias: &str,
+    project_names: Option<&[String]>,
+) -> Result<String, FilterError> {
     match &expr.kind {
-        FilterKind::And(children) => compile_and(children, run_alias),
+        FilterKind::And(children) => compile_and(children, run_alias, project_names),
         FilterKind::Or(children) => {
             if children.is_empty() {
                 return Err(FilterError::Parse(
@@ -129,18 +143,20 @@ fn compile_expr(expr: &FilterExpr, run_alias: &str) -> Result<String, FilterErro
             }
             let predicates = children
                 .iter()
-                .map(|child| compile_expr(child, run_alias))
+                .map(|child| compile_expr(child, run_alias, project_names))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(format!("({})", predicates.join(" OR ")))
         }
-        FilterKind::Compare { op, field, value } => compile_compare(*op, *field, value, run_alias),
-        FilterKind::Has { field, value } => compile_has(*field, value, run_alias),
-        FilterKind::In { field, values } => compile_in(*field, values, run_alias),
+        FilterKind::Compare { op, field, value } => {
+            compile_compare(*op, *field, value, run_alias, project_names)
+        }
+        FilterKind::Has { field, value } => compile_has(*field, value, run_alias, project_names),
+        FilterKind::In { field, values } => compile_in(*field, values, run_alias, project_names),
         FilterKind::Contains {
             field,
             value,
             negated,
-        } => compile_contains(*field, value, *negated, run_alias),
+        } => compile_contains(*field, value, *negated, run_alias, project_names),
         FilterKind::Search(query) => {
             let _query_len = query.len();
             Err(FilterError::Unsupported(
@@ -150,7 +166,11 @@ fn compile_expr(expr: &FilterExpr, run_alias: &str) -> Result<String, FilterErro
     }
 }
 
-fn compile_and(children: &[FilterExpr], run_alias: &str) -> Result<String, FilterError> {
+fn compile_and(
+    children: &[FilterExpr],
+    run_alias: &str,
+    project_names: Option<&[String]>,
+) -> Result<String, FilterError> {
     if children.is_empty() {
         return Err(FilterError::Parse(
             "and() requires at least one child".to_owned(),
@@ -172,11 +192,15 @@ fn compile_and(children: &[FilterExpr], run_alias: &str) -> Result<String, Filte
             feedback_conditions.push(condition);
             continue;
         }
-        predicates.push(compile_expr(child, run_alias)?);
+        predicates.push(compile_expr(child, run_alias, project_names)?);
     }
 
     if !metadata_conditions.is_empty() {
-        predicates.push(metadata_exists_sql(run_alias, &metadata_conditions));
+        predicates.push(metadata_exists_sql(
+            run_alias,
+            &metadata_conditions,
+            project_names,
+        ));
     }
     if !feedback_conditions.is_empty() {
         predicates.push(feedback_exists_sql(run_alias, &feedback_conditions));
@@ -190,10 +214,11 @@ fn compile_compare(
     field: FilterField,
     value: &FilterValue,
     run_alias: &str,
+    project_names: Option<&[String]>,
 ) -> Result<String, FilterError> {
     match field {
         FilterField::MetadataKey | FilterField::MetadataValue => {
-            compile_metadata_atom(op, field, value, run_alias)
+            compile_metadata_atom(op, field, value, run_alias, project_names)
         }
         FilterField::FeedbackKey | FilterField::FeedbackScore | FilterField::FeedbackValue => {
             compile_feedback_atom(op, field, value, run_alias)
@@ -201,8 +226,11 @@ fn compile_compare(
         FilterField::Tags => {
             let tag = value.as_string("tags")?;
             match op {
-                CompareOp::Eq => Ok(tag_exists_sql(run_alias, &tag)),
-                CompareOp::Neq => Ok(format!("NOT ({})", tag_exists_sql(run_alias, &tag))),
+                CompareOp::Eq => Ok(tag_exists_sql(run_alias, &tag, project_names)),
+                CompareOp::Neq => Ok(format!(
+                    "NOT ({})",
+                    tag_exists_sql(run_alias, &tag, project_names)
+                )),
                 _ => Err(FilterError::Unsupported(
                     "tags only support eq, neq, has, and in".to_owned(),
                 )),
@@ -310,15 +338,21 @@ fn compile_has(
     field: FilterField,
     value: &FilterValue,
     run_alias: &str,
+    project_names: Option<&[String]>,
 ) -> Result<String, FilterError> {
     match field {
-        FilterField::Tags => Ok(tag_exists_sql(run_alias, &value.as_string("tags")?)),
+        FilterField::Tags => Ok(tag_exists_sql(
+            run_alias,
+            &value.as_string("tags")?,
+            project_names,
+        )),
         FilterField::MetadataKey => Ok(metadata_exists_sql(
             run_alias,
             &[format!(
                 "key = {}",
                 sql_string_literal(&value.as_string("metadata_key")?)
             )],
+            project_names,
         )),
         _ => Err(FilterError::Unsupported(
             "has() is supported for tags and metadata_key only".to_owned(),
@@ -330,6 +364,7 @@ fn compile_in(
     field: FilterField,
     values: &[FilterValue],
     run_alias: &str,
+    project_names: Option<&[String]>,
 ) -> Result<String, FilterError> {
     if values.is_empty() {
         return Err(FilterError::Parse(
@@ -346,10 +381,11 @@ fn compile_in(
                 "{} IN (
                     SELECT {}
                     FROM run_tags tag_filter
-                    WHERE tag_filter.tag IN ({})
+                    WHERE {}tag_filter.tag IN ({})
                 )",
                 run_key_sql(run_alias),
                 table_run_key_sql("tag_filter"),
+                project_scope_sql("tag_filter", project_names),
                 sql_string_list(&tags)
             ))
         }
@@ -370,6 +406,7 @@ fn compile_in(
             Ok(metadata_exists_sql(
                 run_alias,
                 &[format!("({})", conditions.join(" OR "))],
+                project_names,
             ))
         }
         FilterField::Id => {
@@ -427,6 +464,7 @@ fn compile_contains(
     value: &FilterValue,
     negated: bool,
     run_alias: &str,
+    project_names: Option<&[String]>,
 ) -> Result<String, FilterError> {
     let value = value.as_string("contains")?;
     let predicate = match field {
@@ -468,6 +506,7 @@ fn compile_contains(
                     escape_like_pattern(&value.to_ascii_lowercase())
                 ))
             )],
+            project_names,
         ),
         _ => {
             return Err(FilterError::Unsupported(
@@ -488,16 +527,17 @@ fn compile_metadata_atom(
     field: FilterField,
     value: &FilterValue,
     run_alias: &str,
+    project_names: Option<&[String]>,
 ) -> Result<String, FilterError> {
     if matches!(op, CompareOp::Neq) {
         let condition = metadata_compare_condition(CompareOp::Eq, field, value)?;
         Ok(format!(
             "NOT ({})",
-            metadata_exists_sql(run_alias, &[condition])
+            metadata_exists_sql(run_alias, &[condition], project_names)
         ))
     } else {
         let condition = metadata_compare_condition(op, field, value)?;
-        Ok(metadata_exists_sql(run_alias, &[condition]))
+        Ok(metadata_exists_sql(run_alias, &[condition], project_names))
     }
 }
 
@@ -709,29 +749,46 @@ fn compare_sql(op: CompareOp, column: &str, rhs: &str) -> String {
     format!("{column} {operator} {rhs}")
 }
 
-fn tag_exists_sql(run_alias: &str, tag: &str) -> String {
+fn tag_exists_sql(run_alias: &str, tag: &str, project_names: Option<&[String]>) -> String {
     format!(
         "{} IN (
             SELECT {}
             FROM run_tags tag_filter
-            WHERE tag_filter.tag = {}
+            WHERE {}tag_filter.tag = {}
         )",
         run_key_sql(run_alias),
         table_run_key_sql("tag_filter"),
+        project_scope_sql("tag_filter", project_names),
         sql_string_literal(tag)
     )
 }
 
-fn metadata_exists_sql(run_alias: &str, conditions: &[String]) -> String {
+fn metadata_exists_sql(
+    run_alias: &str,
+    conditions: &[String],
+    project_names: Option<&[String]>,
+) -> String {
     format!(
         "{} IN (
             SELECT {}
             FROM run_metadata metadata_filter
-            WHERE {}
+            WHERE {}{}
         )",
         run_key_sql(run_alias),
         table_run_key_sql("metadata_filter"),
+        project_scope_sql("metadata_filter", project_names),
         conditions.join(" AND ")
+    )
+}
+
+fn project_scope_sql(alias: &str, project_names: Option<&[String]>) -> String {
+    let Some(project_names) = project_names.filter(|names| !names.is_empty()) else {
+        return String::new();
+    };
+
+    format!(
+        "{alias}.project_name IN ({}) AND ",
+        sql_string_list(project_names)
     )
 }
 

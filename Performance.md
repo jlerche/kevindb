@@ -132,15 +132,15 @@ Results:
 
 | Workload | p50 | p95/p99 | Candidate segments | Vortex files | Object requests | Bytes read |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| ingest ack | 122.2 ms | 130.7 ms | 12 | 0 | 12 | 0 |
-| single run load | 69.4 ms | 70.3 ms | 1 | 1 | 45 | 162,660 |
-| trace tree load | 64.9 ms | 65.1 ms | 0 | 0 | 0 | 0 |
+| ingest ack | 123.6 ms | 129.5 ms | 12 | 0 | 12 | 0 |
+| single run load | 70.2 ms | 71.1 ms | 1 | 1 | 45 | 162,660 |
+| trace tree load | 66.4 ms | 66.6 ms | 0 | 0 | 0 | 0 |
 | project run filtering | 145.7 ms | 147.6 ms | 12 | 12 | 480 | 1,932,640 |
-| selective scalar filtering | 50.7 ms | 53.8 ms | 1 | 1 | 35 | 158,300 |
-| nonselective scalar filtering | 94.3 ms | 97.1 ms | 7 | 7 | 245 | 1,117,780 |
-| feedback filtering | 0.8 ms | 1.3 ms | 0 | 0 | 0 | 0 |
-| root tree predicate | 278.3 ms | 285.5 ms | 1 | 1 | 35 | 158,300 |
-| child tree predicate | 277.0 ms | 281.3 ms | 1 | 1 | 40 | 160,180 |
+| selective scalar filtering | 51.9 ms | 52.4 ms | 1 | 1 | 35 | 158,300 |
+| nonselective scalar filtering | 94.8 ms | 97.6 ms | 7 | 7 | 245 | 1,117,780 |
+| feedback filtering | 0.9 ms | 1.8 ms | 0 | 0 | 0 | 0 |
+| root tree predicate | 276.8 ms | 283.1 ms | 1 | 1 | 35 | 158,300 |
+| child tree predicate | 274.6 ms | 284.2 ms | 1 | 1 | 40 | 160,180 |
 | thread trace listing rejection | 0.00002 ms | 0.00013 ms | 0 | 0 | 0 | 0 |
 | aggregate scan rejection | 0.00002 ms | 0.00002 ms | 0 | 0 | 0 | 0 |
 

@@ -214,14 +214,14 @@ fn run_head_where_sql(query: &RunQuery) -> Result<String> {
     if let Some(filter) = &query.filter {
         predicates.push(
             filter
-                .compile_run_head_filter("run_heads")
+                .compile_run_head_filter_for_projects("run_heads", &query.project_names)
                 .map_err(|err| anyhow!(err))?
                 .predicate_sql,
         );
     }
     if let Some(trace_filter) = &query.trace_filter {
         let root_predicate = trace_filter
-            .compile_run_head_filter("root_filter")
+            .compile_run_head_filter_for_projects("root_filter", &query.project_names)
             .map_err(|err| anyhow!(err))?
             .predicate_sql;
         predicates.push(format!(
@@ -238,6 +238,7 @@ fn run_head_where_sql(query: &RunQuery) -> Result<String> {
         predicates.push(tree_filter_predicate_sql(
             "run_heads",
             tree_filter,
+            &query.project_names,
             query.include_deleted,
         )?);
     }
@@ -248,11 +249,12 @@ fn run_head_where_sql(query: &RunQuery) -> Result<String> {
 fn tree_filter_predicate_sql(
     run_alias: &str,
     tree_filter: &TreeFilterExpr,
+    project_names: &[String],
     include_deleted: bool,
 ) -> Result<String> {
     let target_predicate = tree_filter
         .predicate()
-        .compile_run_head_filter("tree_filter")
+        .compile_run_head_filter_for_projects("tree_filter", project_names)
         .map_err(|err| anyhow!(err))?
         .predicate_sql;
     let scope_predicate = match tree_filter.scope() {
@@ -290,6 +292,8 @@ fn tree_filter_predicate_sql(
                 AND tree_filter.span_id = target_tree.span_id
             WHERE {scope_predicate}
                 AND {mode_predicate}
+                AND returned_tree.project_name = {run_alias}.project_name
+                AND returned_tree.trace_id = {run_alias}.trace_id
                 AND {deletion_predicate}
                 AND {target_predicate}
         )",
@@ -502,4 +506,22 @@ pub(crate) fn run_matches_retention_filter(run: &RunSummary, query: &RunQuery) -
 
 pub(crate) fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::TreeFilterExpr;
+
+    #[test]
+    fn tree_filter_subquery_is_correlated_to_outer_run_key() {
+        let mut query = RunQuery::new("demo");
+        query.tree_filter =
+            Some(TreeFilterExpr::parse(r#"child(eq(run_type, "tool"))"#).expect("tree filter"));
+
+        let where_sql = run_head_where_sql(&query).expect("compile where sql");
+
+        assert!(where_sql.contains("returned_tree.project_name = run_heads.project_name"));
+        assert!(where_sql.contains("returned_tree.trace_id = run_heads.trace_id"));
+    }
 }
