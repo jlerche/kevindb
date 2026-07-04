@@ -102,6 +102,13 @@ async fn direct_run_lookup_uses_current_locator_after_stale_segment_deleted() {
             .expect("load deleted run")
             .is_none()
     );
+    assert!(
+        query_engine
+            .replay_run_by_id("1111111111111111")
+            .await
+            .expect("replay deleted run")
+            .is_none()
+    );
 
     mockgres.stop().await.expect("stop mockgres");
 }

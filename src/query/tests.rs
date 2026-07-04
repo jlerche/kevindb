@@ -310,6 +310,53 @@ fn datafusion_sql_pushes_candidate_run_keys_to_sources() {
     assert!(sql.contains("trace_id = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"));
 }
 
+#[test]
+fn datafusion_sql_pushes_segment_candidate_rows_to_sources() {
+    let query = RunQuery::new("demo");
+    let sql = run_head_datafusion_sql(
+        &[SegmentSource {
+            uri: "projects/demo/trace-segments/a.vortex".to_owned(),
+            total_bytes: 123,
+            candidate_rows: vec![
+                SegmentCandidateRow {
+                    project_name: "demo".to_owned(),
+                    trace_id: TRACE_ID.to_owned(),
+                    span_id: "root".to_owned(),
+                    row_index: 7,
+                },
+                SegmentCandidateRow {
+                    project_name: "demo".to_owned(),
+                    trace_id: TRACE_ID.to_owned(),
+                    span_id: "child".to_owned(),
+                    row_index: 11,
+                },
+            ],
+        }],
+        &query,
+        false,
+        None,
+    );
+
+    assert!(sql.contains("span_id = 'root' AND row_index = 7"));
+    assert!(sql.contains("span_id = 'child' AND row_index = 11"));
+}
+
+#[test]
+fn candidate_run_key_source_pushdown_is_not_capped_at_legacy_threshold() {
+    let candidate_run_keys = (0..1025)
+        .map(|index| RunKey {
+            project_name: "demo".to_owned(),
+            trace_id: TRACE_ID.to_owned(),
+            span_id: format!("span-{index}"),
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    let predicate = candidate_run_source_pushdown_sql(Some(&candidate_run_keys))
+        .expect("candidate pushdown should be emitted");
+
+    assert!(predicate.contains("span-1024"));
+}
+
 fn run(
     project_name: &str,
     trace_id: &str,

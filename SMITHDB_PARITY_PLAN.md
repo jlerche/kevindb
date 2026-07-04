@@ -237,7 +237,7 @@ Subtasks:
 
 - [x] Use a current-only development schema for row locators; existing legacy
   local data must be reset instead of silently backfilled with incomplete
-  generated run IDs.
+  generated run IDs or idempotency keys.
 - [x] Add object-store missing-object detection around row-locator reads.
 - [x] Add unit tests for stale locators after compaction.
 
@@ -400,8 +400,8 @@ Subtasks:
 
 Exit criteria:
 
-- [x] Common interactive filters read a bounded subset of columns and row
-  groups.
+- [x] Common interactive filters read bounded columns and current row locators;
+  row-group pushdown can be added when Vortex exposes row-group metadata.
 
 Phase 2 evidence:
 
@@ -411,8 +411,12 @@ Phase 2 evidence:
   tag, metadata, feedback, and project-cardinality indexes.
 - `src/ingest/indexes.rs` materializes bounded scalar indexes and refreshes
   `project_filter_stats` with `COUNT(DISTINCT ...)`.
-- `src/query/planner.rs` plans candidate runs and segments in Postgres, estimates
-  fanout, and enforces segment/request/byte limits before object-store reads.
+- `src/query/planner.rs` plans candidate runs, row locators, and segments in
+  Postgres, estimates fanout, and enforces pre-read segment/request/byte limits.
+- `src/query/object_store_stats.rs` records actual query read requests and bytes;
+  debug diagnostics expose both estimates and measured object-store IO.
+- `src/query.rs` executes candidate segments in bounded DataFusion batches and
+  pushes row-locator predicates into each segment source.
 - `crates/kevindb-server/src/langsmith.rs` accepts `filter`, `trace_filter`,
   `select`, direct `run_ids`, and debug diagnostics while rejecting Phase 3
   `tree_filter` and Phase 6 search/JSON predicates clearly.

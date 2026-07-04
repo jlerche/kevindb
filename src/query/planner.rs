@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, Result, anyhow};
 use tokio_postgres::NoTls;
@@ -18,6 +18,15 @@ pub(crate) struct RunQueryPlan {
 pub(crate) struct SegmentSource {
     pub(crate) uri: String,
     pub(crate) total_bytes: i64,
+    pub(crate) candidate_rows: Vec<SegmentCandidateRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SegmentCandidateRow {
+    pub(crate) project_name: String,
+    pub(crate) trace_id: String,
+    pub(crate) span_id: String,
+    pub(crate) row_index: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -65,34 +74,55 @@ pub(crate) async fn load_run_query_plan(
         .await
         .context("load run query candidates")?;
     let mut candidate_run_keys = HashSet::new();
-    let mut segment_bytes = std::collections::BTreeMap::<String, i64>::new();
+    let mut segments_by_uri = BTreeMap::<String, SegmentSource>::new();
 
     for row in rows {
         let uri: String = row.get(0);
         let total_bytes: i64 = row.get(1);
+        let project_name: String = row.get(2);
+        let trace_id: String = row.get(3);
+        let span_id: String = row.get(4);
+        let row_index: i64 = row.get(5);
         candidate_run_keys.insert(RunKey {
-            project_name: row.get(2),
-            trace_id: row.get(3),
-            span_id: row.get(4),
+            project_name: project_name.clone(),
+            trace_id: trace_id.clone(),
+            span_id: span_id.clone(),
         });
-        segment_bytes.entry(uri).or_insert(total_bytes);
+        segments_by_uri
+            .entry(uri.clone())
+            .or_insert_with(|| SegmentSource {
+                uri,
+                total_bytes,
+                candidate_rows: Vec::new(),
+            })
+            .candidate_rows
+            .push(SegmentCandidateRow {
+                project_name,
+                trace_id,
+                span_id,
+                row_index,
+            });
     }
 
     let candidate_runs = candidate_run_keys.len();
-    let candidate_bytes = segment_bytes.values().copied().sum::<i64>();
+    let candidate_bytes = segments_by_uri
+        .values()
+        .map(|segment| segment.total_bytes)
+        .sum::<i64>();
     let estimated_object_store_requests =
-        estimate_vortex_object_store_requests(segment_bytes.len());
+        estimate_vortex_object_store_requests(segments_by_uri.len());
     enforce_limits(
         query,
-        segment_bytes.len(),
+        segments_by_uri.len(),
         estimated_object_store_requests,
         candidate_bytes,
     )?;
 
-    let mut segments = segment_bytes
-        .into_iter()
-        .map(|(uri, total_bytes)| SegmentSource { uri, total_bytes })
-        .collect::<Vec<_>>();
+    let mut segments = segments_by_uri.into_values().collect::<Vec<_>>();
+    for segment in &mut segments {
+        segment.candidate_rows.sort();
+        segment.candidate_rows.dedup();
+    }
     segments.sort_by(|left, right| left.uri.cmp(&right.uri));
     Ok(RunQueryPlan {
         segments,
@@ -119,7 +149,8 @@ fn run_candidate_runs_sql(query: &RunQuery) -> Result<String> {
             candidate.total_bytes,
             candidate.project_name,
             candidate.trace_id,
-            candidate.span_id
+            candidate.span_id,
+            candidate.last_row_index
             FROM (
                 SELECT
                     trace_segments.uri,

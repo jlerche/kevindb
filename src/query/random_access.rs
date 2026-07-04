@@ -7,12 +7,13 @@ use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt};
 use tokio_postgres::{NoTls, Row};
 
+use super::object_store_stats::{MeasuringObjectStore, ObjectStoreReadSnapshot};
 use super::{
     DataFusionQueryTiming, QueryEngine, RunKey, RunQuery, RunQueryDiagnostics, RunQueryResult,
-    RunSummary, SegmentSource, attributes_json_sql, estimate_vortex_object_store_requests,
-    load_deleted_run_keys, query_segment_sources_with_datafusion_timed,
-    run_matches_retention_filter, run_summaries_from_batches, sql_object_store_path,
-    sql_string_literal, vortex_session_context,
+    RunSummary, SegmentCandidateRow, SegmentSource, attributes_json_sql,
+    estimate_vortex_object_store_requests, load_deleted_run_keys,
+    query_segment_sources_with_datafusion_timed, run_matches_retention_filter,
+    run_summaries_from_batches, sql_object_store_path, sql_string_literal, vortex_session_context,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,14 +106,14 @@ impl QueryEngine {
                 },
             });
         };
-        let postgres_query_time = postgres_started.elapsed();
         let events = if projection.include_events() {
             load_run_events(&self.postgres_url, &locator).await?
         } else {
             Vec::new()
         };
+        let postgres_query_time = postgres_started.elapsed();
 
-        let (run, datafusion_timing) = query_run_locator_segment(
+        let (run, datafusion_timing, object_store_reads) = query_run_locator_segment(
             Arc::clone(&self.object_store),
             &locator,
             projection.include_payload(),
@@ -124,6 +125,8 @@ impl QueryEngine {
                 candidate_runs: usize::from(run.is_some()),
                 candidate_bytes: locator.total_bytes,
                 estimated_object_store_requests: estimate_vortex_object_store_requests(1),
+                actual_object_store_requests: object_store_reads.request_count(),
+                actual_object_store_bytes_read: object_store_reads.bytes_read,
                 vortex_files_opened: 1,
                 rows_returned: usize::from(run.is_some()),
                 postgres_query_time,
@@ -152,12 +155,11 @@ impl QueryEngine {
         let Some(locator) = load_run_locator(&self.postgres_url, run_id, true).await? else {
             return Ok(None);
         };
-        let Some(replayed_locator) =
-            load_latest_event_locator(&self.postgres_url, &locator).await?
+        let Some(replayed_locator) = replay_event_locator(&self.postgres_url, &locator).await?
         else {
             return Ok(None);
         };
-        let (run, _) =
+        let (run, _, _) =
             query_run_locator_segment(Arc::clone(&self.object_store), &replayed_locator, true)
                 .await?;
         Ok(run)
@@ -216,7 +218,6 @@ impl QueryEngine {
             .await
             .context("load trace locator segment uris")?;
         let deleted_runs = load_deleted_run_keys(&self.postgres_url, &query).await?;
-        let postgres_query_time = postgres_started.elapsed();
         let candidate_segments = segments.len();
         let candidate_bytes = segments
             .iter()
@@ -227,15 +228,17 @@ impl QueryEngine {
         } else {
             Vec::new()
         };
+        let postgres_query_time = postgres_started.elapsed();
 
-        let (runs, datafusion_timing) = query_segment_sources_with_datafusion_timed(
-            Arc::clone(&self.object_store),
-            segments,
-            &query,
-            projection.include_payload(),
-            None,
-        )
-        .await?;
+        let (runs, datafusion_timing, object_store_reads) =
+            query_segment_sources_with_datafusion_timed(
+                Arc::clone(&self.object_store),
+                segments,
+                &query,
+                projection.include_payload(),
+                None,
+            )
+            .await?;
         let runs = runs
             .into_iter()
             .filter(|run| !deleted_runs.contains(&RunKey::from(run)))
@@ -250,6 +253,8 @@ impl QueryEngine {
                 estimated_object_store_requests: estimate_vortex_object_store_requests(
                     candidate_segments,
                 ),
+                actual_object_store_requests: object_store_reads.request_count(),
+                actual_object_store_bytes_read: object_store_reads.bytes_read,
                 vortex_files_opened: candidate_segments,
                 rows_returned: runs.len(),
                 postgres_query_time,
@@ -339,13 +344,19 @@ async fn query_run_locator_segment(
     object_store: Arc<dyn ObjectStore>,
     locator: &RunLocator,
     include_payload: bool,
-) -> Result<(Option<RunSummary>, DataFusionQueryTiming)> {
-    let context = vortex_session_context(Arc::clone(&object_store))?;
+) -> Result<(
+    Option<RunSummary>,
+    DataFusionQueryTiming,
+    ObjectStoreReadSnapshot,
+)> {
+    let measured_store = Arc::new(MeasuringObjectStore::new(Arc::clone(&object_store)));
+    let context = vortex_session_context(measured_store.clone())?;
     let sql = run_locator_datafusion_sql(locator, include_payload);
     let result = collect_run_locator_query(context, &sql).await;
+    let object_store_reads = measured_store.snapshot();
 
     match result {
-        Ok((mut runs, timing)) => Ok((runs.pop(), timing)),
+        Ok((mut runs, timing)) => Ok((runs.pop(), timing, object_store_reads)),
         Err(err) => {
             if matches!(
                 object_store
@@ -484,7 +495,13 @@ async fn load_trace_segment_sources(
 
     let rows = client
         .query(
-            "SELECT DISTINCT trace_segments.uri, trace_segments.total_bytes
+            "SELECT
+                trace_segments.uri,
+                trace_segments.total_bytes,
+                trace_locators.project_name,
+                trace_locators.trace_id,
+                trace_locators.span_id,
+                trace_locators.row_index
             FROM trace_locators
             INNER JOIN trace_segments
                 ON trace_segments.id = trace_locators.trace_segment_id
@@ -496,25 +513,38 @@ async fn load_trace_segment_sources(
                 AND trace_locators.trace_id = $2
                 AND trace_segments.compacted_at IS NULL
                 AND run_deletions.span_id IS NULL
-            ORDER BY trace_segments.uri",
+            ORDER BY trace_segments.uri, trace_locators.span_id, trace_locators.row_index",
             &[&project_name, &trace_id],
         )
         .await
         .context("load trace locator segment uris")?;
 
-    let mut segments = rows
-        .into_iter()
-        .map(|row| SegmentSource {
-            uri: row.get(0),
-            total_bytes: row.get(1),
-        })
-        .collect::<Vec<_>>();
-    segments.sort_by(|left, right| {
-        left.uri
-            .cmp(&right.uri)
-            .then(left.total_bytes.cmp(&right.total_bytes))
-    });
-    segments.dedup();
+    let mut segments_by_uri = std::collections::BTreeMap::<String, SegmentSource>::new();
+    for row in rows {
+        let uri: String = row.get(0);
+        let total_bytes: i64 = row.get(1);
+        segments_by_uri
+            .entry(uri.clone())
+            .or_insert_with(|| SegmentSource {
+                uri,
+                total_bytes,
+                candidate_rows: Vec::new(),
+            })
+            .candidate_rows
+            .push(SegmentCandidateRow {
+                project_name: row.get(2),
+                trace_id: row.get(3),
+                span_id: row.get(4),
+                row_index: row.get(5),
+            });
+    }
+
+    let mut segments = segments_by_uri.into_values().collect::<Vec<_>>();
+    for segment in &mut segments {
+        segment.candidate_rows.sort();
+        segment.candidate_rows.dedup();
+    }
+    segments.sort_by(|left, right| left.uri.cmp(&right.uri));
     Ok(segments)
 }
 
@@ -636,7 +666,7 @@ fn run_event_summary_from_row(row: Row) -> RunEventSummary {
     }
 }
 
-async fn load_latest_event_locator(
+async fn replay_event_locator(
     postgres_url: &str,
     locator: &RunLocator,
 ) -> Result<Option<RunLocator>> {
@@ -649,8 +679,8 @@ async fn load_latest_event_locator(
         }
     });
 
-    let row = client
-        .query_opt(
+    let rows = client
+        .query(
             "SELECT
                 trace_segments.uri,
                 run_locators.project_name,
@@ -671,31 +701,33 @@ async fn load_latest_event_locator(
             WHERE run_events.project_name = $1
                 AND run_events.trace_id = $2
                 AND run_events.span_id = $3
-            ORDER BY run_events.event_time_unix_nano DESC, run_events.id DESC
-            LIMIT 1",
+            ORDER BY run_events.event_time_unix_nano ASC, run_events.id ASC",
             &[&locator.project_name, &locator.trace_id, &locator.span_id],
         )
         .await
-        .context("load latest run event")?;
+        .context("load run events for replay")?;
 
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let event_type: String = row.get(8);
-    if event_type == "tombstone" {
-        return Ok(None);
+    let mut replayed = None;
+    for row in rows {
+        let event_type: String = row.get(8);
+        if event_type == "tombstone" {
+            replayed = None;
+            continue;
+        }
+
+        replayed = Some(RunLocator {
+            segment_uri: row.get(0),
+            project_name: row.get(1),
+            stored_run_id: row.get(2),
+            generated_run_id: row.get(3),
+            trace_id: row.get(4),
+            span_id: row.get(5),
+            row_index: row.get(6),
+            total_bytes: row.get(7),
+        });
     }
 
-    Ok(Some(RunLocator {
-        segment_uri: row.get(0),
-        project_name: row.get(1),
-        stored_run_id: row.get(2),
-        generated_run_id: row.get(3),
-        trace_id: row.get(4),
-        span_id: row.get(5),
-        row_index: row.get(6),
-        total_bytes: row.get(7),
-    }))
+    Ok(replayed)
 }
 
 #[cfg(test)]

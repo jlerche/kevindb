@@ -13,15 +13,23 @@ use uuid::Uuid;
 use vortex_datafusion::VortexFormatFactory;
 
 use crate::otlp::RunEventKind;
+const MAX_DATAFUSION_SEGMENTS_PER_BATCH: usize = 8;
+
 pub mod filter;
+mod object_store_stats;
 mod planner;
 mod random_access;
 mod rows;
 mod tree;
 use filter::FilterExpr;
+use object_store_stats::{
+    MeasuringObjectStore, ObjectStoreReadSnapshot, datafusion_batch_query,
+    enforce_runtime_object_store_limits, page_datafusion_runs,
+};
 pub(crate) use planner::{
-    RunKey, SegmentSource, estimate_vortex_object_store_requests, load_deleted_run_keys,
-    load_run_query_plan, run_matches_retention_filter, run_query_where_sql, sql_string_literal,
+    RunKey, SegmentCandidateRow, SegmentSource, estimate_vortex_object_store_requests,
+    load_deleted_run_keys, load_run_query_plan, run_matches_retention_filter, run_query_where_sql,
+    sql_string_literal,
 };
 pub use random_access::{RunEventSummary, RunLoadResult, RunProjection, TraceLoadResult};
 pub(crate) use rows::run_summaries_from_batches;
@@ -118,6 +126,8 @@ pub struct RunQueryDiagnostics {
     pub candidate_runs: usize,
     pub candidate_bytes: i64,
     pub estimated_object_store_requests: usize,
+    pub actual_object_store_requests: u64,
+    pub actual_object_store_bytes_read: u64,
     pub vortex_files_opened: usize,
     pub rows_returned: usize,
     pub postgres_query_time: Duration,
@@ -208,7 +218,7 @@ impl QueryEngine {
         let estimated_object_store_requests = plan.estimated_object_store_requests;
 
         let candidate_run_keys = plan.candidate_run_keys.clone();
-        let (runs, datafusion_timing) = query_timed_with_optional_timeout(
+        let (runs, datafusion_timing, object_store_reads) = query_timed_with_optional_timeout(
             Arc::clone(&self.object_store),
             plan.segments,
             &query,
@@ -229,6 +239,8 @@ impl QueryEngine {
                 candidate_runs,
                 candidate_bytes,
                 estimated_object_store_requests,
+                actual_object_store_requests: object_store_reads.request_count(),
+                actual_object_store_bytes_read: object_store_reads.bytes_read,
                 vortex_files_opened: candidate_segments,
                 rows_returned: runs.len(),
                 postgres_query_time,
@@ -574,22 +586,15 @@ async fn query_segment_sources_with_datafusion_projected(
     include_payload: bool,
     candidate_run_keys: Option<&std::collections::HashSet<RunKey>>,
 ) -> Result<Vec<RunSummary>> {
-    if segments.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let context = vortex_session_context(object_store)?;
-    let sql = run_head_datafusion_sql(&segments, query, include_payload, candidate_run_keys);
-    let dataframe = context
-        .sql(&sql)
-        .await
-        .context("plan DataFusion run head query")?;
-    let batches = dataframe
-        .collect()
-        .await
-        .context("execute DataFusion run head query")?;
-
-    run_summaries_from_batches(&batches)
+    let (runs, _, _) = query_segment_sources_with_datafusion_timed(
+        object_store,
+        segments,
+        query,
+        include_payload,
+        candidate_run_keys,
+    )
+    .await?;
+    Ok(runs)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -604,34 +609,60 @@ pub(crate) async fn query_segment_sources_with_datafusion_timed(
     query: &RunQuery,
     include_payload: bool,
     candidate_run_keys: Option<&std::collections::HashSet<RunKey>>,
-) -> Result<(Vec<RunSummary>, DataFusionQueryTiming)> {
+) -> Result<(
+    Vec<RunSummary>,
+    DataFusionQueryTiming,
+    ObjectStoreReadSnapshot,
+)> {
     if segments.is_empty() {
-        return Ok((Vec::new(), DataFusionQueryTiming::default()));
+        return Ok((
+            Vec::new(),
+            DataFusionQueryTiming::default(),
+            ObjectStoreReadSnapshot::default(),
+        ));
     }
 
-    let context = vortex_session_context(object_store)?;
-    let sql = run_head_datafusion_sql(&segments, query, include_payload, candidate_run_keys);
+    let measured_store = Arc::new(MeasuringObjectStore::new(object_store));
+    let context = vortex_session_context(measured_store.clone())?;
+    let datafusion_query = datafusion_batch_query(query);
+    let mut runs = Vec::new();
+    let mut planning_time = Duration::ZERO;
+    let mut execution_time = Duration::ZERO;
 
-    let planning_started = Instant::now();
-    let dataframe = context
-        .sql(&sql)
-        .await
-        .context("plan DataFusion run head query")?;
-    let planning_time = planning_started.elapsed();
+    for batch in segments.chunks(MAX_DATAFUSION_SEGMENTS_PER_BATCH) {
+        let sql = run_head_datafusion_sql(
+            batch,
+            &datafusion_query,
+            include_payload,
+            candidate_run_keys,
+        );
 
-    let execution_started = Instant::now();
-    let batches = dataframe
-        .collect()
-        .await
-        .context("execute DataFusion run head query")?;
-    let execution_time = execution_started.elapsed();
+        let planning_started = Instant::now();
+        let dataframe = context
+            .sql(&sql)
+            .await
+            .context("plan DataFusion run head query")?;
+        planning_time += planning_started.elapsed();
+
+        let execution_started = Instant::now();
+        let batches = dataframe
+            .collect()
+            .await
+            .context("execute DataFusion run head query")?;
+        execution_time += execution_started.elapsed();
+        runs.extend(run_summaries_from_batches(&batches)?);
+    }
+
+    let object_store_reads = measured_store.snapshot();
+    enforce_runtime_object_store_limits(query, object_store_reads)?;
 
     Ok((
-        run_summaries_from_batches(&batches)?,
+        page_datafusion_runs(runs, query),
         DataFusionQueryTiming {
             planning_time,
             execution_time,
         },
+        object_store_reads,
     ))
 }
 
@@ -641,7 +672,11 @@ async fn query_timed_with_optional_timeout(
     query: &RunQuery,
     include_payload: bool,
     candidate_run_keys: Option<&std::collections::HashSet<RunKey>>,
-) -> Result<(Vec<RunSummary>, DataFusionQueryTiming)> {
+) -> Result<(
+    Vec<RunSummary>,
+    DataFusionQueryTiming,
+    ObjectStoreReadSnapshot,
+)> {
     let future = query_segment_sources_with_datafusion_timed(
         object_store,
         segments,
@@ -728,6 +763,7 @@ fn current_segment_source(uri: String) -> SegmentSource {
     SegmentSource {
         uri,
         total_bytes: 0,
+        candidate_rows: Vec::new(),
     }
 }
 
@@ -737,6 +773,7 @@ fn segment_source_sql(
     source_where_sql: &str,
 ) -> String {
     let attributes_json_sql = attributes_json_sql(include_payload);
+    let source_where_sql = segment_source_where_sql(segment, source_where_sql);
 
     format!(
         "SELECT
@@ -759,6 +796,14 @@ fn segment_source_sql(
         WHERE {source_where_sql}",
         sql_object_store_path(&segment.uri),
     )
+}
+
+fn segment_source_where_sql(segment: &SegmentSource, source_where_sql: &str) -> String {
+    let Some(candidate_rows_sql) = segment_candidate_rows_where_sql(segment) else {
+        return source_where_sql.to_owned();
+    };
+
+    format!("({source_where_sql}) AND ({candidate_rows_sql})")
 }
 
 fn run_source_pushdown_where_sql(
@@ -819,12 +864,8 @@ fn run_source_pushdown_where_sql(
 fn candidate_run_source_pushdown_sql(
     candidate_run_keys: Option<&std::collections::HashSet<RunKey>>,
 ) -> Option<String> {
-    const MAX_CANDIDATE_RUN_KEYS_SOURCE_PUSHDOWN: usize = 1024;
-
     let candidate_run_keys = candidate_run_keys?;
-    if candidate_run_keys.is_empty()
-        || candidate_run_keys.len() > MAX_CANDIDATE_RUN_KEYS_SOURCE_PUSHDOWN
-    {
+    if candidate_run_keys.is_empty() {
         return None;
     }
 
@@ -855,6 +896,31 @@ fn candidate_run_source_pushdown_sql(
         .collect::<Vec<_>>();
 
     Some(format!("({})", predicates.join(" OR ")))
+}
+
+fn segment_candidate_rows_where_sql(segment: &SegmentSource) -> Option<String> {
+    if segment.candidate_rows.is_empty() {
+        return None;
+    }
+
+    Some(
+        segment
+            .candidate_rows
+            .iter()
+            .map(segment_candidate_row_where_sql)
+            .collect::<Vec<_>>()
+            .join(" OR "),
+    )
+}
+
+fn segment_candidate_row_where_sql(row: &SegmentCandidateRow) -> String {
+    format!(
+        "(project_name = {} AND trace_id = {} AND span_id = {} AND row_index = {})",
+        sql_string_literal(&row.project_name),
+        sql_string_literal(&row.trace_id),
+        sql_string_literal(&row.span_id),
+        row.row_index
+    )
 }
 
 pub(crate) fn attributes_json_sql(include_payload: bool) -> &'static str {

@@ -256,6 +256,8 @@ async fn filters_use_scalar_indexes_feedback_and_projection() {
     assert_eq!(result.diagnostics.candidate_segments, 1);
     assert_eq!(result.diagnostics.estimated_object_store_requests, 48);
     assert!(result.diagnostics.candidate_bytes > 0);
+    assert!(result.diagnostics.actual_object_store_requests > 0);
+    assert!(result.diagnostics.actual_object_store_bytes_read > 0);
 
     mockgres.stop().await.expect("stop mockgres");
 }
