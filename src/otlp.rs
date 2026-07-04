@@ -21,6 +21,7 @@ pub struct SpanRecord {
     pub status_code: i32,
     pub event_kind: RunEventKind,
     pub attributes_json: String,
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +121,7 @@ fn span_record_from_span(
         status_code,
         event_kind,
         attributes_json: Value::Object(attributes).to_string(),
+        idempotency_key: None,
     })
 }
 

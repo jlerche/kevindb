@@ -18,6 +18,7 @@ use tokio_postgres::NoTls;
 pub mod cache;
 mod langsmith;
 
+use langsmith::aggregates::query_run_aggregates;
 pub use langsmith::{
     FeedbackResponse, ProjectResponse, RunResponse, RunsQueryRequest, RunsResponse, StringList,
     ThreadResponse, ThreadTraceResponse, ThreadTracesResponse, ThreadsQueryRequest,
@@ -95,6 +96,8 @@ pub fn app(state: ServerState) -> Router {
         .route("/v1/runs/{run_id}/feedback", get(list_run_feedback))
         .route("/runs/query", post(query_runs))
         .route("/v1/runs/query", post(query_runs))
+        .route("/runs/aggregate", post(query_run_aggregates))
+        .route("/v1/runs/aggregate", post(query_run_aggregates))
         .route("/v2/threads/query", post(query_threads))
         .route("/v2/threads/{thread_id}/traces", get(query_thread_traces))
         .route("/feedback", get(list_feedback).post(create_feedback))

@@ -96,6 +96,7 @@ pub fn generate_dataset(config: SyntheticConfig) -> SyntheticDataset {
                 status_code,
                 event_kind: RunEventKind::End,
                 attributes_json: attributes_json(&config, trace_index, run_index),
+                idempotency_key: None,
             });
         }
     }
@@ -130,6 +131,8 @@ fn attributes_json(config: &SyntheticConfig, trace_index: usize, run_index: usiz
             "prompt_tokens": 100 + run_index,
             "completion_tokens": 40 + trace_index % 17,
             "total_tokens": 140 + run_index + trace_index % 17,
+            "prompt_cost": ((run_index + 1) as f64) / 2000.0,
+            "completion_cost": ((run_index + 1) as f64) / 2000.0,
             "total_cost": ((run_index + 1) as f64) / 1000.0
         })
     });
@@ -138,7 +141,9 @@ fn attributes_json(config: &SyntheticConfig, trace_index: usize, run_index: usiz
         "metadata": {
             "thread_id": thread_id,
             "synthetic_trace_index": trace_index,
-            "synthetic_run_index": run_index
+            "synthetic_run_index": run_index,
+            "ls_model_name": format!("synthetic-model-{}", run_index % 3),
+            "ls_provider": if run_index.is_multiple_of(2) { "openai" } else { "anthropic" }
         },
         "tags": [format!("depth-{}", run_depth(run_index, config.fanout)), "synthetic"],
         "payload": "x".repeat(payload_len),

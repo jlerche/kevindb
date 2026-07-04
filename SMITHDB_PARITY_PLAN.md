@@ -81,10 +81,10 @@ Implemented or in progress:
   `thread_messages`, including bounded previews, cursor pagination, and
   LangSmith-compatible thread query endpoints.
 
-Important gaps: no aggregate API, rollup storage, or production full-text/JSON
-object-store index. Full-text and JSON filtering are intentionally deferred
-until we implement an object-store-aware inverted index design. Large payload
-scans are not an acceptable fallback.
+Important gap: no production full-text/JSON object-store index. Full-text and
+JSON filtering are intentionally deferred until we implement an
+object-store-aware inverted index design. Large payload scans are not an
+acceptable fallback.
 
 ## Design Principles
 
@@ -580,16 +580,14 @@ Phase 4 evidence:
 - The 2026-07-04 benchmark records real `thread-trace-listing`: p50 0.62 ms,
   p99 1.12 ms, zero candidate segments, and zero object-store requests.
 
-## [ ] Phase 5: Aggregations And Stats
+## [x] Phase 5: Aggregations And Stats
 
 Goal: compute cost, latency, token usage, evaluator scores, and counts under
 filters without full scans.
-
-### [ ] Epic 5.1: Typed Metrics Extraction
+### [x] Epic 5.1: Typed Metrics Extraction
 
 Tasks:
-
-- [ ] Extract typed numeric metrics during ingest:
+- [x] Extract typed numeric metrics during ingest:
   - latency
   - prompt tokens
   - completion tokens
@@ -599,25 +597,24 @@ Tasks:
   - total cost
   - first token latency
   - evaluator score
-- [ ] Normalize provider/model metadata where available.
-- [ ] Store typed metrics in run heads and Vortex columns.
+- [x] Normalize provider/model metadata where available.
+- [x] Store typed metrics in run heads and Vortex columns.
 
 Subtasks:
-
-- [ ] Define conversion rules from LangSmith payload fields.
-- [ ] Add tests for missing, malformed, and provider-specific values.
+- [x] Define conversion rules from LangSmith payload fields.
+- [x] Add tests for missing, malformed, and provider-specific values.
 
 Exit criteria:
 
-- [ ] Aggregation inputs are typed columns, not parsed out of JSON at query
+- [x] Aggregation inputs are typed columns, not parsed out of JSON at query
   time.
 
-### [ ] Epic 5.2: Aggregate Query Engine
+### [x] Epic 5.2: Aggregate Query Engine
 
 Tasks:
 
-- [ ] Add `RunAggregateQuery`.
-- [ ] Support:
+- [x] Add `RunAggregateQuery`.
+- [x] Support:
   - count
   - error count/rate
   - latency min/max/avg/p50/p95/p99
@@ -625,42 +622,45 @@ Tasks:
   - cost sums/averages
   - feedback score averages and distributions
   - group by project, time bucket, run type, tag, model/provider, feedback key
-- [ ] Execute through DataFusion for Vortex-backed columns.
-- [ ] Join feedback through metastore when selective.
+- [x] Execute through DataFusion for Vortex-backed columns.
+- [x] Join feedback through metastore when selective.
 
 Subtasks:
 
-- [ ] Add API endpoint and internal query API.
-- [ ] Add DataFusion aggregation tests.
-- [ ] Add fanout-aware planning for aggregate queries.
+- [x] Add API endpoint and internal query API.
+- [x] Add DataFusion aggregation tests.
+- [x] Add fanout-aware planning for aggregate queries.
 
 Exit criteria:
 
-- [ ] Common aggregate queries finish from typed columns with measured fanout.
+- [x] Common aggregate queries finish from typed columns with measured fanout.
 
-### [ ] Epic 5.3: Rollups And Sketches
+### [x] Epic 5.3: Rollups And Sketches
 
 Tasks:
 
-- [ ] Add rollup tables/files for common dashboards:
+- [x] Add rollup tables/files for common dashboards:
   - project/time/run_type
   - project/time/model
   - feedback key/time
   - error/time
-- [ ] Consider sketches:
-  - t-digest for latency percentiles
-  - HyperLogLog for approximate cardinality
-  - top-K heavy hitters for tags/models/errors
+- [x] Consider sketches; exact rollup percentiles are used until approximate
+  cardinality/top-K needs appear.
 
 Subtasks:
 
-- [ ] Define freshness requirements.
-- [ ] Update rollups during compaction or background jobs.
-- [ ] Add invalidation for deletes/retention.
+- [x] Define freshness requirements.
+- [x] Update rollups during ingest/compaction-visible metadata refresh.
+- [x] Add invalidation for deletes/retention.
 
 Exit criteria:
 
-- [ ] Dashboard-like stats avoid raw segment scans for common time windows.
+- [x] Dashboard-like stats avoid raw segment scans for common time windows.
+
+Phase 5 evidence: typed metrics live in `src/metrics.rs`, Vortex columns, and
+run heads; `src/query/aggregates/`, `V14__add_phase5_aggregates.sql`, feedback
+rollups, and `/v1/runs/aggregate` cover aggregate APIs, diagnostics, fanout
+limits, rollups, feedback scores, and tests.
 
 ## [ ] Phase 6: Full-Text And JSON Filtering
 

@@ -322,6 +322,7 @@ fn datafusion_sql_pushes_segment_candidate_rows_to_sources() {
         &[SegmentSource {
             uri: "projects/demo/trace-segments/a.vortex".to_owned(),
             total_bytes: 123,
+            schema_version: crate::segment::SPAN_SEGMENT_SCHEMA_VERSION,
             candidate_rows: vec![
                 SegmentCandidateRow {
                     project_name: "demo".to_owned(),
@@ -359,6 +360,7 @@ fn datafusion_sql_omits_candidate_key_pushdown_when_row_locators_exist() {
         &[SegmentSource {
             uri: "projects/demo/trace-segments/a.vortex".to_owned(),
             total_bytes: 123,
+            schema_version: crate::segment::SPAN_SEGMENT_SCHEMA_VERSION,
             candidate_rows: vec![SegmentCandidateRow {
                 project_name: "demo".to_owned(),
                 trace_id: TRACE_ID.to_owned(),
@@ -446,5 +448,6 @@ fn span_record(
         status_code,
         event_kind: crate::otlp::RunEventKind::End,
         attributes_json: "{}".to_owned(),
+        idempotency_key: None,
     }
 }

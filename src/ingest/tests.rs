@@ -18,6 +18,7 @@ mod phase1;
 mod phase2;
 mod phase3;
 mod phase4;
+mod phase5;
 
 #[tokio::test]
 async fn ingest_otlp_flushes_to_object_store_and_postgres() {
@@ -479,6 +480,7 @@ fn segment_uri_escapes_project_name() {
         status_code: 1,
         event_kind: RunEventKind::End,
         attributes_json: "{}".to_owned(),
+        idempotency_key: None,
     };
     let partition = record_partition_key(&record);
     let uri = segment_uri(&partition, &[record]).expect("segment uri");
@@ -653,6 +655,57 @@ async fn compacts_and_respects_deletes_and_retention() {
     mockgres.stop().await.expect("stop mockgres");
 }
 
+#[tokio::test]
+async fn repeated_compaction_preserves_active_runs() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 1,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+
+    ingestor
+        .ingest_records(vec![
+            sample_record("1111111111111111", 10),
+            sample_record("2222222222222222", 20),
+        ])
+        .await
+        .expect("ingest compactable records");
+
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store);
+    for _ in 0..2 {
+        let compacted = ingestor
+            .compact_project("demo")
+            .await
+            .expect("compact project");
+        assert_eq!(compacted.compacted_runs, 2);
+        assert_eq!(compacted.compacted_segments, 2);
+        assert_eq!(compacted.written_segments, 2);
+
+        let active = query_engine
+            .list_runs_in_trace("demo", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .await
+            .expect("query active runs after compaction");
+        assert_eq!(
+            active
+                .iter()
+                .map(|run| run.span_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1111111111111111", "2222222222222222"]
+        );
+    }
+
+    mockgres.stop().await.expect("stop mockgres");
+}
+
 async fn wait_for_pending_records(ingestor: &Ingestor, expected_records: usize) {
     let deadline = Instant::now() + StdDuration::from_secs(1);
     loop {
@@ -691,6 +744,7 @@ fn sample_record(span_id: &str, start_time_unix_nano: i64) -> SpanRecord {
         status_code: 1,
         event_kind: RunEventKind::End,
         attributes_json: "{}".to_owned(),
+        idempotency_key: None,
     }
 }
 

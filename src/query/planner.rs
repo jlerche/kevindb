@@ -18,6 +18,7 @@ pub(crate) struct RunQueryPlan {
 pub(crate) struct SegmentSource {
     pub(crate) uri: String,
     pub(crate) total_bytes: i64,
+    pub(crate) schema_version: i64,
     pub(crate) candidate_rows: Vec<SegmentCandidateRow>,
 }
 
@@ -79,10 +80,11 @@ pub(crate) async fn load_run_query_plan(
     for row in rows {
         let uri: String = row.get(0);
         let total_bytes: i64 = row.get(1);
-        let project_name: String = row.get(2);
-        let trace_id: String = row.get(3);
-        let span_id: String = row.get(4);
-        let row_index: i64 = row.get(5);
+        let schema_version: i64 = row.get(2);
+        let project_name: String = row.get(3);
+        let trace_id: String = row.get(4);
+        let span_id: String = row.get(5);
+        let row_index: i64 = row.get(6);
         candidate_run_keys.insert(RunKey {
             project_name: project_name.clone(),
             trace_id: trace_id.clone(),
@@ -93,6 +95,7 @@ pub(crate) async fn load_run_query_plan(
             .or_insert_with(|| SegmentSource {
                 uri,
                 total_bytes,
+                schema_version,
                 candidate_rows: Vec::new(),
             })
             .candidate_rows
@@ -148,6 +151,7 @@ fn run_candidate_runs_sql(query: &RunQuery) -> Result<String> {
         "SELECT
             candidate.uri,
             candidate.total_bytes,
+            candidate.schema_version,
             candidate.project_name,
             candidate.trace_id,
             candidate.span_id,
@@ -156,6 +160,7 @@ fn run_candidate_runs_sql(query: &RunQuery) -> Result<String> {
                 SELECT
                     trace_segments.uri,
                     trace_segments.total_bytes,
+                    trace_segments.schema_version,
                     run_heads.project_name,
                 run_heads.trace_id,
                 run_heads.span_id,

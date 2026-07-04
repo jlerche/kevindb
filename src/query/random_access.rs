@@ -499,6 +499,7 @@ async fn load_trace_segment_sources(
             "SELECT
                 trace_segments.uri,
                 trace_segments.total_bytes,
+                trace_segments.schema_version,
                 trace_locators.project_name,
                 trace_locators.trace_id,
                 trace_locators.span_id,
@@ -524,19 +525,21 @@ async fn load_trace_segment_sources(
     for row in rows {
         let uri: String = row.get(0);
         let total_bytes: i64 = row.get(1);
+        let schema_version: i64 = row.get(2);
         segments_by_uri
             .entry(uri.clone())
             .or_insert_with(|| SegmentSource {
                 uri,
                 total_bytes,
+                schema_version,
                 candidate_rows: Vec::new(),
             })
             .candidate_rows
             .push(SegmentCandidateRow {
-                project_name: row.get(2),
-                trace_id: row.get(3),
-                span_id: row.get(4),
-                row_index: row.get(5),
+                project_name: row.get(3),
+                trace_id: row.get(4),
+                span_id: row.get(5),
+                row_index: row.get(6),
             });
     }
 

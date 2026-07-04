@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use anyhow::{Context, Result};
 use serde_json::Value;
 use tokio_postgres::{NoTls, Row};
@@ -83,6 +85,23 @@ impl PostgresMetastore {
         let correction_json = json_option_to_string(&feedback.correction);
         let feedback_source_json = json_option_to_string(&feedback.feedback_source);
         let extra_json = json_option_to_string(&feedback.extra);
+        if let Some(project_name) = &feedback.project_name {
+            client
+                .execute(
+                    "INSERT INTO projects(name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
+                    &[project_name],
+                )
+                .await
+                .context("ensure feedback project")?;
+        }
+        let old_project_name = client
+            .query_opt(
+                "SELECT project_name FROM feedback WHERE id = $1",
+                &[&feedback.id],
+            )
+            .await
+            .context("load old feedback project for rollup refresh")?
+            .and_then(|row| row.get::<_, Option<String>>(0));
         client
             .execute(
                 "INSERT INTO feedback(
@@ -126,6 +145,17 @@ impl PostgresMetastore {
             )
             .await
             .context("insert feedback")?;
+
+        let mut affected_projects = BTreeSet::new();
+        if let Some(project_name) = old_project_name {
+            affected_projects.insert(project_name);
+        }
+        if let Some(project_name) = feedback.project_name.clone() {
+            affected_projects.insert(project_name);
+        }
+        for project_name in affected_projects {
+            refresh_feedback_metric_rollups(&client, &project_name).await?;
+        }
 
         Ok(())
     }
@@ -236,6 +266,169 @@ fn list_feedback_sql(filter: &FeedbackFilter) -> String {
         LIMIT {limit} OFFSET {}",
         filter.offset
     )
+}
+
+async fn refresh_feedback_metric_rollups(
+    client: &tokio_postgres::Client,
+    project_name: &str,
+) -> Result<()> {
+    const BUCKET_NANOS: i64 = 60 * 60 * 1_000_000_000;
+
+    client
+        .execute(
+            "DELETE FROM feedback_metric_rollups WHERE project_name = $1",
+            &[&project_name],
+        )
+        .await
+        .context("delete old feedback aggregate rollups")?;
+
+    let rows = client
+        .query(
+            "SELECT key, created_at_unix_nano, score_number
+            FROM feedback
+            WHERE project_name = $1",
+            &[&project_name],
+        )
+        .await
+        .context("load feedback rows for aggregate rollups")?;
+    let mut groups = BTreeMap::<(i64, String), FeedbackRollupAccumulator>::new();
+    for row in rows {
+        let key: String = row.get(0);
+        let created_at_unix_nano: i64 = row.get(1);
+        groups
+            .entry((
+                created_at_unix_nano.div_euclid(BUCKET_NANOS) * BUCKET_NANOS,
+                key,
+            ))
+            .or_default()
+            .push(row.get(2));
+    }
+
+    for ((time_bucket_start_unix_nano, key), accumulator) in groups {
+        let stats = accumulator.finish();
+        client
+            .execute(
+                "INSERT INTO feedback_metric_rollups(
+                    project_name, bucket_size_unix_nanos, time_bucket_start_unix_nano,
+                    feedback_key, feedback_count, score_count, score_min, score_max,
+                    score_avg, score_p50, score_p95, score_p99,
+                    score_distribution_json, updated_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8,
+                    $9, $10, $11, $12, $13, CURRENT_TIMESTAMP
+                )",
+                &[
+                    &project_name,
+                    &BUCKET_NANOS,
+                    &time_bucket_start_unix_nano,
+                    &key,
+                    &stats.feedback_count,
+                    &stats.score_count,
+                    &stats.score_min,
+                    &stats.score_max,
+                    &stats.score_avg,
+                    &stats.score_p50,
+                    &stats.score_p95,
+                    &stats.score_p99,
+                    &stats.score_distribution_json,
+                ],
+            )
+            .await
+            .context("insert feedback aggregate rollup")?;
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct FeedbackRollupAccumulator {
+    feedback_count: i64,
+    score_numbers: Vec<f64>,
+    missing_scores: u64,
+}
+
+impl FeedbackRollupAccumulator {
+    fn push(&mut self, score: Option<f64>) {
+        self.feedback_count += 1;
+        match score.filter(|score| score.is_finite()) {
+            Some(score) => self.score_numbers.push(score),
+            None => self.missing_scores += 1,
+        }
+    }
+
+    fn finish(mut self) -> FeedbackRollupStats {
+        self.score_numbers.sort_by(f64::total_cmp);
+        let score_count = self.score_numbers.len() as i64;
+        FeedbackRollupStats {
+            feedback_count: self.feedback_count,
+            score_count,
+            score_min: self.score_numbers.first().copied(),
+            score_max: self.score_numbers.last().copied(),
+            score_avg: avg_f64(&self.score_numbers),
+            score_p50: percentile_f64(&self.score_numbers, 50),
+            score_p95: percentile_f64(&self.score_numbers, 95),
+            score_p99: percentile_f64(&self.score_numbers, 99),
+            score_distribution_json: feedback_distribution_json(
+                &self.score_numbers,
+                self.missing_scores,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FeedbackRollupStats {
+    feedback_count: i64,
+    score_count: i64,
+    score_min: Option<f64>,
+    score_max: Option<f64>,
+    score_avg: Option<f64>,
+    score_p50: Option<f64>,
+    score_p95: Option<f64>,
+    score_p99: Option<f64>,
+    score_distribution_json: String,
+}
+
+fn avg_f64(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn percentile_f64(sorted_values: &[f64], percentile: usize) -> Option<f64> {
+    if sorted_values.is_empty() {
+        return None;
+    }
+    let index = ((sorted_values.len() - 1) * percentile).div_ceil(100);
+    Some(sorted_values[index.min(sorted_values.len() - 1)])
+}
+
+fn feedback_distribution_json(values: &[f64], missing: u64) -> String {
+    let mut distribution = BTreeMap::from([
+        ("lt_0", 0_u64),
+        ("0_to_0_25", 0),
+        ("0_25_to_0_5", 0),
+        ("0_5_to_0_75", 0),
+        ("0_75_to_1", 0),
+        ("gt_1", 0),
+        ("missing", missing),
+    ]);
+    for value in values {
+        let key = if *value < 0.0 {
+            "lt_0"
+        } else if *value < 0.25 {
+            "0_to_0_25"
+        } else if *value < 0.5 {
+            "0_25_to_0_5"
+        } else if *value < 0.75 {
+            "0_5_to_0_75"
+        } else if *value <= 1.0 {
+            "0_75_to_1"
+        } else {
+            "gt_1"
+        };
+        *distribution.entry(key).or_default() += 1;
+    }
+    serde_json::to_string(&distribution).expect("serialize feedback distribution")
 }
 
 fn feedback_from_row(row: Row) -> Result<FeedbackRecord> {
@@ -372,6 +565,28 @@ mod tests {
             .expect("feedback exists");
         assert_eq!(loaded.run_id.as_deref(), Some("run-a"));
         assert_eq!(loaded.extra, Some(json!({"source": "test"})));
+
+        let (client, connection) = tokio_postgres::connect(mockgres.postgres_url(), NoTls)
+            .await
+            .expect("connect postgres for feedback rollup check");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let rollup = client
+            .query_one(
+                "SELECT feedback_count, score_count, score_avg, score_distribution_json
+                FROM feedback_metric_rollups
+                WHERE project_name = 'demo' AND feedback_key = 'quality'",
+                &[],
+            )
+            .await
+            .expect("load feedback rollup");
+        assert_eq!(rollup.get::<_, i64>(0), 2);
+        assert_eq!(rollup.get::<_, i64>(1), 2);
+        assert_eq!(rollup.get::<_, Option<f64>>(2), Some(2.0));
+        let distribution: Value =
+            serde_json::from_str(&rollup.get::<_, String>(3)).expect("parse distribution");
+        assert_eq!(distribution["gt_1"], json!(1));
 
         mockgres.stop().await.expect("stop mockgres");
     }

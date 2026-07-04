@@ -26,6 +26,18 @@ mod thread;
 mod tree;
 use metadata::persist_metadata;
 
+pub(crate) async fn refresh_trace_materialized_metadata(
+    tx: &tokio_postgres::Transaction<'_>,
+    project_name: &str,
+    trace_id: &str,
+) -> Result<()> {
+    tree::refresh_trace_tree_metadata(tx, project_name, trace_id).await?;
+    thread::refresh_trace_thread_metadata(tx, project_name, trace_id).await?;
+    indexes::refresh_project_filter_stats(tx, project_name).await?;
+    indexes::refresh_project_aggregate_rollups(tx, project_name).await?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct IngestConfig {
     pub max_spans_per_segment: usize,
@@ -600,6 +612,7 @@ fn span_record_from_run_summary(run: &RunSummary) -> SpanRecord {
         },
         event_kind: RunEventKind::Compact,
         attributes_json: run.attributes_json.clone(),
+        idempotency_key: Some(compaction_idempotency_key(run)),
     }
 }
 
@@ -658,6 +671,10 @@ fn validate_partition_records(partition: &PartitionKey, records: &[SpanRecord]) 
 }
 
 fn run_event_idempotency_key(record: &SpanRecord) -> String {
+    if let Some(idempotency_key) = &record.idempotency_key {
+        return idempotency_key.clone();
+    }
+
     format!(
         "{}:{}:{}:{}:{}:{}:{}:{}:{}:{:016x}",
         record.run_id,
@@ -670,6 +687,20 @@ fn run_event_idempotency_key(record: &SpanRecord) -> String {
         record.status_code,
         record.name,
         stable_hash(record.attributes_json.as_bytes())
+    )
+}
+
+fn compaction_idempotency_key(run: &RunSummary) -> String {
+    static NEXT_COMPACTION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    let sequence = NEXT_COMPACTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "compact:{}:{}:{}:{}:{}",
+        run.project_name, run.trace_id, run.span_id, now_ns, sequence
     )
 }
 

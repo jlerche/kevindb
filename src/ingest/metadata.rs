@@ -7,8 +7,8 @@ use crate::query::generated_run_id;
 use crate::segment::SPAN_SEGMENT_SCHEMA_VERSION;
 
 use super::indexes::{
-    ScalarIndexes, refresh_project_filter_stats, replace_run_scalar_indexes,
-    root_locator_for_record,
+    ScalarIndexes, refresh_project_aggregate_rollups, refresh_project_filter_stats,
+    replace_run_scalar_indexes, root_locator_for_record,
 };
 use super::thread::{refresh_trace_thread_metadata, replace_run_preview};
 use super::tree::refresh_trace_tree_metadata;
@@ -142,7 +142,9 @@ pub(super) async fn persist_metadata(
                 name, run_type,
                 start_time_unix_nano, end_time_unix_nano, status_code, status, is_root,
                 root_run_id, root_span_id, latency_nanos,
-                prompt_tokens, completion_tokens, total_tokens, total_cost,
+                prompt_tokens, completion_tokens, total_tokens,
+                prompt_cost, completion_cost, total_cost,
+                first_token_latency_nanos, evaluator_score,
                 model_name, provider_name,
                 last_trace_segment_id, last_row_index,
                 last_event_type, last_event_time_unix_nano, last_run_event_id, updated_at
@@ -150,7 +152,7 @@ pub(super) async fn persist_metadata(
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                 $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25,
-                $26, $27, $28, CURRENT_TIMESTAMP
+                $26, $27, $28, $29, $30, $31, $32, CURRENT_TIMESTAMP
             )
             ON CONFLICT (project_name, trace_id, span_id)
             DO UPDATE SET
@@ -171,7 +173,11 @@ pub(super) async fn persist_metadata(
                 prompt_tokens = EXCLUDED.prompt_tokens,
                 completion_tokens = EXCLUDED.completion_tokens,
                 total_tokens = EXCLUDED.total_tokens,
+                prompt_cost = EXCLUDED.prompt_cost,
+                completion_cost = EXCLUDED.completion_cost,
                 total_cost = EXCLUDED.total_cost,
+                first_token_latency_nanos = EXCLUDED.first_token_latency_nanos,
+                evaluator_score = EXCLUDED.evaluator_score,
                 model_name = EXCLUDED.model_name,
                 provider_name = EXCLUDED.provider_name,
                 last_trace_segment_id = EXCLUDED.last_trace_segment_id,
@@ -208,7 +214,11 @@ pub(super) async fn persist_metadata(
                     &scalar_indexes.prompt_tokens,
                     &scalar_indexes.completion_tokens,
                     &scalar_indexes.total_tokens,
+                    &scalar_indexes.prompt_cost,
+                    &scalar_indexes.completion_cost,
                     &scalar_indexes.total_cost,
+                    &scalar_indexes.first_token_latency_nanos,
+                    &scalar_indexes.evaluator_score,
                     &scalar_indexes.model_name,
                     &scalar_indexes.provider_name,
                     &segment_id,
@@ -306,6 +316,7 @@ pub(super) async fn persist_metadata(
     }
     for project_name in updated_projects {
         refresh_project_filter_stats(tx, &project_name).await?;
+        refresh_project_aggregate_rollups(tx, &project_name).await?;
     }
 
     Ok(true)

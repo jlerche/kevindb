@@ -37,10 +37,22 @@ pub(super) async fn refresh_trace_tree_metadata(
 ) -> Result<()> {
     let rows = tx
         .query(
-            "SELECT span_id, parent_span_id, run_id, generated_run_id, start_time_unix_nano
-            FROM run_heads
-            WHERE project_name = $1 AND trace_id = $2
-            ORDER BY start_time_unix_nano ASC, span_id ASC",
+            "SELECT
+                heads.span_id,
+                heads.parent_span_id,
+                heads.run_id,
+                heads.generated_run_id,
+                heads.start_time_unix_nano
+            FROM run_heads heads
+            LEFT JOIN run_deletions deletions
+                ON deletions.project_name = heads.project_name
+                AND deletions.trace_id = heads.trace_id
+                AND deletions.span_id = heads.span_id
+            WHERE heads.project_name = $1
+                AND heads.trace_id = $2
+                AND heads.deleted_at_unix_nano IS NULL
+                AND deletions.span_id IS NULL
+            ORDER BY heads.start_time_unix_nano ASC, heads.span_id ASC",
             &[&project_name, &trace_id],
         )
         .await

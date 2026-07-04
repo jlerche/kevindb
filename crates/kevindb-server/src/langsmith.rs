@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::{ApiError, ServerState};
 
+pub(crate) mod aggregates;
 mod feedback;
 mod filter;
 mod threads;
@@ -415,6 +416,7 @@ impl RunWriteRequest {
             status_code,
             event_kind,
             attributes_json: payload.to_attributes_json(),
+            idempotency_key: None,
         })
     }
 }

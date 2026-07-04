@@ -270,3 +270,148 @@ async fn filters_use_scalar_indexes_feedback_and_projection() {
 
     mockgres.stop().await.expect("stop mockgres");
 }
+
+#[tokio::test]
+async fn feedback_filters_are_scoped_to_query_projects() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 64,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+
+    let demo = sample_record("1111111111111111", 10);
+    let mut other = sample_record("1111111111111111", 20);
+    other.project_name = "other".to_owned();
+    ingestor
+        .ingest_records(vec![demo, other])
+        .await
+        .expect("ingest colliding run ids");
+
+    let (client, connection) = tokio_postgres::connect(mockgres.postgres_url(), NoTls)
+        .await
+        .expect("connect postgres");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .execute(
+            "INSERT INTO feedback(
+                id, run_id, trace_id, project_name, key,
+                score_json, value_json, score_number, value_text,
+                created_at_unix_nano, modified_at_unix_nano
+            )
+            VALUES (
+                'feedback-other', '1111111111111111',
+                'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+                'other', 'quality', '1.0', '\"pass\"', 1.0, 'pass', 300, 300
+            )",
+            &[],
+        )
+        .await
+        .expect("insert other project feedback");
+
+    let mut query = RunQuery::new("demo");
+    query.filter = Some(FilterExpr::parse(r#"eq(feedback_key, "quality")"#).expect("filter"));
+    query.include_payload = false;
+
+    let result = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store)
+        .list_runs_with_diagnostics(query)
+        .await
+        .expect("run feedback-scoped query");
+
+    assert!(result.runs.is_empty());
+    assert_eq!(result.diagnostics.candidate_runs, 0);
+
+    mockgres.stop().await.expect("stop mockgres");
+}
+
+#[tokio::test]
+async fn deleting_runs_refreshes_current_filter_stats() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 64,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+
+    let mut deleted = sample_record("1111111111111111", 10);
+    deleted.run_type = "tool".to_owned();
+    deleted.attributes_json = json!({
+        "tags": ["drop"],
+        "metadata": {"drop_key": "drop"}
+    })
+    .to_string();
+    let mut kept = sample_record("2222222222222222", 20);
+    kept.run_type = "llm".to_owned();
+    kept.attributes_json = json!({
+        "tags": ["keep"],
+        "metadata": {"keep_key": "keep"}
+    })
+    .to_string();
+    ingestor
+        .ingest_records(vec![deleted, kept])
+        .await
+        .expect("ingest indexed runs");
+
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store);
+    assert!(
+        query_engine
+            .delete_run(
+                "demo",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "1111111111111111",
+                Some("unit-test"),
+            )
+            .await
+            .expect("delete indexed run")
+    );
+
+    let (client, connection) = tokio_postgres::connect(mockgres.postgres_url(), NoTls)
+        .await
+        .expect("connect postgres");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let stats = client
+        .query(
+            "SELECT stat_name, distinct_count
+            FROM project_filter_stats
+            WHERE project_name = 'demo'
+                AND stat_name IN ('run_type', 'tag', 'metadata_key')
+            ORDER BY stat_name",
+            &[],
+        )
+        .await
+        .expect("load filter stats")
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        stats,
+        vec![
+            ("metadata_key".to_owned(), 1),
+            ("run_type".to_owned(), 1),
+            ("tag".to_owned(), 1),
+        ]
+    );
+
+    mockgres.stop().await.expect("stop mockgres");
+}

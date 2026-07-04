@@ -32,6 +32,8 @@ struct ThreadRunRow {
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
     total_tokens: Option<i64>,
+    prompt_cost: Option<f64>,
+    completion_cost: Option<f64>,
     total_cost: Option<f64>,
     trace_segment_id: Option<i64>,
     row_index: Option<i64>,
@@ -57,6 +59,8 @@ struct ThreadTraceUpsert {
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
     total_tokens: Option<i64>,
+    prompt_cost: Option<f64>,
+    completion_cost: Option<f64>,
     total_cost: Option<f64>,
 }
 
@@ -71,6 +75,8 @@ struct ThreadTraceSummaryRow {
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
     total_tokens: Option<i64>,
+    prompt_cost: Option<f64>,
+    completion_cost: Option<f64>,
     total_cost: Option<f64>,
 }
 
@@ -198,6 +204,8 @@ async fn load_trace_thread_runs(
                 heads.prompt_tokens,
                 heads.completion_tokens,
                 heads.total_tokens,
+                heads.prompt_cost,
+                heads.completion_cost,
                 heads.total_cost,
                 heads.last_trace_segment_id,
                 heads.last_row_index,
@@ -240,8 +248,8 @@ async fn load_trace_thread_runs(
         .into_iter()
         .map(|row| {
             let span_id: String = row.get(0);
-            let metadata_thread_id = clean_thread_id(row.get::<_, Option<String>>(16));
-            let metadata_session_id = clean_thread_id(row.get::<_, Option<String>>(17));
+            let metadata_thread_id = clean_thread_id(row.get::<_, Option<String>>(18));
+            let metadata_session_id = clean_thread_id(row.get::<_, Option<String>>(19));
             let tag_thread_id = tags_by_span
                 .get(&span_id)
                 .and_then(|tags| thread_id_from_tags(tags));
@@ -262,14 +270,16 @@ async fn load_trace_thread_runs(
                 prompt_tokens: row.get(10),
                 completion_tokens: row.get(11),
                 total_tokens: row.get(12),
-                total_cost: row.get(13),
-                trace_segment_id: row.get(14),
-                row_index: row.get(15),
+                prompt_cost: row.get(13),
+                completion_cost: row.get(14),
+                total_cost: row.get(15),
+                trace_segment_id: row.get(16),
+                row_index: row.get(17),
                 thread_id,
-                inputs_preview: row.get(18),
-                outputs_preview: row.get(19),
-                error_preview: row.get(20),
-                first_token_time_unix_nano: row.get(21),
+                inputs_preview: row.get(20),
+                outputs_preview: row.get(21),
+                error_preview: row.get(22),
+                first_token_time_unix_nano: row.get(23),
             }
         })
         .collect())
@@ -336,6 +346,8 @@ fn build_thread_trace_upsert(runs: &[ThreadRunRow]) -> ThreadTraceUpsert {
         prompt_tokens: sum_i64(runs.iter().map(|run| run.prompt_tokens)),
         completion_tokens: sum_i64(runs.iter().map(|run| run.completion_tokens)),
         total_tokens: sum_i64(runs.iter().map(|run| run.total_tokens)),
+        prompt_cost: sum_f64(runs.iter().map(|run| run.prompt_cost)),
+        completion_cost: sum_f64(runs.iter().map(|run| run.completion_cost)),
         total_cost: sum_f64(runs.iter().map(|run| run.total_cost)),
     }
 }
@@ -369,11 +381,12 @@ async fn upsert_thread_trace(
             project_name, thread_id, trace_id, root_run_id, root_span_id, name,
             start_time_unix_nano, end_time_unix_nano, latency_nanos,
             first_token_time_unix_nano, inputs_preview, outputs_preview, error_preview,
-            prompt_tokens, completion_tokens, total_tokens, total_cost, updated_at
+            prompt_tokens, completion_tokens, total_tokens,
+            prompt_cost, completion_cost, total_cost, updated_at
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-            $14, $15, $16, $17, CURRENT_TIMESTAMP
+            $14, $15, $16, $17, $18, $19, CURRENT_TIMESTAMP
         )
         ON CONFLICT (project_name, thread_id, trace_id)
         DO UPDATE SET
@@ -390,6 +403,8 @@ async fn upsert_thread_trace(
             prompt_tokens = EXCLUDED.prompt_tokens,
             completion_tokens = EXCLUDED.completion_tokens,
             total_tokens = EXCLUDED.total_tokens,
+            prompt_cost = EXCLUDED.prompt_cost,
+            completion_cost = EXCLUDED.completion_cost,
             total_cost = EXCLUDED.total_cost,
             updated_at = CURRENT_TIMESTAMP",
         &[
@@ -409,6 +424,8 @@ async fn upsert_thread_trace(
             &trace.prompt_tokens,
             &trace.completion_tokens,
             &trace.total_tokens,
+            &trace.prompt_cost,
+            &trace.completion_cost,
             &trace.total_cost,
         ],
     )
@@ -505,6 +522,8 @@ async fn refresh_thread_summary(
                 prompt_tokens,
                 completion_tokens,
                 total_tokens,
+                prompt_cost,
+                completion_cost,
                 total_cost
             FROM thread_traces
             WHERE project_name = $1 AND thread_id = $2
@@ -526,7 +545,9 @@ async fn refresh_thread_summary(
             prompt_tokens: row.get(6),
             completion_tokens: row.get(7),
             total_tokens: row.get(8),
-            total_cost: row.get(9),
+            prompt_cost: row.get(9),
+            completion_cost: row.get(10),
+            total_cost: row.get(11),
         })
         .collect::<Vec<_>>();
 
@@ -560,6 +581,8 @@ async fn refresh_thread_summary(
     let prompt_tokens = sum_i64(traces.iter().map(|trace| trace.prompt_tokens));
     let completion_tokens = sum_i64(traces.iter().map(|trace| trace.completion_tokens));
     let total_tokens = sum_i64(traces.iter().map(|trace| trace.total_tokens));
+    let prompt_cost = sum_f64(traces.iter().map(|trace| trace.prompt_cost));
+    let completion_cost = sum_f64(traces.iter().map(|trace| trace.completion_cost));
     let total_cost = sum_f64(traces.iter().map(|trace| trace.total_cost));
 
     tx.execute(
@@ -576,10 +599,12 @@ async fn refresh_thread_summary(
             prompt_tokens = $11,
             completion_tokens = $12,
             total_tokens = $13,
-            total_cost = $14,
-            latency_p50 = $15,
-            latency_p99 = $16,
-            num_errored_turns = $17,
+            prompt_cost = $14,
+            completion_cost = $15,
+            total_cost = $16,
+            latency_p50 = $17,
+            latency_p99 = $18,
+            num_errored_turns = $19,
             updated_at = CURRENT_TIMESTAMP
         WHERE project_name = $1 AND thread_id = $2",
         &[
@@ -596,6 +621,8 @@ async fn refresh_thread_summary(
             &prompt_tokens,
             &completion_tokens,
             &total_tokens,
+            &prompt_cost,
+            &completion_cost,
             &total_cost,
             &latency_p50,
             &latency_p99,

@@ -198,6 +198,66 @@ async fn cyclic_parent_edges_are_guarded_in_tree_metadata() {
     mockgres.stop().await.expect("stop mockgres");
 }
 
+#[tokio::test]
+async fn deleting_parent_refreshes_current_tree_metadata() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 64,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+
+    let root = tree_record("1111111111111111", "agent.root", "chain", None, 10);
+    let child = tree_record(
+        "2222222222222222",
+        "llm.call",
+        "llm",
+        Some("1111111111111111"),
+        20,
+    );
+    ingestor
+        .ingest_records(vec![root, child])
+        .await
+        .expect("ingest tree");
+
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store);
+    assert!(
+        query_engine
+            .delete_run(
+                "demo",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "1111111111111111",
+                Some("unit-test"),
+            )
+            .await
+            .expect("delete root")
+    );
+
+    let child = load_tree_node(mockgres.postgres_url(), "2222222222222222").await;
+    assert_eq!(child.parent_span_id, None);
+    assert_eq!(child.root_span_id, "2222222222222222");
+    assert_eq!(child.depth, 0);
+    assert!(child.unresolved_parent);
+
+    let trace_tree = query_engine
+        .load_trace_tree("demo", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .await
+        .expect("load current tree");
+    assert_eq!(trace_tree.roots.len(), 1);
+    assert_eq!(trace_tree.roots[0].run.span_id, "2222222222222222");
+    assert!(trace_tree.roots[0].run.is_root);
+
+    mockgres.stop().await.expect("stop mockgres");
+}
+
 #[derive(Debug)]
 struct TreeNodeRow {
     parent_span_id: Option<String>,

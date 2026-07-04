@@ -58,13 +58,13 @@ Results:
 | thread trace listing rejection | 0.00002 ms | 0.00005 ms | 0 | 0 | 0 | 0 |
 | aggregate scan rejection | 0.00002 ms | 0.00008 ms | 0 | 0 | 0 | 0 |
 
-Thread trace listing and aggregate scans are deliberately benchmarked as
-measured rejection paths until their storage models exist:
+Thread trace listing and aggregate scans were benchmarked as measured rejection
+paths before their storage models existed:
 
 | Workload | Reason |
 | --- | --- |
 | thread trace listing | Thread materialization is not implemented; no payload metadata scan fallback. |
-| aggregate scans | Aggregate API and typed rollups are not implemented yet. |
+| aggregate scans | Historical pre-Phase 5 rejection path. |
 
 ## Phase 2 Filtering Snapshot
 
@@ -191,6 +191,23 @@ Thread trace listing now reads `threads`/`thread_traces` from Postgres using
 cursor pagination. It does not open Vortex files or read object storage; full
 payloads remain in object storage while previews and locators are materialized
 in Postgres.
+
+## Phase 5 Aggregation Snapshot
+
+Command:
+
+```bash
+just bench-core
+```
+
+| Workload | p50 latency | p99 latency | Candidate segments | Vortex files opened | Object requests | Bytes read |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| aggregate run-type rollup | 0.66 ms | 0.81 ms | 0 | 0 | 0 | 0 |
+| aggregate model grouping | 138.1 ms | 142.2 ms | 12 | 12 | 420 | 2,915,760 |
+
+Run-type dashboard aggregates read `run_metric_rollups` from Postgres and avoid
+object storage. Model grouping scans typed Vortex metric columns with measured
+fanout and does not parse payload JSON at query time.
 
 ## Planner Snapshots
 

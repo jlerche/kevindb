@@ -495,6 +495,7 @@ fn span_record(
         status_code,
         event_kind: RunEventKind::End,
         attributes_json: "{}".to_owned(),
+        idempotency_key: None,
     }
 }
 

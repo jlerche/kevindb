@@ -1,8 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use crate::metrics::TypedRunMetrics;
 use crate::otlp::SpanRecord;
 
 const MAX_TAGS: usize = 32;
@@ -10,6 +11,7 @@ const MAX_TAG_BYTES: usize = 128;
 const MAX_METADATA_PAIRS: usize = 32;
 const MAX_METADATA_KEY_BYTES: usize = 128;
 const MAX_METADATA_VALUE_BYTES: usize = 256;
+pub(crate) const AGGREGATE_ROLLUP_BUCKET_UNIX_NANOS: i64 = 60 * 60 * 1_000_000_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ScalarIndexes {
@@ -19,7 +21,11 @@ pub(super) struct ScalarIndexes {
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
+    pub prompt_cost: Option<f64>,
+    pub completion_cost: Option<f64>,
     pub total_cost: Option<f64>,
+    pub first_token_latency_nanos: Option<i64>,
+    pub evaluator_score: Option<f64>,
     pub model_name: Option<String>,
     pub provider_name: Option<String>,
     pub tags: Vec<String>,
@@ -35,16 +41,21 @@ pub(super) struct RootLocator {
 impl ScalarIndexes {
     pub fn from_record(record: &SpanRecord, root: RootLocator) -> Self {
         let attributes = parse_attributes(&record.attributes_json);
+        let metrics = TypedRunMetrics::from_record(record);
         Self {
             root_run_id: root.run_id,
             root_span_id: root.span_id,
-            latency_nanos: latency_nanos(record),
-            prompt_tokens: scalar_i64(&attributes, PROMPT_TOKEN_PATHS),
-            completion_tokens: scalar_i64(&attributes, COMPLETION_TOKEN_PATHS),
-            total_tokens: scalar_i64(&attributes, TOTAL_TOKEN_PATHS),
-            total_cost: scalar_f64(&attributes, TOTAL_COST_PATHS),
-            model_name: scalar_string(&attributes, MODEL_PATHS),
-            provider_name: scalar_string(&attributes, PROVIDER_PATHS),
+            latency_nanos: metrics.latency_nanos,
+            prompt_tokens: metrics.prompt_tokens,
+            completion_tokens: metrics.completion_tokens,
+            total_tokens: metrics.total_tokens,
+            prompt_cost: metrics.prompt_cost,
+            completion_cost: metrics.completion_cost,
+            total_cost: metrics.total_cost,
+            first_token_latency_nanos: metrics.first_token_latency_nanos,
+            evaluator_score: metrics.evaluator_score,
+            model_name: metrics.model_name,
+            provider_name: metrics.provider_name,
             tags: extract_tags(&attributes),
             metadata: extract_metadata(&attributes),
         }
@@ -205,6 +216,291 @@ pub(super) async fn refresh_project_filter_stats(
     Ok(())
 }
 
+pub(super) async fn refresh_project_aggregate_rollups(
+    tx: &tokio_postgres::Transaction<'_>,
+    project_name: &str,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM run_metric_rollups WHERE project_name = $1",
+        &[&project_name],
+    )
+    .await
+    .context("delete old run aggregate rollups")?;
+
+    let rows = tx
+        .query(
+            "SELECT
+                run_type, status, start_time_unix_nano, latency_nanos,
+                prompt_tokens, completion_tokens, total_tokens,
+                prompt_cost, completion_cost, total_cost,
+                evaluator_score, model_name
+            FROM run_heads heads
+            LEFT JOIN run_deletions deletions
+                ON deletions.project_name = heads.project_name
+                AND deletions.trace_id = heads.trace_id
+                AND deletions.span_id = heads.span_id
+            WHERE heads.project_name = $1
+                AND heads.deleted_at_unix_nano IS NULL
+                AND deletions.span_id IS NULL",
+            &[&project_name],
+        )
+        .await
+        .context("load run heads for aggregate rollups")?;
+
+    let runs = rows
+        .into_iter()
+        .map(|row| RollupRun {
+            run_type: row.get(0),
+            status: row.get(1),
+            start_time_unix_nano: row.get(2),
+            latency_nanos: row.get(3),
+            prompt_tokens: row.get(4),
+            completion_tokens: row.get(5),
+            total_tokens: row.get(6),
+            prompt_cost: row.get(7),
+            completion_cost: row.get(8),
+            total_cost: row.get(9),
+            evaluator_score: row.get(10),
+            model_name: row.get(11),
+        })
+        .collect::<Vec<_>>();
+
+    for rollup_kind in ["project", "run_type", "model", "error"] {
+        let mut groups = BTreeMap::<(i64, String), RollupAccumulator>::new();
+        for run in &runs {
+            let group_value = match rollup_kind {
+                "project" => project_name.to_owned(),
+                "run_type" => run.run_type.clone(),
+                "model" => run
+                    .model_name
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                "error" => (run.status == "error").to_string(),
+                _ => unreachable!("known rollup kind"),
+            };
+            groups
+                .entry((rollup_time_bucket(run.start_time_unix_nano), group_value))
+                .or_default()
+                .push(run);
+        }
+        for ((time_bucket_start_unix_nano, group_value), accumulator) in groups {
+            insert_run_metric_rollup(
+                tx,
+                project_name,
+                rollup_kind,
+                time_bucket_start_unix_nano,
+                &group_value,
+                accumulator.finish(),
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn insert_run_metric_rollup(
+    tx: &tokio_postgres::Transaction<'_>,
+    project_name: &str,
+    rollup_kind: &str,
+    time_bucket_start_unix_nano: i64,
+    group_value: &str,
+    stats: RollupStats,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO run_metric_rollups(
+            project_name, bucket_size_unix_nanos, time_bucket_start_unix_nano,
+            rollup_kind, group_value, run_count, error_count,
+            latency_min_nanos, latency_max_nanos, latency_avg_nanos,
+            latency_p50_nanos, latency_p95_nanos, latency_p99_nanos,
+            prompt_tokens_sum, prompt_tokens_avg,
+            completion_tokens_sum, completion_tokens_avg,
+            total_tokens_sum, total_tokens_avg,
+            prompt_cost_sum, prompt_cost_avg,
+            completion_cost_sum, completion_cost_avg,
+            total_cost_sum, total_cost_avg,
+            evaluator_score_avg, updated_at
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+            $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+            $21, $22, $23, $24, $25, $26, CURRENT_TIMESTAMP
+        )",
+        &[
+            &project_name,
+            &AGGREGATE_ROLLUP_BUCKET_UNIX_NANOS,
+            &time_bucket_start_unix_nano,
+            &rollup_kind,
+            &group_value,
+            &stats.run_count,
+            &stats.error_count,
+            &stats.latency_min_nanos,
+            &stats.latency_max_nanos,
+            &stats.latency_avg_nanos,
+            &stats.latency_p50_nanos,
+            &stats.latency_p95_nanos,
+            &stats.latency_p99_nanos,
+            &stats.prompt_tokens_sum,
+            &stats.prompt_tokens_avg,
+            &stats.completion_tokens_sum,
+            &stats.completion_tokens_avg,
+            &stats.total_tokens_sum,
+            &stats.total_tokens_avg,
+            &stats.prompt_cost_sum,
+            &stats.prompt_cost_avg,
+            &stats.completion_cost_sum,
+            &stats.completion_cost_avg,
+            &stats.total_cost_sum,
+            &stats.total_cost_avg,
+            &stats.evaluator_score_avg,
+        ],
+    )
+    .await
+    .with_context(|| format!("insert {rollup_kind} aggregate rollup"))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct RollupRun {
+    run_type: String,
+    status: String,
+    start_time_unix_nano: i64,
+    latency_nanos: i64,
+    prompt_tokens: Option<i64>,
+    completion_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    prompt_cost: Option<f64>,
+    completion_cost: Option<f64>,
+    total_cost: Option<f64>,
+    evaluator_score: Option<f64>,
+    model_name: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct RollupAccumulator {
+    run_count: i64,
+    error_count: i64,
+    latency_nanos: Vec<i64>,
+    prompt_tokens: Vec<i64>,
+    completion_tokens: Vec<i64>,
+    total_tokens: Vec<i64>,
+    prompt_cost: Vec<f64>,
+    completion_cost: Vec<f64>,
+    total_cost: Vec<f64>,
+    evaluator_score: Vec<f64>,
+}
+
+impl RollupAccumulator {
+    fn push(&mut self, run: &RollupRun) {
+        self.run_count += 1;
+        if run.status == "error" {
+            self.error_count += 1;
+        }
+        self.latency_nanos.push(run.latency_nanos);
+        push_option(&mut self.prompt_tokens, run.prompt_tokens);
+        push_option(&mut self.completion_tokens, run.completion_tokens);
+        push_option(&mut self.total_tokens, run.total_tokens);
+        push_option_f64(&mut self.prompt_cost, run.prompt_cost);
+        push_option_f64(&mut self.completion_cost, run.completion_cost);
+        push_option_f64(&mut self.total_cost, run.total_cost);
+        push_option_f64(&mut self.evaluator_score, run.evaluator_score);
+    }
+
+    fn finish(self) -> RollupStats {
+        let mut latency_nanos = self.latency_nanos;
+        latency_nanos.sort_unstable();
+        RollupStats {
+            run_count: self.run_count,
+            error_count: self.error_count,
+            latency_min_nanos: latency_nanos.first().copied(),
+            latency_max_nanos: latency_nanos.last().copied(),
+            latency_avg_nanos: avg_i64(&latency_nanos),
+            latency_p50_nanos: percentile_i64(&latency_nanos, 50),
+            latency_p95_nanos: percentile_i64(&latency_nanos, 95),
+            latency_p99_nanos: percentile_i64(&latency_nanos, 99),
+            prompt_tokens_sum: sum_i64(&self.prompt_tokens),
+            prompt_tokens_avg: avg_i64(&self.prompt_tokens),
+            completion_tokens_sum: sum_i64(&self.completion_tokens),
+            completion_tokens_avg: avg_i64(&self.completion_tokens),
+            total_tokens_sum: sum_i64(&self.total_tokens),
+            total_tokens_avg: avg_i64(&self.total_tokens),
+            prompt_cost_sum: sum_f64(&self.prompt_cost),
+            prompt_cost_avg: avg_f64(&self.prompt_cost),
+            completion_cost_sum: sum_f64(&self.completion_cost),
+            completion_cost_avg: avg_f64(&self.completion_cost),
+            total_cost_sum: sum_f64(&self.total_cost),
+            total_cost_avg: avg_f64(&self.total_cost),
+            evaluator_score_avg: avg_f64(&self.evaluator_score),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RollupStats {
+    run_count: i64,
+    error_count: i64,
+    latency_min_nanos: Option<i64>,
+    latency_max_nanos: Option<i64>,
+    latency_avg_nanos: Option<f64>,
+    latency_p50_nanos: Option<f64>,
+    latency_p95_nanos: Option<f64>,
+    latency_p99_nanos: Option<f64>,
+    prompt_tokens_sum: Option<i64>,
+    prompt_tokens_avg: Option<f64>,
+    completion_tokens_sum: Option<i64>,
+    completion_tokens_avg: Option<f64>,
+    total_tokens_sum: Option<i64>,
+    total_tokens_avg: Option<f64>,
+    prompt_cost_sum: Option<f64>,
+    prompt_cost_avg: Option<f64>,
+    completion_cost_sum: Option<f64>,
+    completion_cost_avg: Option<f64>,
+    total_cost_sum: Option<f64>,
+    total_cost_avg: Option<f64>,
+    evaluator_score_avg: Option<f64>,
+}
+
+fn rollup_time_bucket(start_time_unix_nano: i64) -> i64 {
+    start_time_unix_nano.div_euclid(AGGREGATE_ROLLUP_BUCKET_UNIX_NANOS)
+        * AGGREGATE_ROLLUP_BUCKET_UNIX_NANOS
+}
+
+fn push_option(values: &mut Vec<i64>, value: Option<i64>) {
+    if let Some(value) = value {
+        values.push(value);
+    }
+}
+
+fn push_option_f64(values: &mut Vec<f64>, value: Option<f64>) {
+    if let Some(value) = value.filter(|value| value.is_finite()) {
+        values.push(value);
+    }
+}
+
+fn sum_i64(values: &[i64]) -> Option<i64> {
+    (!values.is_empty()).then(|| values.iter().sum())
+}
+
+fn avg_i64(values: &[i64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<i64>() as f64 / values.len() as f64)
+}
+
+fn sum_f64(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum())
+}
+
+fn avg_f64(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn percentile_i64(sorted_values: &[i64], percentile: usize) -> Option<f64> {
+    if sorted_values.is_empty() {
+        return None;
+    }
+    let index = ((sorted_values.len() - 1) * percentile).div_ceil(100);
+    Some(sorted_values[index.min(sorted_values.len() - 1)] as f64)
+}
+
 async fn count_distinct_run_head(
     tx: &tokio_postgres::Transaction<'_>,
     project_name: &str,
@@ -212,8 +508,18 @@ async fn count_distinct_run_head(
 ) -> Result<i64> {
     let row = tx
         .query_one(
-            format!("SELECT COUNT(DISTINCT {column}) FROM run_heads WHERE project_name = $1")
-                .as_str(),
+            format!(
+                "SELECT COUNT(DISTINCT heads.{column})
+                FROM run_heads heads
+                LEFT JOIN run_deletions deletions
+                    ON deletions.project_name = heads.project_name
+                    AND deletions.trace_id = heads.trace_id
+                    AND deletions.span_id = heads.span_id
+                WHERE heads.project_name = $1
+                    AND heads.deleted_at_unix_nano IS NULL
+                    AND deletions.span_id IS NULL"
+            )
+            .as_str(),
             &[&project_name],
         )
         .await
@@ -227,7 +533,19 @@ async fn count_distinct_tag(
 ) -> Result<i64> {
     let row = tx
         .query_one(
-            "SELECT COUNT(DISTINCT tag) FROM run_tags WHERE project_name = $1",
+            "SELECT COUNT(DISTINCT tags.tag)
+            FROM run_tags tags
+            INNER JOIN run_heads heads
+                ON heads.project_name = tags.project_name
+                AND heads.trace_id = tags.trace_id
+                AND heads.span_id = tags.span_id
+            LEFT JOIN run_deletions deletions
+                ON deletions.project_name = tags.project_name
+                AND deletions.trace_id = tags.trace_id
+                AND deletions.span_id = tags.span_id
+            WHERE tags.project_name = $1
+                AND heads.deleted_at_unix_nano IS NULL
+                AND deletions.span_id IS NULL",
             &[&project_name],
         )
         .await
@@ -241,7 +559,19 @@ async fn count_distinct_metadata_key(
 ) -> Result<i64> {
     let row = tx
         .query_one(
-            "SELECT COUNT(DISTINCT key) FROM run_metadata WHERE project_name = $1",
+            "SELECT COUNT(DISTINCT metadata.key)
+            FROM run_metadata metadata
+            INNER JOIN run_heads heads
+                ON heads.project_name = metadata.project_name
+                AND heads.trace_id = metadata.trace_id
+                AND heads.span_id = metadata.span_id
+            LEFT JOIN run_deletions deletions
+                ON deletions.project_name = metadata.project_name
+                AND deletions.trace_id = metadata.trace_id
+                AND deletions.span_id = metadata.span_id
+            WHERE metadata.project_name = $1
+                AND heads.deleted_at_unix_nano IS NULL
+                AND deletions.span_id IS NULL",
             &[&project_name],
         )
         .await
@@ -251,14 +581,6 @@ async fn count_distinct_metadata_key(
 
 fn parse_attributes(attributes_json: &str) -> Value {
     serde_json::from_str(attributes_json).unwrap_or(Value::Null)
-}
-
-fn latency_nanos(record: &SpanRecord) -> i64 {
-    record
-        .end_time_unix_nano
-        .checked_sub(record.start_time_unix_nano)
-        .filter(|latency| *latency > 0)
-        .unwrap_or(0)
 }
 
 fn extract_tags(root: &Value) -> Vec<String> {
@@ -297,32 +619,6 @@ fn extract_metadata(root: &Value) -> Vec<(String, String)> {
         }
     }
     metadata.into_iter().collect()
-}
-
-fn scalar_string(root: &Value, paths: &[&[&str]]) -> Option<String> {
-    paths
-        .iter()
-        .find_map(|path| path_value(root, path).and_then(|value| bounded_string(value, 256)))
-}
-
-fn scalar_i64(root: &Value, paths: &[&[&str]]) -> Option<i64> {
-    paths.iter().find_map(|path| {
-        path_value(root, path).and_then(|value| match value {
-            Value::Number(number) => number.as_i64(),
-            Value::String(value) => value.parse::<i64>().ok(),
-            _ => None,
-        })
-    })
-}
-
-fn scalar_f64(root: &Value, paths: &[&[&str]]) -> Option<f64> {
-    paths.iter().find_map(|path| {
-        path_value(root, path).and_then(|value| match value {
-            Value::Number(number) => number.as_f64(),
-            Value::String(value) => value.parse::<f64>().ok(),
-            _ => None,
-        })
-    })
 }
 
 fn bounded_string(value: &Value, max_bytes: usize) -> Option<String> {
@@ -367,49 +663,6 @@ const METADATA_PATHS: &[&[&str]] = &[
     &["extra", "metadata"],
 ];
 
-const PROMPT_TOKEN_PATHS: &[&[&str]] = &[
-    &["prompt_tokens"],
-    &["metrics", "prompt_tokens"],
-    &["usage", "prompt_tokens"],
-    &["langsmith.extra", "metadata", "prompt_tokens"],
-];
-const COMPLETION_TOKEN_PATHS: &[&[&str]] = &[
-    &["completion_tokens"],
-    &["metrics", "completion_tokens"],
-    &["usage", "completion_tokens"],
-    &["langsmith.extra", "metadata", "completion_tokens"],
-];
-const TOTAL_TOKEN_PATHS: &[&[&str]] = &[
-    &["total_tokens"],
-    &["metrics", "total_tokens"],
-    &["usage", "total_tokens"],
-    &["langsmith.extra", "metadata", "total_tokens"],
-];
-const TOTAL_COST_PATHS: &[&[&str]] = &[
-    &["total_cost"],
-    &["metrics", "total_cost"],
-    &["usage", "total_cost"],
-    &["langsmith.extra", "metadata", "total_cost"],
-];
-const MODEL_PATHS: &[&[&str]] = &[
-    &["gen_ai.request.model"],
-    &["model"],
-    &["model_name"],
-    &["metadata", "model"],
-    &["metadata", "ls_model_name"],
-    &["langsmith.extra", "metadata", "model"],
-    &["langsmith.extra", "metadata", "ls_model_name"],
-];
-const PROVIDER_PATHS: &[&[&str]] = &[
-    &["gen_ai.system"],
-    &["provider"],
-    &["provider_name"],
-    &["metadata", "provider"],
-    &["metadata", "ls_provider"],
-    &["langsmith.extra", "metadata", "provider"],
-    &["langsmith.extra", "metadata", "ls_provider"],
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +701,7 @@ mod tests {
                 "gen_ai.system": "openai"
             })
             .to_string(),
+            idempotency_key: None,
         };
 
         let indexes = ScalarIndexes::from_record(

@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use arrow_array::{ArrayRef as ArrowArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{
+    ArrayRef as ArrowArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use std::sync::Arc;
@@ -12,10 +14,11 @@ use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 
+use crate::metrics::TypedRunMetrics;
 use crate::otlp::SpanRecord;
 
-pub const SPAN_SEGMENT_SCHEMA_VERSION: i64 = 2;
-pub const ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION: i64 = 2;
+pub const SPAN_SEGMENT_SCHEMA_VERSION: i64 = 3;
+pub const ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION: i64 = 3;
 
 pub async fn encode_span_records(records: &[SpanRecord]) -> Result<Bytes> {
     let batch = records_to_batch(records)?;
@@ -66,6 +69,17 @@ fn records_to_batch(records: &[SpanRecord]) -> Result<RecordBatch> {
         Field::new("event_time_unix_nano", DataType::Int64, false),
         Field::new("row_index", DataType::Int64, false),
         Field::new("attributes_json", DataType::Utf8, false),
+        Field::new("latency_nanos", DataType::Int64, false),
+        Field::new("prompt_tokens", DataType::Int64, true),
+        Field::new("completion_tokens", DataType::Int64, true),
+        Field::new("total_tokens", DataType::Int64, true),
+        Field::new("prompt_cost", DataType::Float64, true),
+        Field::new("completion_cost", DataType::Float64, true),
+        Field::new("total_cost", DataType::Float64, true),
+        Field::new("first_token_latency_nanos", DataType::Int64, true),
+        Field::new("evaluator_score", DataType::Float64, true),
+        Field::new("model_name", DataType::Utf8, true),
+        Field::new("provider_name", DataType::Utf8, true),
     ]));
 
     let parent_run_ids: Vec<Option<&str>> = records
@@ -76,6 +90,10 @@ fn records_to_batch(records: &[SpanRecord]) -> Result<RecordBatch> {
         .iter()
         .map(|record| record.parent_span_id.as_deref())
         .collect();
+    let metrics = records
+        .iter()
+        .map(TypedRunMetrics::from_record)
+        .collect::<Vec<_>>();
     let columns: Vec<ArrowArrayRef> = vec![
         Arc::new(StringArray::from(
             records
@@ -155,6 +173,72 @@ fn records_to_batch(records: &[SpanRecord]) -> Result<RecordBatch> {
                 .map(|record| record.attributes_json.as_str())
                 .collect::<Vec<_>>(),
         )),
+        Arc::new(Int64Array::from(
+            metrics
+                .iter()
+                .map(|metrics| metrics.latency_nanos)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            metrics
+                .iter()
+                .map(|metrics| metrics.prompt_tokens)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            metrics
+                .iter()
+                .map(|metrics| metrics.completion_tokens)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            metrics
+                .iter()
+                .map(|metrics| metrics.total_tokens)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Float64Array::from(
+            metrics
+                .iter()
+                .map(|metrics| metrics.prompt_cost)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Float64Array::from(
+            metrics
+                .iter()
+                .map(|metrics| metrics.completion_cost)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Float64Array::from(
+            metrics
+                .iter()
+                .map(|metrics| metrics.total_cost)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            metrics
+                .iter()
+                .map(|metrics| metrics.first_token_latency_nanos)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Float64Array::from(
+            metrics
+                .iter()
+                .map(|metrics| metrics.evaluator_score)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            metrics
+                .iter()
+                .map(|metrics| metrics.model_name.as_deref())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            metrics
+                .iter()
+                .map(|metrics| metrics.provider_name.as_deref())
+                .collect::<Vec<_>>(),
+        )),
     ];
 
     RecordBatch::try_new(schema, columns).context("build Arrow span batch")
@@ -208,6 +292,7 @@ mod tests {
             status_code: 1,
             event_kind: crate::otlp::RunEventKind::End,
             attributes_json: "{}".to_owned(),
+            idempotency_key: None,
         }
     }
 }

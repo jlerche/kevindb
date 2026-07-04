@@ -281,6 +281,8 @@ fn thread_trace_sql(query: &ThreadTraceQuery, limit: usize) -> Result<String> {
             traces.prompt_tokens,
             traces.completion_tokens,
             traces.total_tokens,
+            traces.prompt_cost,
+            traces.completion_cost,
             traces.total_cost
         FROM thread_traces traces
         WHERE {}
@@ -334,6 +336,8 @@ fn thread_sql(query: &ThreadListQuery, limit: usize) -> Result<String> {
             threads.prompt_tokens,
             threads.completion_tokens,
             threads.total_tokens,
+            threads.prompt_cost,
+            threads.completion_cost,
             threads.total_cost,
             threads.latency_p50,
             threads.latency_p99,
@@ -460,9 +464,9 @@ fn thread_trace_from_row(row: Row) -> ThreadTraceSummary {
         prompt_tokens: row.get(12),
         completion_tokens: row.get(13),
         total_tokens: row.get(14),
-        prompt_cost: None,
-        completion_cost: None,
-        total_cost: row.get(15),
+        prompt_cost: row.get(15),
+        completion_cost: row.get(16),
+        total_cost: row.get(17),
     }
 }
 
@@ -481,10 +485,10 @@ fn thread_summary_from_row(row: Row) -> ThreadSummary {
         prompt_tokens: row.get(10),
         completion_tokens: row.get(11),
         total_tokens: row.get(12),
-        total_cost: row.get(13),
-        latency_p50: row.get(14),
-        latency_p99: row.get(15),
-        num_errored_turns: row.get(16),
+        total_cost: row.get(15),
+        latency_p50: row.get(16),
+        latency_p99: row.get(17),
+        num_errored_turns: row.get(18),
     }
 }
 

@@ -203,7 +203,11 @@ fn compile_and(
         ));
     }
     if !feedback_conditions.is_empty() {
-        predicates.push(feedback_exists_sql(run_alias, &feedback_conditions));
+        predicates.push(feedback_exists_sql(
+            run_alias,
+            &feedback_conditions,
+            project_names,
+        ));
     }
 
     Ok(format!("({})", predicates.join(" AND ")))
@@ -221,7 +225,7 @@ fn compile_compare(
             compile_metadata_atom(op, field, value, run_alias, project_names)
         }
         FilterField::FeedbackKey | FilterField::FeedbackScore | FilterField::FeedbackValue => {
-            compile_feedback_atom(op, field, value, run_alias)
+            compile_feedback_atom(op, field, value, run_alias, project_names)
         }
         FilterField::Tags => {
             let tag = value.as_string("tags")?;
@@ -546,16 +550,17 @@ fn compile_feedback_atom(
     field: FilterField,
     value: &FilterValue,
     run_alias: &str,
+    project_names: Option<&[String]>,
 ) -> Result<String, FilterError> {
     if matches!(op, CompareOp::Neq) {
         let condition = feedback_compare_condition(CompareOp::Eq, field, value)?;
         Ok(format!(
             "NOT ({})",
-            feedback_exists_sql(run_alias, &[condition])
+            feedback_exists_sql(run_alias, &[condition], project_names)
         ))
     } else {
         let condition = feedback_compare_condition(op, field, value)?;
-        Ok(feedback_exists_sql(run_alias, &[condition]))
+        Ok(feedback_exists_sql(run_alias, &[condition], project_names))
     }
 }
 
@@ -792,13 +797,18 @@ fn project_scope_sql(alias: &str, project_names: Option<&[String]>) -> String {
     )
 }
 
-fn feedback_exists_sql(run_alias: &str, conditions: &[String]) -> String {
+fn feedback_exists_sql(
+    run_alias: &str,
+    conditions: &[String],
+    project_names: Option<&[String]>,
+) -> String {
     format!(
         "(({run_alias}.run_id <> '' AND {run_alias}.run_id IN ({subquery}))
             OR {run_alias}.generated_run_id IN ({subquery}))",
         subquery = format!(
             "SELECT feedback_filter.run_id FROM feedback feedback_filter
-            WHERE feedback_filter.run_id IS NOT NULL AND {}",
+            WHERE feedback_filter.run_id IS NOT NULL AND {}{}",
+            project_scope_sql("feedback_filter", project_names),
             conditions.join(" AND ")
         )
     )

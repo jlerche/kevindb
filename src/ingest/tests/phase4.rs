@@ -289,6 +289,109 @@ async fn long_thread_overview_uses_bounded_metastore_pages() {
     mockgres.stop().await.expect("stop mockgres");
 }
 
+#[tokio::test]
+async fn deleting_thread_trace_refreshes_thread_summaries_and_messages() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 64,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+
+    ingestor
+        .ingest_records(vec![
+            thread_root(ThreadRootArgs {
+                trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                span_id: "1111111111111111",
+                start_time_unix_nano: 10,
+                thread_key: "thread_id",
+                thread_id: "thread-delete",
+                user_message: "delete me",
+                assistant_message: "gone",
+                metrics: Some((2, 3, 5, 0.01)),
+            }),
+            thread_root(ThreadRootArgs {
+                trace_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                span_id: "2222222222222222",
+                start_time_unix_nano: 20,
+                thread_key: "thread_id",
+                thread_id: "thread-delete",
+                user_message: "keep me",
+                assistant_message: "kept",
+                metrics: Some((4, 6, 10, 0.02)),
+            }),
+        ])
+        .await
+        .expect("ingest threaded traces");
+
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store);
+    assert!(
+        query_engine
+            .delete_run(
+                "demo",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "1111111111111111",
+                Some("unit-test"),
+            )
+            .await
+            .expect("delete threaded trace")
+    );
+
+    let traces = query_engine
+        .list_thread_traces(ThreadTraceQuery {
+            project_name: "demo".to_owned(),
+            thread_id: "thread-delete".to_owned(),
+            filter: None,
+            page_size: 10,
+            cursor: None,
+        })
+        .await
+        .expect("list current thread traces");
+    assert_eq!(
+        traces
+            .items
+            .iter()
+            .map(|trace| trace.trace_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+    );
+
+    let thread = query_engine
+        .list_threads(ThreadListQuery::new("demo"))
+        .await
+        .expect("list thread summaries")
+        .items
+        .into_iter()
+        .find(|thread| thread.thread_id == "thread-delete")
+        .expect("thread summary");
+    assert_eq!(thread.count, 1);
+    assert_eq!(thread.total_tokens, Some(10));
+    assert_eq!(thread.first_inputs.as_deref(), Some("keep me"));
+    assert_eq!(thread.last_outputs.as_deref(), Some("kept"));
+
+    let messages = query_engine
+        .list_thread_messages("demo", "thread-delete", 10)
+        .await
+        .expect("list current thread messages");
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message.preview.as_str())
+            .collect::<Vec<_>>(),
+        vec!["keep me", "kept"]
+    );
+
+    mockgres.stop().await.expect("stop mockgres");
+}
+
 struct ThreadRootArgs<'a> {
     trace_id: &'a str,
     span_id: &'a str,

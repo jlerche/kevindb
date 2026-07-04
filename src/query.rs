@@ -12,9 +12,11 @@ use url::Url;
 use uuid::Uuid;
 use vortex_datafusion::VortexFormatFactory;
 
+use crate::ingest::refresh_trace_materialized_metadata;
 use crate::otlp::RunEventKind;
 const MAX_DATAFUSION_SEGMENTS_PER_BATCH: usize = 8;
 
+mod aggregates;
 pub mod filter;
 mod object_store_stats;
 mod planner;
@@ -24,6 +26,10 @@ mod threads;
 mod tree;
 mod tree_access;
 mod tree_filter;
+pub use aggregates::{
+    FeedbackScoreStats, NumericStats, RunAggregateGroup, RunAggregateMetrics, RunAggregateQuery,
+    RunAggregateResult, RunAggregateRow, RunAggregateSource,
+};
 use filter::FilterExpr;
 use object_store_stats::{
     MeasuringObjectStore, ObjectStoreReadLimits, ObjectStoreReadSnapshot, datafusion_batch_query,
@@ -532,6 +538,10 @@ async fn delete_run_in_tx(
     .await
     .context("advance deleted trace locator tombstone")?;
 
+    refresh_trace_materialized_metadata(tx, project_name, trace_id)
+        .await
+        .context("refresh trace metadata after run delete")?;
+
     Ok(true)
 }
 
@@ -763,6 +773,7 @@ fn current_segment_source(uri: String) -> SegmentSource {
     SegmentSource {
         uri,
         total_bytes: 0,
+        schema_version: crate::segment::SPAN_SEGMENT_SCHEMA_VERSION,
         candidate_rows: Vec::new(),
     }
 }
