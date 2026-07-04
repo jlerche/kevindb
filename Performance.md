@@ -14,7 +14,7 @@ published parity claims.
 | --- | --- | --- |
 | Ingest batch ack | p99 <= 150 ms | Object PUTs <= flushed segments |
 | Single run load | p99 <= 150 ms | Candidate segments <= 1 |
-| Trace tree load | p99 <= 150 ms | Candidate segments <= runs in trace |
+| Trace tree load | p99 <= 150 ms | Object-store requests = 0 |
 | Selective project filter | p99 <= 200 ms | Candidate segments < project total when time filters narrow |
 | Selective scalar filter | p99 <= 200 ms | Candidate segments scale with indexed candidates |
 | Feedback filter | p99 <= 20 ms | Object-store requests = 0 |
@@ -107,6 +107,48 @@ out of the Vortex scan. The nonselective scalar filter uses an indexed tag that
 matches most runs, so fanout is bounded by the newest-first limit rather than by
 a full project payload scan.
 
+## Phase 3 Tree Snapshot
+
+Command:
+
+```bash
+cargo run -p kevindb-bench --quiet -- core
+```
+
+Date: 2026-07-04
+
+Dataset:
+
+| Setting | Value |
+| --- | ---: |
+| traces | 24 |
+| runs per trace | 8 |
+| records | 192 |
+| active segments | 12 |
+| feedback records | 52 |
+| iterations | 5 |
+
+Results:
+
+| Workload | p50 | p95/p99 | Candidate segments | Vortex files | Object requests | Bytes read |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ingest ack | 122.2 ms | 130.7 ms | 12 | 0 | 12 | 0 |
+| single run load | 69.4 ms | 70.3 ms | 1 | 1 | 45 | 162,660 |
+| trace tree load | 64.9 ms | 65.1 ms | 0 | 0 | 0 | 0 |
+| project run filtering | 145.7 ms | 147.6 ms | 12 | 12 | 480 | 1,932,640 |
+| selective scalar filtering | 50.7 ms | 53.8 ms | 1 | 1 | 35 | 158,300 |
+| nonselective scalar filtering | 94.3 ms | 97.1 ms | 7 | 7 | 245 | 1,117,780 |
+| feedback filtering | 0.8 ms | 1.3 ms | 0 | 0 | 0 | 0 |
+| root tree predicate | 278.3 ms | 285.5 ms | 1 | 1 | 35 | 158,300 |
+| child tree predicate | 277.0 ms | 281.3 ms | 1 | 1 | 40 | 160,180 |
+| thread trace listing rejection | 0.00002 ms | 0.00013 ms | 0 | 0 | 0 | 0 |
+| aggregate scan rejection | 0.00002 ms | 0.00002 ms | 0 | 0 | 0 | 0 |
+
+Trace tree reconstruction now reads `run_tree_nodes` and current `run_heads`
+from Postgres and does not open Vortex or object storage. Root and child tree
+predicate workloads use trace-selective indexed metadata so their Vortex fanout
+reflects the matched trace instead of the whole synthetic project.
+
 ## Planner Snapshots
 
 Single run load:
@@ -127,14 +169,15 @@ Trace tree load:
 
 ```text
 Postgres:
-  trace_locators(project_name, trace_id)
-  -> active trace_segment URIs
+  run_tree_nodes(project_name, trace_id)
+  -> current run_heads
   -> run_deletions for delete filtering
 DataFusion:
-  open trace-relevant current segments only
-  reconstruct latest run heads and tree in memory
+  not used
+Object storage:
+  no reads
 Budget assertion:
-  candidate_segments <= current runs in the trace
+  candidate_segments = 0 and object_store_requests = 0
 ```
 
 Selective project/time filtering:
@@ -185,7 +228,9 @@ Current query fanout assertions live in library tests:
 - `direct_run_lookup_uses_current_locator_after_stale_segment_deleted`
 - `ingest::tests::phase2::filters_use_scalar_indexes_feedback_and_projection`
 - `ingest::tests::phase2::planner_rejects_queries_that_exceed_fanout_limits`
+- `ingest::tests::phase3::tree_metadata_repairs_late_parents_and_indexes_nested_sets`
 - `query::tests::datafusion_sql_pushes_projection_and_source_predicates`
+- `query::tests::datafusion_sql_omits_candidate_key_pushdown_when_row_locators_exist`
 
 New query features should add a similar assertion or a benchmark note before
 being considered complete.

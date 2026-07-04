@@ -98,6 +98,19 @@ fn parses_structured_filters() {
 }
 
 #[test]
+fn parses_structured_tree_filters() {
+    assert!(
+        parse_tree_filter(Some(&json!({
+            "field": "run_type",
+            "operator": "eq",
+            "value": "tool"
+        })))
+        .expect("parse structured tree filter")
+        .is_some()
+    );
+}
+
+#[test]
 fn structured_filters_reject_payload_fields() {
     let error = parse_filter(
         Some(&json!({"field": "inputs", "operator": "eq", "value": "secret"})),

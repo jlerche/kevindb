@@ -24,6 +24,9 @@ pub use feedback::FeedbackResponse;
 pub(crate) use feedback::{create_feedback, list_feedback, list_run_feedback, read_feedback};
 use filter::{parse_filter, parse_tree_filter};
 
+const MAX_RUN_QUERY_CANDIDATE_SEGMENTS: usize = 128;
+const ESTIMATED_OBJECT_STORE_REQUESTS_PER_VORTEX_FILE: usize = 48;
+
 impl ServerState {
     async fn list_project_names(
         &self,
@@ -236,13 +239,15 @@ pub(super) async fn query_runs(
         include_deleted: false,
         filter: parse_filter(request.filter.as_ref(), "filter")?,
         trace_filter: parse_filter(request.trace_filter.as_ref(), "trace_filter")?,
-        tree_filter: parse_tree_filter(request.tree_filter.as_deref())?,
+        tree_filter: parse_tree_filter(request.tree_filter.as_ref())?,
         include_payload,
         newest_first: true,
         limits: RunQueryLimits {
-            max_candidate_segments: Some(128),
+            max_candidate_segments: Some(MAX_RUN_QUERY_CANDIDATE_SEGMENTS),
             max_candidate_runs: Some(max_candidate_runs),
-            max_estimated_object_store_requests: Some(128),
+            max_estimated_object_store_requests: Some(
+                MAX_RUN_QUERY_CANDIDATE_SEGMENTS * ESTIMATED_OBJECT_STORE_REQUESTS_PER_VORTEX_FILE,
+            ),
             max_candidate_bytes: Some(128 * 1024 * 1024),
             max_wall_time: Some(Duration::from_secs(30)),
         },
@@ -624,7 +629,7 @@ pub struct RunsQueryRequest {
     #[serde(default)]
     pub trace_filter: Option<Value>,
     #[serde(default)]
-    pub tree_filter: Option<String>,
+    pub tree_filter: Option<Value>,
     #[serde(default)]
     pub select: Option<StringList>,
     #[serde(default)]

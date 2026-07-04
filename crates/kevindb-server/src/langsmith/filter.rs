@@ -26,12 +26,22 @@ pub(super) fn parse_filter(
         .map_err(|error| ApiError::bad_request(format!("{field}: {error}")))
 }
 
-pub(super) fn parse_tree_filter(value: Option<&str>) -> Result<Option<TreeFilterExpr>, ApiError> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+pub(super) fn parse_tree_filter(value: Option<&Value>) -> Result<Option<TreeFilterExpr>, ApiError> {
+    let Some(value) = value else {
         return Ok(None);
     };
+    if value.is_null() {
+        return Ok(None);
+    }
 
-    TreeFilterExpr::parse(value)
+    let text = structured_filter_to_text(value)
+        .map_err(|error| ApiError::bad_request(format!("tree_filter: {error}")))?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+
+    TreeFilterExpr::parse(text)
         .map(Some)
         .map_err(|error| ApiError::bad_request(format!("tree_filter: {error}")))
 }

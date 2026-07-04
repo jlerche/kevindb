@@ -287,9 +287,12 @@ async fn run_root_tree_predicate(
     dataset: &SyntheticDataset,
     store: &CountingObjectStore,
 ) -> Result<WorkloadResult> {
+    let selected_trace_index = dataset.config.trace_count / 2;
     let mut query = RunQuery::new(dataset.config.project_name.clone());
     query.is_root = Some(true);
-    query.tree_filter = Some(TreeFilterExpr::parse(r#"eq(run_type, "tool")"#)?);
+    query.tree_filter = Some(TreeFilterExpr::parse(&format!(
+        r#"and(eq(run_type, "tool"), eq(metadata_key, "synthetic_trace_index"), eq(metadata_value, "{selected_trace_index}"))"#
+    ))?);
     query.limit = Some(100);
     query.include_payload = false;
     run_query_workload("root-tree-predicate", query_engine, dataset, store, query).await
@@ -300,9 +303,12 @@ async fn run_child_tree_predicate(
     dataset: &SyntheticDataset,
     store: &CountingObjectStore,
 ) -> Result<WorkloadResult> {
+    let selected_trace_index = dataset.config.trace_count / 2;
     let mut query = RunQuery::new(dataset.config.project_name.clone());
     query.run_type = Some("llm".to_owned());
-    query.tree_filter = Some(TreeFilterExpr::parse(r#"child(eq(run_type, "tool"))"#)?);
+    query.tree_filter = Some(TreeFilterExpr::parse(&format!(
+        r#"child(and(eq(run_type, "tool"), eq(metadata_key, "synthetic_trace_index"), eq(metadata_value, "{selected_trace_index}")))"#
+    ))?);
     query.limit = Some(100);
     query.include_payload = false;
     run_query_workload("child-tree-predicate", query_engine, dataset, store, query).await

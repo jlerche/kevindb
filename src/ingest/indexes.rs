@@ -161,8 +161,7 @@ pub(super) async fn replace_run_scalar_indexes(
         .await
         .context("insert run metadata")?;
     }
-
-    refresh_project_filter_stats(tx, &record.project_name).await
+    Ok(())
 }
 
 pub(super) async fn refresh_project_filter_stats(

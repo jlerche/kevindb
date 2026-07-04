@@ -1,10 +1,15 @@
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result, anyhow};
 
 use crate::otlp::SpanRecord;
 use crate::query::generated_run_id;
 use crate::segment::SPAN_SEGMENT_SCHEMA_VERSION;
 
-use super::indexes::{ScalarIndexes, replace_run_scalar_indexes, root_locator_for_record};
+use super::indexes::{
+    ScalarIndexes, refresh_project_filter_stats, replace_run_scalar_indexes,
+    root_locator_for_record,
+};
 use super::tree::refresh_trace_tree_metadata;
 use super::{PartitionKey, event_time_unix_nano, run_event_idempotency_key, status_from_record};
 
@@ -62,6 +67,8 @@ pub(super) async fn persist_metadata(
         .context("insert trace segment")?;
     let segment_id: i64 = row.get(0);
 
+    let mut updated_projects = BTreeSet::new();
+    let mut updated_traces = BTreeSet::new();
     for (row_index, record) in records.iter().enumerate() {
         let event_row = tx
             .query_opt(
@@ -216,7 +223,8 @@ pub(super) async fn persist_metadata(
 
         if run_head_updated {
             replace_run_scalar_indexes(tx, record, &scalar_indexes).await?;
-            refresh_trace_tree_metadata(tx, &record.project_name, &record.trace_id).await?;
+            updated_projects.insert(record.project_name.clone());
+            updated_traces.insert((record.project_name.clone(), record.trace_id.clone()));
         }
 
         tx.execute(
@@ -288,6 +296,13 @@ pub(super) async fn persist_metadata(
         )
         .await
         .context("upsert trace locator")?;
+    }
+
+    for (project_name, trace_id) in updated_traces {
+        refresh_trace_tree_metadata(tx, &project_name, &trace_id).await?;
+    }
+    for project_name in updated_projects {
+        refresh_project_filter_stats(tx, &project_name).await?;
     }
 
     Ok(true)

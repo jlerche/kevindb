@@ -342,8 +342,37 @@ fn datafusion_sql_pushes_segment_candidate_rows_to_sources() {
         None,
     );
 
-    assert!(sql.contains("span_id = 'root' AND row_index = 7"));
-    assert!(sql.contains("span_id = 'child' AND row_index = 11"));
+    assert!(sql.contains("row_index IN (7, 11)"));
+    assert!(!sql.contains("span_id = 'root' AND row_index = 7"));
+}
+
+#[test]
+fn datafusion_sql_omits_candidate_key_pushdown_when_row_locators_exist() {
+    let query = RunQuery::new("demo");
+    let candidate_run_keys = std::collections::HashSet::from([RunKey {
+        project_name: "demo".to_owned(),
+        trace_id: TRACE_ID.to_owned(),
+        span_id: "root".to_owned(),
+    }]);
+
+    let sql = run_head_datafusion_sql(
+        &[SegmentSource {
+            uri: "projects/demo/trace-segments/a.vortex".to_owned(),
+            total_bytes: 123,
+            candidate_rows: vec![SegmentCandidateRow {
+                project_name: "demo".to_owned(),
+                trace_id: TRACE_ID.to_owned(),
+                span_id: "root".to_owned(),
+                row_index: 7,
+            }],
+        }],
+        &query,
+        false,
+        Some(&candidate_run_keys),
+    );
+
+    assert!(sql.contains("row_index IN (7)"));
+    assert!(!sql.contains("span_id IN ('root')"));
 }
 
 #[test]

@@ -21,6 +21,7 @@ mod planner;
 mod random_access;
 mod rows;
 mod tree;
+mod tree_access;
 mod tree_filter;
 use filter::FilterExpr;
 use object_store_stats::{
@@ -253,25 +254,6 @@ impl QueryEngine {
                 datafusion_execution_time: datafusion_timing.execution_time,
             },
             runs,
-        })
-    }
-
-    pub async fn load_trace_tree(&self, project_name: &str, trace_id: &str) -> Result<TraceTree> {
-        let runs = self.load_trace(project_name, trace_id).await?;
-        Ok(trace_tree_from_runs(project_name, trace_id, runs))
-    }
-
-    pub async fn load_trace_tree_with_diagnostics(
-        &self,
-        project_name: &str,
-        trace_id: &str,
-    ) -> Result<TraceTreeQueryResult> {
-        let result = self
-            .load_trace_with_diagnostics(project_name, trace_id)
-            .await?;
-        Ok(TraceTreeQueryResult {
-            trace_tree: trace_tree_from_runs(project_name, trace_id, result.runs),
-            diagnostics: result.diagnostics,
         })
     }
 
@@ -707,7 +689,12 @@ fn run_head_datafusion_sql(
     include_payload: bool,
     candidate_run_keys: Option<&std::collections::HashSet<RunKey>>,
 ) -> String {
-    let source_where_sql = run_source_pushdown_where_sql(query, candidate_run_keys);
+    let source_candidate_keys = segments
+        .iter()
+        .any(|segment| segment.candidate_rows.is_empty())
+        .then_some(candidate_run_keys)
+        .flatten();
+    let source_where_sql = run_source_pushdown_where_sql(query, source_candidate_keys);
     let source_sql = segments
         .iter()
         .map(|segment| segment_source_sql(segment, include_payload, &source_where_sql))
@@ -911,24 +898,16 @@ fn segment_candidate_rows_where_sql(segment: &SegmentSource) -> Option<String> {
         return None;
     }
 
-    Some(
-        segment
-            .candidate_rows
-            .iter()
-            .map(segment_candidate_row_where_sql)
-            .collect::<Vec<_>>()
-            .join(" OR "),
-    )
-}
-
-fn segment_candidate_row_where_sql(row: &SegmentCandidateRow) -> String {
-    format!(
-        "(project_name = {} AND trace_id = {} AND span_id = {} AND row_index = {})",
-        sql_string_literal(&row.project_name),
-        sql_string_literal(&row.trace_id),
-        sql_string_literal(&row.span_id),
-        row.row_index
-    )
+    let row_indexes = segment
+        .candidate_rows
+        .iter()
+        .map(|row| row.row_index)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|row_index| row_index.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("row_index IN ({row_indexes})"))
 }
 
 pub(crate) fn attributes_json_sql(include_payload: bool) -> &'static str {

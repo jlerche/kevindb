@@ -66,6 +66,17 @@ async fn tree_metadata_repairs_late_parents_and_indexes_nested_sets() {
     assert!(child.subtree_start < grandchild.subtree_start);
     assert!(root.subtree_end > grandchild.subtree_end);
 
+    let trace_tree = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store.clone())
+        .load_trace_tree_with_diagnostics("demo", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .await
+        .expect("load trace tree from metadata");
+    assert_eq!(trace_tree.trace_tree.roots.len(), 2);
+    assert_eq!(trace_tree.trace_tree.roots[0].run.attributes_json, "{}");
+    assert_eq!(trace_tree.diagnostics.candidate_segments, 0);
+    assert_eq!(trace_tree.diagnostics.vortex_files_opened, 0);
+    assert_eq!(trace_tree.diagnostics.actual_object_store_requests, 0);
+    assert_eq!(trace_tree.diagnostics.actual_object_store_bytes_read, 0);
+
     let mut query = RunQuery::new("demo");
     query.filter = Some(FilterExpr::parse(r#"eq(name, "agent.root")"#).expect("parse filter"));
     query.tree_filter =
@@ -98,6 +109,45 @@ async fn tree_metadata_repairs_late_parents_and_indexes_nested_sets() {
             .collect::<Vec<_>>(),
         vec!["1111111111111111"]
     );
+
+    mockgres.stop().await.expect("stop mockgres");
+}
+
+#[tokio::test]
+async fn batched_child_before_parent_refreshes_tree_once_after_heads_are_written() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        Arc::new(InMemory::new()),
+        IngestConfig {
+            max_spans_per_segment: 64,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+
+    let child = tree_record(
+        "2222222222222222",
+        "llm.call",
+        "llm",
+        Some("1111111111111111"),
+        20,
+    );
+    let root = tree_record("1111111111111111", "agent.root", "chain", None, 10);
+    ingestor
+        .ingest_records(vec![child, root])
+        .await
+        .expect("ingest child and parent in one segment");
+
+    let root = load_tree_node(mockgres.postgres_url(), "1111111111111111").await;
+    let child = load_tree_node(mockgres.postgres_url(), "2222222222222222").await;
+    assert_eq!(root.descendant_count, 1);
+    assert_eq!(child.parent_span_id.as_deref(), Some("1111111111111111"));
+    assert_eq!(child.root_span_id, "1111111111111111");
+    assert!(!child.unresolved_parent);
 
     mockgres.stop().await.expect("stop mockgres");
 }
