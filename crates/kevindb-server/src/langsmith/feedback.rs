@@ -130,12 +130,28 @@ impl FeedbackWriteRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ListFeedbackQuery {
     #[serde(default, alias = "run_id")]
     run: Option<StringList>,
+    #[serde(default, alias = "trace_id")]
+    trace: Option<StringList>,
+    #[serde(default, alias = "project", alias = "session", alias = "session_name")]
+    project_name: Option<StringList>,
     #[serde(default, alias = "feedback_key")]
     key: Option<StringList>,
+    #[serde(default, alias = "feedback_score")]
+    score: Option<f64>,
+    #[serde(default, alias = "min_score", alias = "feedback_score_min")]
+    score_min: Option<f64>,
+    #[serde(default, alias = "max_score", alias = "feedback_score_max")]
+    score_max: Option<f64>,
+    #[serde(default, alias = "feedback_value", alias = "value_text")]
+    value: Option<StringList>,
+    #[serde(default, alias = "created_after", alias = "created_at_start")]
+    created_at_min: Option<String>,
+    #[serde(default, alias = "created_before", alias = "created_at_end")]
+    created_at_max: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
@@ -154,10 +170,28 @@ impl ListFeedbackQuery {
                 .map(|run_id| canonical_uuid(&run_id, "run_id"))
                 .collect::<Result<Vec<_>, _>>()?,
         };
+        let trace_ids = self
+            .trace
+            .map(StringList::into_vec)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|trace_id| canonical_uuid(&trace_id, "trace_id"))
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(FeedbackFilter {
             run_ids,
+            trace_ids,
+            project_names: self
+                .project_name
+                .map(StringList::into_vec)
+                .unwrap_or_default(),
             keys: self.key.map(StringList::into_vec).unwrap_or_default(),
+            score: self.score,
+            score_min: self.score_min,
+            score_max: self.score_max,
+            value_texts: self.value.map(StringList::into_vec).unwrap_or_default(),
+            created_time_min_unix_nano: parse_time_nanos(self.created_at_min.as_deref())?,
+            created_time_max_unix_nano: parse_time_nanos(self.created_at_max.as_deref())?,
             limit: self.limit.unwrap_or(100).min(1000),
             offset: self.offset.unwrap_or(0),
         })

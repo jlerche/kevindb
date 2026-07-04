@@ -122,6 +122,9 @@ impl QueryEngine {
         Ok(RunLoadResult {
             diagnostics: RunQueryDiagnostics {
                 candidate_segments: 1,
+                candidate_runs: usize::from(run.is_some()),
+                candidate_bytes: 0,
+                estimated_object_store_requests: 1,
                 vortex_files_opened: 1,
                 rows_returned: usize::from(run.is_some()),
                 postgres_query_time,
@@ -202,6 +205,11 @@ impl QueryEngine {
             offset: None,
             retention_cutoff_unix_nano: None,
             include_deleted: false,
+            filter: None,
+            trace_filter: None,
+            include_payload: projection.include_payload(),
+            newest_first: false,
+            limits: Default::default(),
         };
 
         let postgres_started = Instant::now();
@@ -233,6 +241,9 @@ impl QueryEngine {
         Ok(TraceLoadResult {
             diagnostics: RunQueryDiagnostics {
                 candidate_segments,
+                candidate_runs: runs.len(),
+                candidate_bytes: 0,
+                estimated_object_store_requests: candidate_segments,
                 vortex_files_opened: candidate_segments,
                 rows_returned: runs.len(),
                 postgres_query_time,
@@ -415,6 +426,7 @@ fn run_locator_datafusion_sql(locator: &RunLocator, include_payload: bool) -> St
                 schema_version: locator.schema_version,
             },
             include_payload,
+            "true",
         )
     };
 

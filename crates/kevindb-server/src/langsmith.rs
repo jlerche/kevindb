@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::Json;
@@ -7,7 +8,10 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use chrono::{DateTime, SecondsFormat, Utc};
 use kevindb::otlp::{RunEventKind, SpanRecord};
-use kevindb::query::{RunQuery, RunSummary, generated_run_id};
+use kevindb::query::filter::FilterExpr;
+use kevindb::query::{
+    RunProjection, RunQuery, RunQueryDiagnostics, RunQueryLimits, RunSummary, generated_run_id,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_postgres::NoTls;
@@ -153,10 +157,27 @@ pub(super) async fn query_runs(
     }
 
     let project_names = dedupe(project_names);
-    if project_names.is_empty() {
+    let direct_run_ids = request
+        .run_ids
+        .clone()
+        .map(StringList::into_vec)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|run_id| canonical_uuid(&run_id, "run_id"))
+        .collect::<Result<Vec<_>, _>>()?;
+    if project_names.is_empty() && direct_run_ids.is_empty() {
         return Err(ApiError::bad_request(
-            "project_name or session is required".to_owned(),
+            "project_name, session, or run_ids is required".to_owned(),
         ));
+    }
+    if let Some(tree_filter) = request
+        .tree_filter
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Err(ApiError::bad_request(format!(
+            "tree_filter is not supported until Phase 3: {tree_filter}"
+        )));
     }
 
     let parent_run_id = request
@@ -180,28 +201,76 @@ pub(super) async fn query_runs(
     )?;
     let offset = request.cursor_offset().or(request.offset);
     let limit = request.limit;
-    let runs = state
-        .query_engine()
-        .list_runs(RunQuery {
-            project_names,
-            trace_id: normalize_trace_filter(request.trace_id),
-            parent_run_id,
-            parent_span_id: request.parent_span_id,
-            run_type: request.run_type,
-            is_root: request.is_root,
-            error: request.error,
-            start_time_min_unix_nano,
-            start_time_max_unix_nano,
-            limit: limit.map(|limit| limit.saturating_add(1)),
-            offset,
-            retention_cutoff_unix_nano: None,
-            include_deleted: false,
-        })
-        .await
-        .context("query runs")?;
+    let include_payload = request.include_payload();
+    if !direct_run_ids.is_empty() {
+        let projection = if include_payload {
+            RunProjection::FullPayload
+        } else {
+            RunProjection::Summary
+        };
+        let mut runs = Vec::new();
+        for run_id in direct_run_ids {
+            if let Some(run) = state
+                .query_engine()
+                .load_run_by_id_with_projection(&run_id, projection)
+                .await
+                .context("load requested run")?
+                .run
+            {
+                runs.push(run);
+            }
+        }
+        return Ok(Json(RunsResponse::from_runs_with_limit_and_diagnostics(
+            runs, limit, offset, None,
+        )));
+    }
 
-    Ok(Json(RunsResponse::from_runs_with_limit(
-        runs, limit, offset,
+    let run_query = RunQuery {
+        project_names,
+        trace_id: normalize_trace_filter(request.trace_id),
+        parent_run_id,
+        parent_span_id: request.parent_span_id,
+        run_type: request.run_type,
+        is_root: request.is_root,
+        error: request.error,
+        start_time_min_unix_nano,
+        start_time_max_unix_nano,
+        limit: limit.map(|limit| limit.saturating_add(1)),
+        offset,
+        retention_cutoff_unix_nano: None,
+        include_deleted: false,
+        filter: parse_filter(request.filter.as_deref(), "filter")?,
+        trace_filter: parse_filter(request.trace_filter.as_deref(), "trace_filter")?,
+        include_payload,
+        newest_first: true,
+        limits: RunQueryLimits {
+            max_candidate_segments: Some(128),
+            max_estimated_object_store_requests: Some(128),
+            max_candidate_bytes: Some(128 * 1024 * 1024),
+            max_wall_time: Some(Duration::from_secs(30)),
+        },
+    };
+    let (runs, diagnostics) = if request.debug.unwrap_or(false) {
+        let result = state
+            .query_engine()
+            .list_runs_with_diagnostics(run_query)
+            .await
+            .map_err(query_error)?;
+        (result.runs, Some(result.diagnostics))
+    } else {
+        let runs = state
+            .query_engine()
+            .list_runs(run_query)
+            .await
+            .map_err(query_error)?;
+        (runs, None)
+    };
+
+    Ok(Json(RunsResponse::from_runs_with_limit_and_diagnostics(
+        runs,
+        limit,
+        offset,
+        diagnostics,
     )))
 }
 
@@ -517,6 +586,8 @@ impl ProjectResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RunsQueryRequest {
+    #[serde(default, alias = "id", alias = "run_id")]
+    pub run_ids: Option<StringList>,
     #[serde(default, alias = "project_names", alias = "session_name")]
     pub project_name: Option<StringList>,
     #[serde(default)]
@@ -551,6 +622,16 @@ pub struct RunsQueryRequest {
     pub offset: Option<usize>,
     #[serde(default)]
     pub cursor: Option<String>,
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(default)]
+    pub trace_filter: Option<String>,
+    #[serde(default)]
+    pub tree_filter: Option<String>,
+    #[serde(default)]
+    pub select: Option<StringList>,
+    #[serde(default)]
+    pub debug: Option<bool>,
 }
 
 impl RunsQueryRequest {
@@ -559,6 +640,18 @@ impl RunsQueryRequest {
             .as_deref()
             .filter(|cursor| !cursor.trim().is_empty())
             .and_then(|cursor| cursor.parse().ok())
+    }
+
+    fn include_payload(&self) -> bool {
+        let Some(select) = self.select.clone() else {
+            return true;
+        };
+        select.into_vec().into_iter().any(|field| {
+            matches!(
+                field.as_str(),
+                "inputs" | "outputs" | "extra" | "attributes_json"
+            )
+        })
     }
 }
 
@@ -583,6 +676,8 @@ pub struct RunsResponse {
     pub runs: Vec<RunResponse>,
     #[serde(default)]
     pub cursors: CursorResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<RunQueryDiagnosticsResponse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -621,13 +716,15 @@ impl RunsResponse {
         Self {
             runs: runs_with_children(runs),
             cursors: CursorResponse { next: None },
+            diagnostics: None,
         }
     }
 
-    fn from_runs_with_limit(
+    fn from_runs_with_limit_and_diagnostics(
         runs: Vec<RunSummary>,
         limit: Option<usize>,
         offset: Option<usize>,
+        diagnostics: Option<RunQueryDiagnostics>,
     ) -> Self {
         let mut runs = runs.into_iter().map(RunResponse::from).collect::<Vec<_>>();
         let next = limit.and_then(|limit| {
@@ -642,6 +739,36 @@ impl RunsResponse {
         Self {
             runs: runs_with_children(runs),
             cursors: CursorResponse { next },
+            diagnostics: diagnostics.map(RunQueryDiagnosticsResponse::from),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunQueryDiagnosticsResponse {
+    pub candidate_segments: usize,
+    pub candidate_runs: usize,
+    pub candidate_bytes: i64,
+    pub estimated_object_store_requests: usize,
+    pub vortex_files_opened: usize,
+    pub rows_returned: usize,
+    pub postgres_query_time_nanos: u64,
+    pub datafusion_planning_time_nanos: u64,
+    pub datafusion_execution_time_nanos: u64,
+}
+
+impl From<RunQueryDiagnostics> for RunQueryDiagnosticsResponse {
+    fn from(diagnostics: RunQueryDiagnostics) -> Self {
+        Self {
+            candidate_segments: diagnostics.candidate_segments,
+            candidate_runs: diagnostics.candidate_runs,
+            candidate_bytes: diagnostics.candidate_bytes,
+            estimated_object_store_requests: diagnostics.estimated_object_store_requests,
+            vortex_files_opened: diagnostics.vortex_files_opened,
+            rows_returned: diagnostics.rows_returned,
+            postgres_query_time_nanos: duration_nanos(diagnostics.postgres_query_time),
+            datafusion_planning_time_nanos: duration_nanos(diagnostics.datafusion_planning_time),
+            datafusion_execution_time_nanos: duration_nanos(diagnostics.datafusion_execution_time),
         }
     }
 }
@@ -732,6 +859,27 @@ fn runs_with_children(mut runs: Vec<RunResponse>) -> Vec<RunResponse> {
     }
 
     runs
+}
+
+fn parse_filter(value: Option<&str>, field: &str) -> Result<Option<FilterExpr>, ApiError> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .map(FilterExpr::parse)
+        .transpose()
+        .map_err(|error| ApiError::bad_request(format!("{field}: {error}")))
+}
+
+fn query_error(error: anyhow::Error) -> ApiError {
+    let message = error.to_string();
+    if message.contains("query rejected") || message.contains("unsupported filter") {
+        ApiError::bad_request(message)
+    } else {
+        ApiError::from(error)
+    }
+}
+
+fn duration_nanos(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 fn tenant_uuid() -> Uuid {

@@ -51,6 +51,11 @@ async fn datafusion_scans_vortex_segments() {
             offset: None,
             retention_cutoff_unix_nano: None,
             include_deleted: false,
+            filter: None,
+            trace_filter: None,
+            include_payload: true,
+            newest_first: false,
+            limits: Default::default(),
         },
     )
     .await
@@ -104,6 +109,11 @@ async fn datafusion_applies_run_query_filters() {
             offset: None,
             retention_cutoff_unix_nano: None,
             include_deleted: false,
+            filter: None,
+            trace_filter: None,
+            include_payload: true,
+            newest_first: false,
+            limits: Default::default(),
         },
     )
     .await
@@ -146,6 +156,11 @@ async fn datafusion_filters_latest_run_versions() {
             offset: None,
             retention_cutoff_unix_nano: None,
             include_deleted: false,
+            filter: None,
+            trace_filter: None,
+            include_payload: true,
+            newest_first: false,
+            limits: Default::default(),
         },
     )
     .await
@@ -169,6 +184,11 @@ async fn datafusion_filters_latest_run_versions() {
             offset: None,
             retention_cutoff_unix_nano: None,
             include_deleted: false,
+            filter: None,
+            trace_filter: None,
+            include_payload: true,
+            newest_first: false,
+            limits: Default::default(),
         },
     )
     .await
@@ -221,9 +241,43 @@ fn escapes_sql_string_literals() {
             offset: None,
             retention_cutoff_unix_nano: None,
             include_deleted: false,
+            filter: None,
+            trace_filter: None,
+            include_payload: true,
+            newest_first: false,
+            limits: Default::default(),
         }),
         "project_name IN ('demo') AND trace_id = 'trace' AND parent_run_id = 'parent-run' AND parent_span_id = 'parent-span' AND run_type = 'llm' AND is_root = false AND status <> 'error' AND start_time_unix_nano >= 10 AND start_time_unix_nano <= 20"
     );
+}
+
+#[test]
+fn datafusion_sql_pushes_projection_and_source_predicates() {
+    let mut query = RunQuery::new("demo");
+    query.project_names.push("other's".to_owned());
+    query.trace_id = Some(TRACE_ID.to_owned());
+    query.run_type = Some("llm".to_owned());
+    query.start_time_min_unix_nano = Some(10);
+    query.start_time_max_unix_nano = Some(20);
+
+    let source_where = run_source_pushdown_where_sql(&query);
+    assert_eq!(
+        source_where,
+        "project_name IN ('demo', 'other''s') AND trace_id = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' AND run_type = 'llm' AND start_time_unix_nano >= 10 AND start_time_unix_nano <= 20"
+    );
+
+    let sql = run_head_datafusion_sql(
+        &[
+            current_segment_source("projects/demo/trace-segments/a.vortex".to_owned()),
+            current_segment_source("projects/demo/trace-segments/b.vortex".to_owned()),
+        ],
+        &query,
+        false,
+    );
+
+    assert_eq!(sql.matches(&format!("WHERE {source_where}")).count(), 2);
+    assert!(sql.contains("'{}' AS attributes_json"));
+    assert!(sql.contains("WHERE run_version = 1 AND project_name IN ('demo', 'other''s')"));
 }
 
 fn run(

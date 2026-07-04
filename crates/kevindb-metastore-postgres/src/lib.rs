@@ -19,10 +19,18 @@ pub struct FeedbackRecord {
     pub modified_at_unix_nano: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FeedbackFilter {
     pub run_ids: Vec<String>,
+    pub trace_ids: Vec<String>,
+    pub project_names: Vec<String>,
     pub keys: Vec<String>,
+    pub score: Option<f64>,
+    pub score_min: Option<f64>,
+    pub score_max: Option<f64>,
+    pub value_texts: Vec<String>,
+    pub created_time_min_unix_nano: Option<i64>,
+    pub created_time_max_unix_nano: Option<i64>,
     pub limit: usize,
     pub offset: usize,
 }
@@ -31,7 +39,15 @@ impl Default for FeedbackFilter {
     fn default() -> Self {
         Self {
             run_ids: Vec::new(),
+            trace_ids: Vec::new(),
+            project_names: Vec::new(),
             keys: Vec::new(),
+            score: None,
+            score_min: None,
+            score_max: None,
+            value_texts: Vec::new(),
+            created_time_min_unix_nano: None,
+            created_time_max_unix_nano: None,
             limit: 100,
             offset: 0,
         }
@@ -61,7 +77,9 @@ impl PostgresMetastore {
         });
 
         let score_json = json_option_to_string(&feedback.score);
+        let score_number = json_option_to_f64(&feedback.score);
         let value_json = json_option_to_string(&feedback.value);
+        let value_text = json_option_to_scalar_text(&feedback.value);
         let correction_json = json_option_to_string(&feedback.correction);
         let feedback_source_json = json_option_to_string(&feedback.feedback_source);
         let extra_json = json_option_to_string(&feedback.extra);
@@ -69,10 +87,11 @@ impl PostgresMetastore {
             .execute(
                 "INSERT INTO feedback(
                     id, run_id, trace_id, project_name, key, score_json, value_json,
+                    score_number, value_text,
                     correction_json, comment, feedback_source_json, extra_json,
                     created_at_unix_nano, modified_at_unix_nano
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 ON CONFLICT (id) DO UPDATE SET
                     run_id = EXCLUDED.run_id,
                     trace_id = EXCLUDED.trace_id,
@@ -80,6 +99,8 @@ impl PostgresMetastore {
                     key = EXCLUDED.key,
                     score_json = EXCLUDED.score_json,
                     value_json = EXCLUDED.value_json,
+                    score_number = EXCLUDED.score_number,
+                    value_text = EXCLUDED.value_text,
                     correction_json = EXCLUDED.correction_json,
                     comment = EXCLUDED.comment,
                     feedback_source_json = EXCLUDED.feedback_source_json,
@@ -93,6 +114,8 @@ impl PostgresMetastore {
                     &feedback.key,
                     &score_json,
                     &value_json,
+                    &score_number,
+                    &value_text,
                     &correction_json,
                     &feedback.comment,
                     &feedback_source_json,
@@ -156,8 +179,45 @@ fn list_feedback_sql(filter: &FeedbackFilter) -> String {
     if !filter.run_ids.is_empty() {
         predicates.push(format!("run_id IN ({})", sql_string_list(&filter.run_ids)));
     }
+    if !filter.trace_ids.is_empty() {
+        predicates.push(format!(
+            "trace_id IN ({})",
+            sql_string_list(&filter.trace_ids)
+        ));
+    }
+    if !filter.project_names.is_empty() {
+        predicates.push(format!(
+            "project_name IN ({})",
+            sql_string_list(&filter.project_names)
+        ));
+    }
     if !filter.keys.is_empty() {
         predicates.push(format!("key IN ({})", sql_string_list(&filter.keys)));
+    }
+    if let Some(score) = filter.score {
+        predicates.push(format!("score_number = {score}"));
+    }
+    if let Some(score_min) = filter.score_min {
+        predicates.push(format!("score_number >= {score_min}"));
+    }
+    if let Some(score_max) = filter.score_max {
+        predicates.push(format!("score_number <= {score_max}"));
+    }
+    if !filter.value_texts.is_empty() {
+        predicates.push(format!(
+            "value_text IN ({})",
+            sql_string_list(&filter.value_texts)
+        ));
+    }
+    if let Some(created_time_min_unix_nano) = filter.created_time_min_unix_nano {
+        predicates.push(format!(
+            "created_at_unix_nano >= {created_time_min_unix_nano}"
+        ));
+    }
+    if let Some(created_time_max_unix_nano) = filter.created_time_max_unix_nano {
+        predicates.push(format!(
+            "created_at_unix_nano <= {created_time_max_unix_nano}"
+        ));
     }
 
     let where_sql = if predicates.is_empty() {
@@ -198,6 +258,23 @@ fn feedback_from_row(row: Row) -> Result<FeedbackRecord> {
 
 fn json_option_to_string(value: &Option<Value>) -> Option<String> {
     value.as_ref().map(Value::to_string)
+}
+
+fn json_option_to_f64(value: &Option<Value>) -> Option<f64> {
+    match value.as_ref()? {
+        Value::Number(number) => number.as_f64(),
+        Value::String(value) => value.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn json_option_to_scalar_text(value: &Option<Value>) -> Option<String> {
+    match value.as_ref()? {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn json_string_to_option(value: Option<String>) -> Result<Option<Value>> {
@@ -260,12 +337,33 @@ mod tests {
                 keys: vec!["quality".to_owned()],
                 limit: 1,
                 offset: 1,
+                ..FeedbackFilter::default()
             })
             .await
             .expect("list filtered feedback");
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].id, "three");
         assert_eq!(page[0].score, Some(json!(3)));
+
+        let scalar_filtered = metastore
+            .list_feedback(FeedbackFilter {
+                trace_ids: vec!["trace-a".to_owned()],
+                project_names: vec!["demo".to_owned()],
+                keys: vec!["quality".to_owned()],
+                score_min: Some(2.0),
+                score_max: Some(3.0),
+                value_texts: vec!["quality".to_owned()],
+                ..FeedbackFilter::default()
+            })
+            .await
+            .expect("list scalar filtered feedback");
+        assert_eq!(
+            scalar_filtered
+                .iter()
+                .map(|feedback| feedback.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["three"]
+        );
 
         let loaded = metastore
             .load_feedback("one")
@@ -282,13 +380,22 @@ mod tests {
     fn list_feedback_sql_escapes_filter_values() {
         let sql = list_feedback_sql(&FeedbackFilter {
             run_ids: vec!["run-a".to_owned()],
+            trace_ids: vec!["trace-a".to_owned()],
+            project_names: vec!["demo".to_owned()],
             keys: vec!["quality's".to_owned()],
+            score_min: Some(0.5),
+            value_texts: vec!["good".to_owned()],
             limit: 2000,
             offset: 3,
+            ..FeedbackFilter::default()
         });
 
         assert!(sql.contains("run_id IN ('run-a')"));
+        assert!(sql.contains("trace_id IN ('trace-a')"));
+        assert!(sql.contains("project_name IN ('demo')"));
         assert!(sql.contains("key IN ('quality''s')"));
+        assert!(sql.contains("score_number >= 0.5"));
+        assert!(sql.contains("value_text IN ('good')"));
         assert!(sql.contains("LIMIT 1000 OFFSET 3"));
     }
 
@@ -300,7 +407,7 @@ mod tests {
             project_name: Some("demo".to_owned()),
             key: key.to_owned(),
             score: Some(json!(created_at_unix_nano)),
-            value: Some(json!({"label": key})),
+            value: Some(json!(key)),
             correction: None,
             comment: Some("comment".to_owned()),
             feedback_source: None,

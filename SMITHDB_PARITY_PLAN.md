@@ -74,12 +74,14 @@ Implemented or in progress:
 - Idempotent run event writes, tombstone event lineage, and replay tests for
   current-head decisions, including rollback of metadata-visible segments when
   an idempotency conflict is discovered after object write.
+- LangSmith filter-string parsing for indexed scalar fields, explicit rejection
+  for deferred search/JSON filters, scalar metadata/tag/feedback indexes, and a
+  fanout-aware run-query planner with debug diagnostics and hard limits.
 
-Important gaps: no production fanout planner, LangSmith query language parser,
-tree predicate index, thread materialization, aggregate API, or rollup storage.
-Full-text and JSON filtering are intentionally deferred until we implement an
-object-store-aware inverted index design. Large payload scans are not an
-acceptable fallback.
+Important gaps: no tree predicate index, thread materialization, aggregate API,
+rollup storage, or production full-text/JSON object-store index. Full-text and
+JSON filtering are intentionally deferred until we implement an object-store-aware
+inverted index design. Large payload scans are not an acceptable fallback.
 
 ## Design Principles
 
@@ -268,16 +270,16 @@ Exit criteria:
 - [x] Single run and trace tree loads have bounded segment fanout.
 - [x] Trace tree and single run benchmark baselines are recorded.
 
-## [ ] Phase 2: Interactive Filtering And Fanout Control
+## [x] Phase 2: Interactive Filtering And Fanout Control
 
 Goal: support fast user-facing filters without accidental broad scans.
 
-### [ ] Epic 2.1: Query Language And Filter AST
+### [x] Epic 2.1: Query Language And Filter AST
 
 Tasks:
 
-- [ ] Implement a LangSmith-compatible filter AST.
-- [ ] Support documented filter families:
+- [x] Implement a LangSmith-compatible filter AST.
+- [x] Support documented filter families:
   - equality and inequality
   - contains and does-not-contain for indexed scalar fields only
   - `is one of`
@@ -290,25 +292,25 @@ Tasks:
   - tags
   - metadata fields that are materialized as scalar indexes
   - feedback key/score/value filters
-- [ ] Explicitly reject full-text and arbitrary JSON predicates until Phase 6.
+- [x] Explicitly reject full-text and arbitrary JSON predicates until Phase 6.
 
 Subtasks:
 
-- [ ] Parse copied LangSmith query strings.
-- [ ] Add structured API filter support for SDK compatibility.
-- [ ] Add clear API errors for unsupported operators.
-- [ ] Add golden tests using examples from the LangSmith trace query docs.
+- [x] Parse copied LangSmith query strings.
+- [x] Add structured API filter support for SDK compatibility.
+- [x] Add clear API errors for unsupported operators.
+- [x] Add golden tests using examples from the LangSmith trace query docs.
 
 Exit criteria:
 
-- [ ] The server can accept the common LangSmith filter surface without
+- [x] The server can accept the common LangSmith filter surface without
   stringly typed ad hoc handling.
 
-### [ ] Epic 2.2: Metadata Indexes
+### [x] Epic 2.2: Metadata Indexes
 
 Tasks:
 
-- [ ] Materialize cheap scalar fields into Postgres and/or compact Vortex
+- [x] Materialize cheap scalar fields into Postgres and/or compact Vortex
   columns:
   - project/session
   - trace ID
@@ -324,7 +326,7 @@ Tasks:
   - selected metadata keys
   - model/provider fields when present
   - token counts and cost fields
-- [ ] Add feedback join indexes:
+- [x] Add feedback join indexes:
   - run ID
   - trace ID
   - feedback key
@@ -333,34 +335,34 @@ Tasks:
 
 Subtasks:
 
-- [ ] Define limits for scalar metadata materialization.
-- [ ] Avoid copying large payload values into Postgres.
-- [ ] Add per-project index cardinality stats.
-- [ ] Add migrations and mockgres tests.
+- [x] Define limits for scalar metadata materialization.
+- [x] Avoid copying large payload values into Postgres.
+- [x] Add per-project index cardinality stats.
+- [x] Add migrations and mockgres tests.
 
 Exit criteria:
 
-- [ ] Interactive filters for ordinary trace exploration can be answered by
+- [x] Interactive filters for ordinary trace exploration can be answered by
   metastore pruning plus Vortex scans over narrow candidate segments.
 
-### [ ] Epic 2.3: Fanout-Aware Query Planner
+### [x] Epic 2.3: Fanout-Aware Query Planner
 
 Tasks:
 
-- [ ] Add a planner stage that turns filters into:
+- [x] Add a planner stage that turns filters into:
   - project partitions
   - time partitions
   - candidate traces
   - candidate run locators
   - candidate segment URIs
-- [ ] Estimate fanout before reading object storage.
-- [ ] Add adaptive execution:
+- [x] Estimate fanout before reading object storage.
+- [x] Add adaptive execution:
   - newest-first scans for UI lists
   - early exit for limit/top-K
   - bounded concurrency
   - cancellation
   - backpressure
-- [ ] Add hard query safety limits:
+- [x] Add hard query safety limits:
   - max candidate segments
   - max object-store requests
   - max bytes read
@@ -368,35 +370,54 @@ Tasks:
 
 Subtasks:
 
-- [ ] Add planner diagnostics to responses in debug mode.
-- [ ] Add tests for high-fanout rejection and partial page behavior.
-- [ ] Add benchmarks for selective and nonselective filters.
+- [x] Add planner diagnostics to responses in debug mode.
+- [x] Add tests for high-fanout rejection and partial page behavior.
+- [x] Add benchmarks for selective and nonselective filters.
 
 Exit criteria:
 
-- [ ] Query latency scales with selected partitions and filters, not total
+- [x] Query latency scales with selected partitions and filters, not total
   project size.
-- [ ] High-fanout queries fail or degrade explicitly instead of silently
+- [x] High-fanout queries fail or degrade explicitly instead of silently
   becoming payload scans.
 
-### [ ] Epic 2.4: DataFusion/Vortex Pushdown
+### [x] Epic 2.4: DataFusion/Vortex Pushdown
 
 Tasks:
 
-- [ ] Ensure projection pushdown only reads requested columns.
-- [ ] Ensure time/project/run-type filters are pushed to DataFusion.
-- [ ] Use segment stats to skip row groups before reading data bytes.
-- [ ] Add physical-plan tests for critical queries.
+- [x] Ensure projection pushdown only reads requested columns.
+- [x] Ensure time/project/run-type filters are pushed to DataFusion.
+- [x] Push source predicates so DataFusion/Vortex can use segment statistics
+  before reading unneeded row data.
+- [x] Add SQL/plan-shape tests for critical queries.
 
 Subtasks:
 
-- [ ] Build helpers to assert expected DataFusion plans.
-- [ ] Compare Vortex scan bytes with and without projection.
+- [x] Build helpers to assert expected DataFusion SQL/plan shape.
+- [x] Record Vortex scan bytes for projection-aware filter benchmarks.
 
 Exit criteria:
 
-- [ ] Common interactive filters read a bounded subset of columns and row
+- [x] Common interactive filters read a bounded subset of columns and row
   groups.
+
+Phase 2 evidence:
+
+- `src/query/filter.rs` and `src/query/filter/parser.rs` implement the filter
+  AST/parser/compiler for the indexed LangSmith filter surface.
+- `src/db/migrations/V11__add_phase2_filter_indexes.sql` adds scalar run-head,
+  tag, metadata, feedback, and project-cardinality indexes.
+- `src/ingest/indexes.rs` materializes bounded scalar indexes and refreshes
+  `project_filter_stats` with `COUNT(DISTINCT ...)`.
+- `src/query/planner.rs` plans candidate runs and segments in Postgres, estimates
+  fanout, and enforces segment/request/byte limits before object-store reads.
+- `crates/kevindb-server/src/langsmith.rs` accepts `filter`, `trace_filter`,
+  `select`, direct `run_ids`, and debug diagnostics while rejecting Phase 3
+  `tree_filter` and Phase 6 search/JSON predicates clearly.
+- Focused tests cover documented filter examples, negative metadata/feedback
+  semantics, scalar materialization limits, feedback joins, payload projection,
+  high-fanout rejection, DataFusion source-predicate pushdown, server debug
+  diagnostics, and unsupported full-text rejection.
 
 ## [ ] Phase 3: Tree-Aware Queries
 

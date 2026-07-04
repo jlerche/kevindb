@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use kevindb::ingest::{IngestConfig, Ingestor};
+use kevindb::query::filter::FilterExpr;
 use kevindb::query::{QueryEngine, RunQuery, RunQueryDiagnostics};
 use kevindb_metastore_postgres::{FeedbackFilter, FeedbackRecord, PostgresMetastore};
 use object_store::ObjectStore;
@@ -82,6 +83,9 @@ pub async fn run_core_benchmarks() -> Result<BenchReport> {
     );
     results.push(run_trace_tree_load(&query_engine, &dataset, &counting_store).await?);
     results.push(run_project_run_filtering(&query_engine, &dataset, &counting_store).await?);
+    results.push(run_selective_scalar_filtering(&query_engine, &dataset, &counting_store).await?);
+    results
+        .push(run_nonselective_scalar_filtering(&query_engine, &dataset, &counting_store).await?);
     results.push(run_feedback_filtering(&metastore, &dataset.config).await?);
     results.push(run_root_tree_predicate(&query_engine, &dataset, &counting_store).await?);
     results.push(run_child_tree_predicate(&query_engine, &dataset, &counting_store).await?);
@@ -220,7 +224,59 @@ async fn run_project_run_filtering(
             offset: None,
             retention_cutoff_unix_nano: None,
             include_deleted: false,
+            filter: None,
+            trace_filter: None,
+            include_payload: true,
+            newest_first: false,
+            limits: Default::default(),
         },
+    )
+    .await
+}
+
+async fn run_selective_scalar_filtering(
+    query_engine: &QueryEngine,
+    dataset: &SyntheticDataset,
+    store: &CountingObjectStore,
+) -> Result<WorkloadResult> {
+    let selected_trace_index = dataset.config.trace_count / 2;
+    let filter = FilterExpr::parse(&format!(
+        r#"and(eq(metadata_key, "synthetic_trace_index"), eq(metadata_value, "{selected_trace_index}"))"#
+    ))
+    .context("parse selective scalar filter")?;
+    let mut query = RunQuery::new(dataset.config.project_name.clone());
+    query.filter = Some(filter);
+    query.limit = Some(100);
+    query.include_payload = false;
+    query.newest_first = true;
+
+    run_query_workload(
+        "selective-scalar-filtering",
+        query_engine,
+        dataset,
+        store,
+        query,
+    )
+    .await
+}
+
+async fn run_nonselective_scalar_filtering(
+    query_engine: &QueryEngine,
+    dataset: &SyntheticDataset,
+    store: &CountingObjectStore,
+) -> Result<WorkloadResult> {
+    let mut query = RunQuery::new(dataset.config.project_name.clone());
+    query.filter = Some(FilterExpr::parse(r#"has(tags, "synthetic")"#)?);
+    query.limit = Some(100);
+    query.include_payload = false;
+    query.newest_first = true;
+
+    run_query_workload(
+        "nonselective-scalar-filtering",
+        query_engine,
+        dataset,
+        store,
+        query,
     )
     .await
 }
@@ -249,6 +305,11 @@ async fn run_root_tree_predicate(
             offset: None,
             retention_cutoff_unix_nano: None,
             include_deleted: false,
+            filter: None,
+            trace_filter: None,
+            include_payload: true,
+            newest_first: false,
+            limits: Default::default(),
         },
     )
     .await
@@ -278,6 +339,11 @@ async fn run_child_tree_predicate(
             offset: None,
             retention_cutoff_unix_nano: None,
             include_deleted: false,
+            filter: None,
+            trace_filter: None,
+            include_payload: true,
+            newest_first: false,
+            limits: Default::default(),
         },
     )
     .await
@@ -323,6 +389,7 @@ async fn run_feedback_filtering(
                 keys: vec!["quality".to_owned()],
                 limit: 100,
                 offset: 0,
+                ..FeedbackFilter::default()
             })
             .await?;
         latencies.push(started.elapsed());

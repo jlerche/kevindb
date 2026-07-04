@@ -6,6 +6,8 @@ use chrono::DateTime;
 const MAX_FILTER_DEPTH: usize = 16;
 const MAX_FILTER_NODES: usize = 128;
 
+mod parser;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FilterExpr {
     kind: FilterKind,
@@ -63,6 +65,16 @@ enum FilterField {
     FeedbackValue,
     IsRoot,
     TraceId,
+    ProjectName,
+    RootRunId,
+    RootSpanId,
+    ModelName,
+    ProviderName,
+    PromptTokens,
+    CompletionTokens,
+    TotalTokens,
+    TotalCost,
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,17 +108,7 @@ pub struct CompiledFilter {
 
 impl FilterExpr {
     pub fn parse(input: &str) -> Result<Self, FilterError> {
-        let tokens = lex(input)?;
-        let mut parser = Parser {
-            tokens,
-            offset: 0,
-            nodes: 0,
-        };
-        let expr = parser.parse_expr(0)?;
-        if !parser.is_done() {
-            return Err(FilterError::Parse("trailing tokens".to_owned()));
-        }
-        Ok(expr)
+        parser::parse_filter_expr(input)
     }
 
     pub fn compile_run_head_filter(&self, run_alias: &str) -> Result<CompiledFilter, FilterError> {
@@ -158,13 +160,15 @@ fn compile_and(children: &[FilterExpr], run_alias: &str) -> Result<String, Filte
     let mut predicates = Vec::new();
     let mut metadata_conditions = Vec::new();
     let mut feedback_conditions = Vec::new();
+    let has_metadata_key_anchor = children.iter().any(is_positive_metadata_key_condition);
+    let has_feedback_key_anchor = children.iter().any(is_positive_feedback_key_condition);
 
     for child in children {
-        if let Some(condition) = metadata_row_condition(child)? {
+        if let Some(condition) = metadata_row_condition(child, has_metadata_key_anchor)? {
             metadata_conditions.push(condition);
             continue;
         }
-        if let Some(condition) = feedback_row_condition(child)? {
+        if let Some(condition) = feedback_row_condition(child, has_feedback_key_anchor)? {
             feedback_conditions.push(condition);
             continue;
         }
@@ -198,7 +202,7 @@ fn compile_compare(
             let tag = value.as_string("tags")?;
             match op {
                 CompareOp::Eq => Ok(tag_exists_sql(run_alias, &tag)),
-                CompareOp::Neq => Ok(format!("NOT {}", tag_exists_sql(run_alias, &tag))),
+                CompareOp::Neq => Ok(format!("NOT ({})", tag_exists_sql(run_alias, &tag))),
                 _ => Err(FilterError::Unsupported(
                     "tags only support eq, neq, has, and in".to_owned(),
                 )),
@@ -206,16 +210,25 @@ fn compile_compare(
         }
         FilterField::Id => {
             let id = value.as_string("id")?;
-            Ok(compare_sql(
-                op,
-                &format!(
-                    "(NULLIF({run_alias}.run_id, '') = {id} OR {run_alias}.generated_run_id = {id})",
-                    id = sql_string_literal(&id)
-                ),
-                "true",
-            ))
+            let predicate = format!(
+                "(NULLIF({run_alias}.run_id, '') = {id} OR {run_alias}.generated_run_id = {id})",
+                id = sql_string_literal(&id)
+            );
+            match op {
+                CompareOp::Eq => Ok(predicate),
+                CompareOp::Neq => Ok(format!("NOT ({predicate})")),
+                _ => Err(FilterError::Unsupported(
+                    "id only supports eq, neq, and in".to_owned(),
+                )),
+            }
         }
         FilterField::Name => compile_text_column(op, &format!("{run_alias}.name"), value, "name"),
+        FilterField::ProjectName => compile_text_column(
+            op,
+            &format!("{run_alias}.project_name"),
+            value,
+            "project_name",
+        ),
         FilterField::RunType => {
             compile_text_column(op, &format!("{run_alias}.run_type"), value, "run_type")
         }
@@ -225,6 +238,27 @@ fn compile_compare(
         FilterField::TraceId => {
             compile_text_column(op, &format!("{run_alias}.trace_id"), value, "trace_id")
         }
+        FilterField::RootRunId => compile_text_column(
+            op,
+            &format!("{run_alias}.root_run_id"),
+            value,
+            "root_run_id",
+        ),
+        FilterField::RootSpanId => compile_text_column(
+            op,
+            &format!("{run_alias}.root_span_id"),
+            value,
+            "root_span_id",
+        ),
+        FilterField::ModelName => {
+            compile_text_column(op, &format!("{run_alias}.model_name"), value, "model_name")
+        }
+        FilterField::ProviderName => compile_text_column(
+            op,
+            &format!("{run_alias}.provider_name"),
+            value,
+            "provider_name",
+        ),
         FilterField::StartTime => compile_i64_column(
             op,
             &format!("{run_alias}.start_time_unix_nano"),
@@ -240,9 +274,34 @@ fn compile_compare(
         FilterField::Latency => {
             compile_i64_column(op, &format!("{run_alias}.latency_nanos"), value, "latency")
         }
+        FilterField::PromptTokens => compile_i64_column(
+            op,
+            &format!("{run_alias}.prompt_tokens"),
+            value,
+            "prompt_tokens",
+        ),
+        FilterField::CompletionTokens => compile_i64_column(
+            op,
+            &format!("{run_alias}.completion_tokens"),
+            value,
+            "completion_tokens",
+        ),
+        FilterField::TotalTokens => compile_i64_column(
+            op,
+            &format!("{run_alias}.total_tokens"),
+            value,
+            "total_tokens",
+        ),
+        FilterField::TotalCost => {
+            compile_f64_column(op, &format!("{run_alias}.total_cost"), value, "total_cost")
+        }
         FilterField::IsRoot => {
             let boolean = value.as_bool("is_root")?;
             compile_bool_column(op, &format!("{run_alias}.is_root"), boolean)
+        }
+        FilterField::Error => {
+            let boolean = value.as_bool("error")?;
+            compile_error_column(op, &format!("{run_alias}.status"), boolean)
         }
     }
 }
@@ -284,13 +343,13 @@ fn compile_in(
                 .map(|value| value.as_string("tags"))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(format!(
-                "EXISTS (
-                    SELECT 1 FROM run_tags tag_filter
-                    WHERE tag_filter.project_name = {run_alias}.project_name
-                        AND tag_filter.trace_id = {run_alias}.trace_id
-                        AND tag_filter.span_id = {run_alias}.span_id
-                        AND tag_filter.tag IN ({})
+                "{} IN (
+                    SELECT {}
+                    FROM run_tags tag_filter
+                    WHERE tag_filter.tag IN ({})
                 )",
+                run_key_sql(run_alias),
+                table_run_key_sql("tag_filter"),
                 sql_string_list(&tags)
             ))
         }
@@ -313,12 +372,39 @@ fn compile_in(
                 &[format!("({})", conditions.join(" OR "))],
             ))
         }
-        FilterField::RunType | FilterField::Status | FilterField::Name | FilterField::TraceId => {
+        FilterField::Id => {
+            let values = values
+                .iter()
+                .map(|value| value.as_string("id"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let predicates = values
+                .iter()
+                .map(|id| {
+                    let id = sql_string_literal(id);
+                    format!("(NULLIF({run_alias}.run_id, '') = {id} OR {run_alias}.generated_run_id = {id})")
+                })
+                .collect::<Vec<_>>();
+            Ok(format!("({})", predicates.join(" OR ")))
+        }
+        FilterField::RunType
+        | FilterField::Status
+        | FilterField::Name
+        | FilterField::TraceId
+        | FilterField::ProjectName
+        | FilterField::RootRunId
+        | FilterField::RootSpanId
+        | FilterField::ModelName
+        | FilterField::ProviderName => {
             let column = match field {
                 FilterField::RunType => "run_type",
                 FilterField::Status => "status",
                 FilterField::Name => "name",
                 FilterField::TraceId => "trace_id",
+                FilterField::ProjectName => "project_name",
+                FilterField::RootRunId => "root_run_id",
+                FilterField::RootSpanId => "root_span_id",
+                FilterField::ModelName => "model_name",
+                FilterField::ProviderName => "provider_name",
                 _ => unreachable!(),
             };
             let values = values
@@ -331,7 +417,7 @@ fn compile_in(
             ))
         }
         _ => Err(FilterError::Unsupported(
-            "in() is supported for run_type, status, name, trace_id, tags, and metadata".to_owned(),
+            "in() is supported for indexed scalar text fields, tags, and metadata".to_owned(),
         )),
     }
 }
@@ -344,11 +430,25 @@ fn compile_contains(
 ) -> Result<String, FilterError> {
     let value = value.as_string("contains")?;
     let predicate = match field {
-        FilterField::Name | FilterField::RunType | FilterField::Status => {
+        FilterField::Name
+        | FilterField::RunType
+        | FilterField::Status
+        | FilterField::ProjectName
+        | FilterField::TraceId
+        | FilterField::RootRunId
+        | FilterField::RootSpanId
+        | FilterField::ModelName
+        | FilterField::ProviderName => {
             let column = match field {
                 FilterField::Name => "name",
                 FilterField::RunType => "run_type",
                 FilterField::Status => "status",
+                FilterField::ProjectName => "project_name",
+                FilterField::TraceId => "trace_id",
+                FilterField::RootRunId => "root_run_id",
+                FilterField::RootSpanId => "root_span_id",
+                FilterField::ModelName => "model_name",
+                FilterField::ProviderName => "provider_name",
                 _ => unreachable!(),
             };
             format!(
@@ -383,13 +483,14 @@ fn compile_metadata_atom(
     value: &FilterValue,
     run_alias: &str,
 ) -> Result<String, FilterError> {
-    let condition = metadata_compare_condition(op, field, value)?;
     if matches!(op, CompareOp::Neq) {
+        let condition = metadata_compare_condition(CompareOp::Eq, field, value)?;
         Ok(format!(
-            "NOT {}",
+            "NOT ({})",
             metadata_exists_sql(run_alias, &[condition])
         ))
     } else {
+        let condition = metadata_compare_condition(op, field, value)?;
         Ok(metadata_exists_sql(run_alias, &[condition]))
     }
 }
@@ -400,22 +501,32 @@ fn compile_feedback_atom(
     value: &FilterValue,
     run_alias: &str,
 ) -> Result<String, FilterError> {
-    let condition = feedback_compare_condition(op, field, value)?;
     if matches!(op, CompareOp::Neq) {
+        let condition = feedback_compare_condition(CompareOp::Eq, field, value)?;
         Ok(format!(
-            "NOT {}",
+            "NOT ({})",
             feedback_exists_sql(run_alias, &[condition])
         ))
     } else {
+        let condition = feedback_compare_condition(op, field, value)?;
         Ok(feedback_exists_sql(run_alias, &[condition]))
     }
 }
 
-fn metadata_row_condition(expr: &FilterExpr) -> Result<Option<String>, FilterError> {
+fn metadata_row_condition(
+    expr: &FilterExpr,
+    has_key_anchor: bool,
+) -> Result<Option<String>, FilterError> {
     match &expr.kind {
         FilterKind::Compare { op, field, value }
             if matches!(field, FilterField::MetadataKey | FilterField::MetadataValue) =>
         {
+            if matches!((*op, *field), (CompareOp::Neq, FilterField::MetadataKey))
+                || (matches!((*op, *field), (CompareOp::Neq, FilterField::MetadataValue))
+                    && !has_key_anchor)
+            {
+                return Ok(None);
+            }
             Ok(Some(metadata_compare_condition(*op, *field, value)?))
         }
         FilterKind::In {
@@ -432,7 +543,10 @@ fn metadata_row_condition(expr: &FilterExpr) -> Result<Option<String>, FilterErr
     }
 }
 
-fn feedback_row_condition(expr: &FilterExpr) -> Result<Option<String>, FilterError> {
+fn feedback_row_condition(
+    expr: &FilterExpr,
+    has_key_anchor: bool,
+) -> Result<Option<String>, FilterError> {
     match &expr.kind {
         FilterKind::Compare { op, field, value }
             if matches!(
@@ -440,10 +554,47 @@ fn feedback_row_condition(expr: &FilterExpr) -> Result<Option<String>, FilterErr
                 FilterField::FeedbackKey | FilterField::FeedbackScore | FilterField::FeedbackValue
             ) =>
         {
+            if matches!((*op, *field), (CompareOp::Neq, FilterField::FeedbackKey))
+                || (matches!(
+                    (*op, *field),
+                    (
+                        CompareOp::Neq,
+                        FilterField::FeedbackScore | FilterField::FeedbackValue
+                    )
+                ) && !has_key_anchor)
+            {
+                return Ok(None);
+            }
             Ok(Some(feedback_compare_condition(*op, *field, value)?))
         }
         _ => Ok(None),
     }
+}
+
+fn is_positive_metadata_key_condition(expr: &FilterExpr) -> bool {
+    match &expr.kind {
+        FilterKind::Compare {
+            op,
+            field: FilterField::MetadataKey,
+            ..
+        } => !matches!(op, CompareOp::Neq),
+        FilterKind::In {
+            field: FilterField::MetadataKey,
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+fn is_positive_feedback_key_condition(expr: &FilterExpr) -> bool {
+    matches!(
+        &expr.kind,
+        FilterKind::Compare {
+            op,
+            field: FilterField::FeedbackKey,
+            ..
+        } if !matches!(op, CompareOp::Neq)
+    )
 }
 
 fn metadata_compare_condition(
@@ -530,6 +681,16 @@ fn compile_bool_column(op: CompareOp, column: &str, value: bool) -> Result<Strin
     }
 }
 
+fn compile_error_column(op: CompareOp, column: &str, value: bool) -> Result<String, FilterError> {
+    match (op, value) {
+        (CompareOp::Eq, true) | (CompareOp::Neq, false) => Ok(format!("{column} = 'error'")),
+        (CompareOp::Eq, false) | (CompareOp::Neq, true) => Ok(format!("{column} <> 'error'")),
+        _ => Err(FilterError::Unsupported(
+            "error only supports eq and neq boolean filters".to_owned(),
+        )),
+    }
+}
+
 fn compare_sql(op: CompareOp, column: &str, rhs: &str) -> String {
     let operator = match op {
         CompareOp::Eq => "=",
@@ -544,42 +705,48 @@ fn compare_sql(op: CompareOp, column: &str, rhs: &str) -> String {
 
 fn tag_exists_sql(run_alias: &str, tag: &str) -> String {
     format!(
-        "EXISTS (
-            SELECT 1 FROM run_tags tag_filter
-            WHERE tag_filter.project_name = {run_alias}.project_name
-                AND tag_filter.trace_id = {run_alias}.trace_id
-                AND tag_filter.span_id = {run_alias}.span_id
-                AND tag_filter.tag = {}
+        "{} IN (
+            SELECT {}
+            FROM run_tags tag_filter
+            WHERE tag_filter.tag = {}
         )",
+        run_key_sql(run_alias),
+        table_run_key_sql("tag_filter"),
         sql_string_literal(tag)
     )
 }
 
 fn metadata_exists_sql(run_alias: &str, conditions: &[String]) -> String {
     format!(
-        "EXISTS (
-            SELECT 1 FROM run_metadata metadata_filter
-            WHERE metadata_filter.project_name = {run_alias}.project_name
-                AND metadata_filter.trace_id = {run_alias}.trace_id
-                AND metadata_filter.span_id = {run_alias}.span_id
-                AND {}
+        "{} IN (
+            SELECT {}
+            FROM run_metadata metadata_filter
+            WHERE {}
         )",
+        run_key_sql(run_alias),
+        table_run_key_sql("metadata_filter"),
         conditions.join(" AND ")
     )
 }
 
 fn feedback_exists_sql(run_alias: &str, conditions: &[String]) -> String {
     format!(
-        "EXISTS (
-            SELECT 1 FROM feedback feedback_filter
-            WHERE (
-                    feedback_filter.run_id = NULLIF({run_alias}.run_id, '')
-                    OR feedback_filter.run_id = {run_alias}.generated_run_id
-                )
-                AND {}
-        )",
-        conditions.join(" AND ")
+        "(({run_alias}.run_id <> '' AND {run_alias}.run_id IN ({subquery}))
+            OR {run_alias}.generated_run_id IN ({subquery}))",
+        subquery = format!(
+            "SELECT feedback_filter.run_id FROM feedback feedback_filter
+            WHERE feedback_filter.run_id IS NOT NULL AND {}",
+            conditions.join(" AND ")
+        )
     )
+}
+
+fn run_key_sql(alias: &str) -> String {
+    format!("{alias}.project_name || '\u{1f}' || {alias}.trace_id || '\u{1f}' || {alias}.span_id")
+}
+
+fn table_run_key_sql(alias: &str) -> String {
+    run_key_sql(alias)
 }
 
 impl FilterValue {
@@ -650,331 +817,6 @@ impl FilterValue {
 fn trim_float(value: f64) -> String {
     let text = value.to_string();
     text.strip_suffix(".0").unwrap_or(&text).to_owned()
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum Token {
-    Ident(String),
-    String(String),
-    Number(f64),
-    LParen,
-    RParen,
-    LBracket,
-    RBracket,
-    Comma,
-}
-
-struct Parser {
-    tokens: Vec<Token>,
-    offset: usize,
-    nodes: usize,
-}
-
-impl Parser {
-    fn parse_expr(&mut self, depth: usize) -> Result<FilterExpr, FilterError> {
-        if depth > MAX_FILTER_DEPTH {
-            return Err(FilterError::Parse("filter nesting is too deep".to_owned()));
-        }
-        self.nodes += 1;
-        if self.nodes > MAX_FILTER_NODES {
-            return Err(FilterError::Parse("filter is too large".to_owned()));
-        }
-
-        let function = self.expect_ident()?.to_ascii_lowercase();
-        self.expect(Token::LParen)?;
-        let expr = match function.as_str() {
-            "and" | "or" => {
-                let mut children = Vec::new();
-                if !self.peek_is(&Token::RParen) {
-                    loop {
-                        children.push(self.parse_expr(depth + 1)?);
-                        if !self.consume_if(&Token::Comma) {
-                            break;
-                        }
-                    }
-                }
-                if function == "and" {
-                    FilterExpr {
-                        kind: FilterKind::And(children),
-                    }
-                } else {
-                    FilterExpr {
-                        kind: FilterKind::Or(children),
-                    }
-                }
-            }
-            "eq" | "neq" | "gt" | "gte" | "lt" | "lte" => {
-                let field = parse_field(&self.expect_ident()?)?;
-                self.expect(Token::Comma)?;
-                let value = self.parse_value()?;
-                FilterExpr {
-                    kind: FilterKind::Compare {
-                        op: parse_compare_op(&function),
-                        field,
-                        value,
-                    },
-                }
-            }
-            "has" => {
-                let field = parse_field(&self.expect_ident()?)?;
-                self.expect(Token::Comma)?;
-                let value = self.parse_value()?;
-                FilterExpr {
-                    kind: FilterKind::Has { field, value },
-                }
-            }
-            "in" => {
-                let field = parse_field(&self.expect_ident()?)?;
-                self.expect(Token::Comma)?;
-                let values = self.parse_list()?;
-                FilterExpr {
-                    kind: FilterKind::In { field, values },
-                }
-            }
-            "contains" | "does_not_contain" | "not_contains" => {
-                let field = parse_field(&self.expect_ident()?)?;
-                self.expect(Token::Comma)?;
-                let value = self.parse_value()?;
-                FilterExpr {
-                    kind: FilterKind::Contains {
-                        field,
-                        value,
-                        negated: function != "contains",
-                    },
-                }
-            }
-            "search" => {
-                let value = self.parse_value()?.as_string("search")?;
-                FilterExpr {
-                    kind: FilterKind::Search(value),
-                }
-            }
-            _ => {
-                return Err(FilterError::Unsupported(format!(
-                    "operator {function} is not supported"
-                )));
-            }
-        };
-        self.expect(Token::RParen)?;
-        Ok(expr)
-    }
-
-    fn parse_value(&mut self) -> Result<FilterValue, FilterError> {
-        match self.next() {
-            Some(Token::String(value)) => Ok(FilterValue::String(value)),
-            Some(Token::Number(value)) => Ok(FilterValue::Number(value)),
-            Some(Token::Ident(value)) if value.eq_ignore_ascii_case("true") => {
-                Ok(FilterValue::Bool(true))
-            }
-            Some(Token::Ident(value)) if value.eq_ignore_ascii_case("false") => {
-                Ok(FilterValue::Bool(false))
-            }
-            Some(other) => Err(FilterError::Parse(format!(
-                "expected value, found {other:?}"
-            ))),
-            None => Err(FilterError::Parse("expected value".to_owned())),
-        }
-    }
-
-    fn parse_list(&mut self) -> Result<Vec<FilterValue>, FilterError> {
-        self.expect(Token::LBracket)?;
-        let mut values = Vec::new();
-        if !self.peek_is(&Token::RBracket) {
-            loop {
-                values.push(self.parse_value()?);
-                if !self.consume_if(&Token::Comma) {
-                    break;
-                }
-            }
-        }
-        self.expect(Token::RBracket)?;
-        Ok(values)
-    }
-
-    fn expect_ident(&mut self) -> Result<String, FilterError> {
-        match self.next() {
-            Some(Token::Ident(value)) => Ok(value),
-            Some(other) => Err(FilterError::Parse(format!(
-                "expected identifier, found {other:?}"
-            ))),
-            None => Err(FilterError::Parse("expected identifier".to_owned())),
-        }
-    }
-
-    fn expect(&mut self, expected: Token) -> Result<(), FilterError> {
-        match self.next() {
-            Some(token) if token == expected => Ok(()),
-            Some(token) => Err(FilterError::Parse(format!(
-                "expected {expected:?}, found {token:?}"
-            ))),
-            None => Err(FilterError::Parse(format!("expected {expected:?}"))),
-        }
-    }
-
-    fn consume_if(&mut self, expected: &Token) -> bool {
-        if self.peek_is(expected) {
-            self.offset += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn peek_is(&self, expected: &Token) -> bool {
-        self.tokens
-            .get(self.offset)
-            .is_some_and(|token| token == expected)
-    }
-
-    fn next(&mut self) -> Option<Token> {
-        let token = self.tokens.get(self.offset).cloned();
-        if token.is_some() {
-            self.offset += 1;
-        }
-        token
-    }
-
-    fn is_done(&self) -> bool {
-        self.offset >= self.tokens.len()
-    }
-}
-
-fn parse_compare_op(value: &str) -> CompareOp {
-    match value {
-        "eq" => CompareOp::Eq,
-        "neq" => CompareOp::Neq,
-        "gt" => CompareOp::Gt,
-        "gte" => CompareOp::Gte,
-        "lt" => CompareOp::Lt,
-        "lte" => CompareOp::Lte,
-        _ => unreachable!(),
-    }
-}
-
-fn parse_field(value: &str) -> Result<FilterField, FilterError> {
-    match value {
-        "id" | "run_id" => Ok(FilterField::Id),
-        "name" => Ok(FilterField::Name),
-        "run_type" => Ok(FilterField::RunType),
-        "status" => Ok(FilterField::Status),
-        "start_time" => Ok(FilterField::StartTime),
-        "end_time" => Ok(FilterField::EndTime),
-        "latency" => Ok(FilterField::Latency),
-        "tags" => Ok(FilterField::Tags),
-        "metadata_key" => Ok(FilterField::MetadataKey),
-        "metadata_value" => Ok(FilterField::MetadataValue),
-        "feedback_key" => Ok(FilterField::FeedbackKey),
-        "feedback_score" => Ok(FilterField::FeedbackScore),
-        "feedback_value" => Ok(FilterField::FeedbackValue),
-        "is_root" => Ok(FilterField::IsRoot),
-        "trace_id" | "trace" => Ok(FilterField::TraceId),
-        "inputs" | "outputs" | "extra" | "attributes_json" => Err(FilterError::Unsupported(
-            "payload JSON filters require the Phase 6 object-store index".to_owned(),
-        )),
-        other => Err(FilterError::Unsupported(format!(
-            "field {other} is not indexed"
-        ))),
-    }
-}
-
-fn lex(input: &str) -> Result<Vec<Token>, FilterError> {
-    let mut chars = input.char_indices().peekable();
-    let mut tokens = Vec::new();
-    while let Some((_, ch)) = chars.peek().copied() {
-        match ch {
-            c if c.is_whitespace() => {
-                chars.next();
-            }
-            '(' => {
-                chars.next();
-                tokens.push(Token::LParen);
-            }
-            ')' => {
-                chars.next();
-                tokens.push(Token::RParen);
-            }
-            '[' => {
-                chars.next();
-                tokens.push(Token::LBracket);
-            }
-            ']' => {
-                chars.next();
-                tokens.push(Token::RBracket);
-            }
-            ',' => {
-                chars.next();
-                tokens.push(Token::Comma);
-            }
-            '"' | '\'' => tokens.push(Token::String(read_string(&mut chars, ch)?)),
-            '-' | '0'..='9' => tokens.push(read_number(&mut chars)?),
-            c if is_ident_start(c) => tokens.push(Token::Ident(read_ident(&mut chars))),
-            _ => {
-                return Err(FilterError::Parse(format!("unexpected character {ch:?}")));
-            }
-        }
-    }
-    Ok(tokens)
-}
-
-fn read_string<I>(chars: &mut std::iter::Peekable<I>, quote: char) -> Result<String, FilterError>
-where
-    I: Iterator<Item = (usize, char)>,
-{
-    chars.next();
-    let mut value = String::new();
-    while let Some((_, ch)) = chars.next() {
-        if ch == quote {
-            return Ok(value);
-        }
-        if ch == '\\' {
-            let Some((_, escaped)) = chars.next() else {
-                return Err(FilterError::Parse("unterminated escape".to_owned()));
-            };
-            value.push(escaped);
-        } else {
-            value.push(ch);
-        }
-    }
-    Err(FilterError::Parse("unterminated string".to_owned()))
-}
-
-fn read_number<I>(chars: &mut std::iter::Peekable<I>) -> Result<Token, FilterError>
-where
-    I: Iterator<Item = (usize, char)>,
-{
-    let mut value = String::new();
-    while let Some((_, ch)) = chars.peek().copied() {
-        if ch.is_ascii_digit() || matches!(ch, '-' | '.') {
-            value.push(ch);
-            chars.next();
-        } else {
-            break;
-        }
-    }
-    value
-        .parse::<f64>()
-        .map(Token::Number)
-        .map_err(|_| FilterError::Parse(format!("invalid number {value}")))
-}
-
-fn read_ident<I>(chars: &mut std::iter::Peekable<I>) -> String
-where
-    I: Iterator<Item = (usize, char)>,
-{
-    let mut value = String::new();
-    while let Some((_, ch)) = chars.peek().copied() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            value.push(ch);
-            chars.next();
-        } else {
-            break;
-        }
-    }
-    value
-}
-
-fn is_ident_start(ch: char) -> bool {
-    ch.is_ascii_alphabetic() || ch == '_'
 }
 
 fn sql_string_list(values: &[String]) -> String {

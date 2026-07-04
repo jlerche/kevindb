@@ -380,6 +380,26 @@ mod tests {
         );
         let child_run_id = trace_body.runs[1].id.clone();
 
+        let direct_run_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runs/query")
+                    .header("content-type", "application/json")
+                    .body(json_body(json!({
+                        "run_ids": [child_run_id.clone()],
+                        "select": ["id", "name"]
+                    })))?,
+            )
+            .await?;
+        assert_eq!(direct_run_response.status(), StatusCode::OK);
+        let direct_run_body: RunsResponse =
+            decode_response(direct_run_response.into_body()).await?;
+        assert_eq!(direct_run_body.runs.len(), 1);
+        assert_eq!(direct_run_body.runs[0].id, child_run_id);
+        assert_eq!(direct_run_body.runs[0].inputs, json!({}));
+
         let create_feedback_response = app
             .clone()
             .oneshot(
@@ -391,6 +411,7 @@ mod tests {
                         "run_id": child_run_id.clone(),
                         "key": "quality",
                         "score": 1.0,
+                        "value": "pass",
                         "comment": "looks good",
                         "extra": {"source": "unit-test"}
                     })))?,
@@ -417,7 +438,23 @@ mod tests {
         );
         assert_eq!(feedback_body[0].key, "quality");
         assert_eq!(feedback_body[0].score, Some(json!(1.0)));
+        assert_eq!(feedback_body[0].value, Some(json!("pass")));
         assert_eq!(feedback_body[0].comment.as_deref(), Some("looks good"));
+
+        let indexed_feedback_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/feedback?project_name=demo&trace_id=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa&score_min=1&score_max=1&value=pass&created_at_min=1970-01-01T00:00:00Z&created_at_max=2100-01-01T00:00:00Z")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(indexed_feedback_response.status(), StatusCode::OK);
+        let indexed_feedback_body: Vec<FeedbackResponse> =
+            decode_response(indexed_feedback_response.into_body()).await?;
+        assert_eq!(indexed_feedback_body.len(), 1);
+        assert_eq!(indexed_feedback_body[0].id, feedback_body[0].id);
 
         let read_feedback_response = app
             .clone()
@@ -464,6 +501,51 @@ mod tests {
         assert_eq!(langsmith_body.runs[0].name, "llm.call");
         assert_eq!(langsmith_body.runs[0].inputs, json!({}));
 
+        let phase2_filter_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runs/query")
+                    .header("content-type", "application/json")
+                    .body(json_body(json!({
+                        "project_name": "demo",
+                        "filter": "and(eq(model, \"gpt-test\"), eq(feedback_key, \"quality\"), eq(feedback_score, 1.0))",
+                        "select": ["id", "name"],
+                        "debug": true
+                    })))?,
+            )
+            .await?;
+        assert_eq!(phase2_filter_response.status(), StatusCode::OK);
+        let phase2_filter_body: RunsResponse =
+            decode_response(phase2_filter_response.into_body()).await?;
+        assert_eq!(phase2_filter_body.runs.len(), 1);
+        assert_eq!(phase2_filter_body.runs[0].name, "llm.call");
+        assert_eq!(phase2_filter_body.runs[0].inputs, json!({}));
+        let diagnostics = phase2_filter_body
+            .diagnostics
+            .expect("debug query should include diagnostics");
+        assert_eq!(diagnostics.candidate_runs, 1);
+        assert_eq!(diagnostics.estimated_object_store_requests, 1);
+
+        let unsupported_filter_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runs/query")
+                    .header("content-type", "application/json")
+                    .body(json_body(json!({
+                        "project_name": "demo",
+                        "filter": "search(\"payload\")"
+                    })))?,
+            )
+            .await?;
+        assert_eq!(
+            unsupported_filter_response.status(),
+            StatusCode::BAD_REQUEST
+        );
+
         let filtered_response = app
             .clone()
             .oneshot(
@@ -504,7 +586,7 @@ mod tests {
             .await?;
         assert_eq!(first_page_response.status(), StatusCode::OK);
         let first_page: RunsResponse = decode_response(first_page_response.into_body()).await?;
-        assert_eq!(first_page.runs[0].name, "agent.run");
+        assert_eq!(first_page.runs[0].name, "llm.call");
         assert_eq!(first_page.cursors.next.as_deref(), Some("1"));
 
         let second_page_response = app
@@ -523,7 +605,7 @@ mod tests {
             .await?;
         assert_eq!(second_page_response.status(), StatusCode::OK);
         let second_page: RunsResponse = decode_response(second_page_response.into_body()).await?;
-        assert_eq!(second_page.runs[0].name, "llm.call");
+        assert_eq!(second_page.runs[0].name, "agent.run");
         assert_eq!(second_page.cursors.next, None);
 
         let root_response = app
@@ -620,6 +702,7 @@ mod tests {
                             span_id: repeated_bytes(0x22, 8),
                             parent_span_id: repeated_bytes(0x11, 8),
                             name: "llm.call".to_owned(),
+                            attributes: vec![string_attr("gen_ai.request.model", "gpt-test")],
                             start_time_unix_nano: 2,
                             end_time_unix_nano: 9,
                             status: Some(Status {

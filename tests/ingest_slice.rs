@@ -270,6 +270,11 @@ async fn compaction_deletes_and_retention_work_together() -> Result<()> {
             offset: None,
             retention_cutoff_unix_nano: None,
             include_deleted: false,
+            filter: None,
+            trace_filter: None,
+            include_payload: true,
+            newest_first: false,
+            limits: Default::default(),
         })
         .await?;
     assert_eq!(
@@ -322,6 +327,11 @@ async fn compaction_deletes_and_retention_work_together() -> Result<()> {
             offset: None,
             retention_cutoff_unix_nano: None,
             include_deleted: true,
+            filter: None,
+            trace_filter: None,
+            include_payload: true,
+            newest_first: false,
+            limits: Default::default(),
         })
         .await?;
     assert_eq!(inclusive.len(), 2);
