@@ -526,7 +526,7 @@ mod tests {
             .diagnostics
             .expect("debug query should include diagnostics");
         assert_eq!(diagnostics.candidate_runs, 1);
-        assert_eq!(diagnostics.estimated_object_store_requests, 1);
+        assert_eq!(diagnostics.estimated_object_store_requests, 48);
 
         let unsupported_filter_response = app
             .clone()

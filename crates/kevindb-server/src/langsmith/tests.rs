@@ -69,3 +69,44 @@ fn merges_partial_langsmith_payload_updates() {
     let round_trip = LangSmithPayload::from_attributes_json(&payload.to_attributes_json());
     assert_eq!(round_trip, payload);
 }
+
+#[test]
+fn parses_structured_filters() {
+    let filter = parse_filter(
+        Some(&json!({
+            "operator": "and",
+            "children": [
+                {"field": "name", "operator": "contains", "value": "llm"},
+                {"field": "run_type", "operator": "is one of", "values": ["llm", "tool"]},
+                {"field": "error", "operator": "eq", "value": false}
+            ]
+        })),
+        "filter",
+    )
+    .expect("parse structured filter")
+    .expect("filter should exist");
+
+    let compiled = filter
+        .compile_run_head_filter("run_heads")
+        .expect("compile structured filter");
+    assert!(compiled.predicate_sql.contains("run_heads.run_type IN"));
+    assert!(
+        compiled
+            .predicate_sql
+            .contains("run_heads.status <> 'error'")
+    );
+}
+
+#[test]
+fn structured_filters_reject_payload_fields() {
+    let error = parse_filter(
+        Some(&json!({"field": "inputs", "operator": "eq", "value": "secret"})),
+        "filter",
+    )
+    .expect_err("payload filter should be rejected");
+
+    match error {
+        ApiError::BadRequest(message) => assert!(message.contains("payload JSON")),
+        other => panic!("expected bad request, got {other:?}"),
+    }
+}

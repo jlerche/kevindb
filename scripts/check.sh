@@ -22,7 +22,6 @@ done < <(
       -path '*/__pycache__' \
     \) -prune -o \
     -type f \
-    ! -path './SMITHDB_PARITY_PLAN.md' \
     ! -name 'Cargo.lock' \
     ! -name '*.lock' \
     -print0

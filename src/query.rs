@@ -13,8 +13,6 @@ use uuid::Uuid;
 use vortex_datafusion::VortexFormatFactory;
 
 use crate::otlp::RunEventKind;
-use crate::segment::ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION;
-
 pub mod filter;
 mod planner;
 mod random_access;
@@ -22,8 +20,8 @@ mod rows;
 mod tree;
 use filter::FilterExpr;
 pub(crate) use planner::{
-    RunKey, SegmentSource, load_deleted_run_keys, load_run_query_plan,
-    run_matches_retention_filter, run_query_where_sql, sql_string_literal,
+    RunKey, SegmentSource, estimate_vortex_object_store_requests, load_deleted_run_keys,
+    load_run_query_plan, run_matches_retention_filter, run_query_where_sql, sql_string_literal,
 };
 pub use random_access::{RunEventSummary, RunLoadResult, RunProjection, TraceLoadResult};
 pub(crate) use rows::run_summaries_from_batches;
@@ -149,6 +147,16 @@ impl QueryEngine {
     }
 
     pub async fn list_runs(&self, query: RunQuery) -> Result<Vec<RunSummary>> {
+        if let Some(max_wall_time) = query.limits.max_wall_time {
+            let query = query_without_wall_time_limit(query);
+            return tokio::time::timeout(max_wall_time, self.list_runs_inner(query))
+                .await
+                .context("query exceeded max wall clock")?;
+        }
+        self.list_runs_inner(query).await
+    }
+
+    async fn list_runs_inner(&self, query: RunQuery) -> Result<Vec<RunSummary>> {
         let plan = load_run_query_plan(&self.postgres_url, &query).await?;
         let deleted_runs = if query.include_deleted {
             std::collections::HashSet::new()
@@ -161,6 +169,7 @@ impl QueryEngine {
             plan.segments,
             &query,
             query.include_payload,
+            Some(&candidate_run_keys),
         )
         .await?;
         Ok(runs
@@ -172,6 +181,19 @@ impl QueryEngine {
     }
 
     pub async fn list_runs_with_diagnostics(&self, query: RunQuery) -> Result<RunQueryResult> {
+        if let Some(max_wall_time) = query.limits.max_wall_time {
+            let query = query_without_wall_time_limit(query);
+            return tokio::time::timeout(
+                max_wall_time,
+                self.list_runs_with_diagnostics_inner(query),
+            )
+            .await
+            .context("query exceeded max wall clock")?;
+        }
+        self.list_runs_with_diagnostics_inner(query).await
+    }
+
+    async fn list_runs_with_diagnostics_inner(&self, query: RunQuery) -> Result<RunQueryResult> {
         let postgres_started = Instant::now();
         let plan = load_run_query_plan(&self.postgres_url, &query).await?;
         let deleted_runs = if query.include_deleted {
@@ -191,6 +213,7 @@ impl QueryEngine {
             plan.segments,
             &query,
             query.include_payload,
+            Some(&candidate_run_keys),
         )
         .await?;
         let runs = runs
@@ -318,6 +341,11 @@ impl QueryEngine {
         tx.commit().await.context("commit retention expiration")?;
         Ok(deleted)
     }
+}
+
+fn query_without_wall_time_limit(mut query: RunQuery) -> RunQuery {
+    query.limits.max_wall_time = None;
+    query
 }
 
 pub fn generated_run_id(project_name: &str, trace_id: &str, span_id: &str) -> String {
@@ -513,7 +541,7 @@ async fn query_trace_segments_with_datafusion(
         .into_iter()
         .map(current_segment_source)
         .collect::<Vec<_>>();
-    query_segment_sources_with_datafusion_projected(object_store, segments, query, true).await
+    query_segment_sources_with_datafusion_projected(object_store, segments, query, true, None).await
 }
 
 async fn query_with_optional_timeout(
@@ -521,12 +549,14 @@ async fn query_with_optional_timeout(
     segments: Vec<SegmentSource>,
     query: &RunQuery,
     include_payload: bool,
+    candidate_run_keys: Option<&std::collections::HashSet<RunKey>>,
 ) -> Result<Vec<RunSummary>> {
     let future = query_segment_sources_with_datafusion_projected(
         object_store,
         segments,
         query,
         include_payload,
+        candidate_run_keys,
     );
     if let Some(max_wall_time) = query.limits.max_wall_time {
         tokio::time::timeout(max_wall_time, future)
@@ -542,13 +572,14 @@ async fn query_segment_sources_with_datafusion_projected(
     segments: Vec<SegmentSource>,
     query: &RunQuery,
     include_payload: bool,
+    candidate_run_keys: Option<&std::collections::HashSet<RunKey>>,
 ) -> Result<Vec<RunSummary>> {
     if segments.is_empty() {
         return Ok(Vec::new());
     }
 
     let context = vortex_session_context(object_store)?;
-    let sql = run_head_datafusion_sql(&segments, query, include_payload);
+    let sql = run_head_datafusion_sql(&segments, query, include_payload, candidate_run_keys);
     let dataframe = context
         .sql(&sql)
         .await
@@ -572,13 +603,14 @@ pub(crate) async fn query_segment_sources_with_datafusion_timed(
     segments: Vec<SegmentSource>,
     query: &RunQuery,
     include_payload: bool,
+    candidate_run_keys: Option<&std::collections::HashSet<RunKey>>,
 ) -> Result<(Vec<RunSummary>, DataFusionQueryTiming)> {
     if segments.is_empty() {
         return Ok((Vec::new(), DataFusionQueryTiming::default()));
     }
 
     let context = vortex_session_context(object_store)?;
-    let sql = run_head_datafusion_sql(&segments, query, include_payload);
+    let sql = run_head_datafusion_sql(&segments, query, include_payload, candidate_run_keys);
 
     let planning_started = Instant::now();
     let dataframe = context
@@ -608,9 +640,15 @@ async fn query_timed_with_optional_timeout(
     segments: Vec<SegmentSource>,
     query: &RunQuery,
     include_payload: bool,
+    candidate_run_keys: Option<&std::collections::HashSet<RunKey>>,
 ) -> Result<(Vec<RunSummary>, DataFusionQueryTiming)> {
-    let future =
-        query_segment_sources_with_datafusion_timed(object_store, segments, query, include_payload);
+    let future = query_segment_sources_with_datafusion_timed(
+        object_store,
+        segments,
+        query,
+        include_payload,
+        candidate_run_keys,
+    );
     if let Some(max_wall_time) = query.limits.max_wall_time {
         tokio::time::timeout(max_wall_time, future)
             .await
@@ -624,8 +662,9 @@ fn run_head_datafusion_sql(
     segments: &[SegmentSource],
     query: &RunQuery,
     include_payload: bool,
+    candidate_run_keys: Option<&std::collections::HashSet<RunKey>>,
 ) -> String {
-    let source_where_sql = run_source_pushdown_where_sql(query);
+    let source_where_sql = run_source_pushdown_where_sql(query, candidate_run_keys);
     let source_sql = segments
         .iter()
         .map(|segment| segment_source_sql(segment, include_payload, &source_where_sql))
@@ -688,7 +727,7 @@ fn run_head_datafusion_sql(
 fn current_segment_source(uri: String) -> SegmentSource {
     SegmentSource {
         uri,
-        schema_version: ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION,
+        total_bytes: 0,
     }
 }
 
@@ -697,11 +736,6 @@ fn segment_source_sql(
     include_payload: bool,
     source_where_sql: &str,
 ) -> String {
-    let row_index_sql = if segment.schema_version >= ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION {
-        "row_index".to_owned()
-    } else {
-        "0 AS row_index".to_owned()
-    };
     let attributes_json_sql = attributes_json_sql(include_payload);
 
     format!(
@@ -719,7 +753,7 @@ fn segment_source_sql(
             status_code,
             event_type,
             event_time_unix_nano,
-            {row_index_sql},
+            row_index,
             {attributes_json_sql}
         FROM {}
         WHERE {source_where_sql}",
@@ -727,7 +761,10 @@ fn segment_source_sql(
     )
 }
 
-fn run_source_pushdown_where_sql(query: &RunQuery) -> String {
+fn run_source_pushdown_where_sql(
+    query: &RunQuery,
+    candidate_run_keys: Option<&std::collections::HashSet<RunKey>>,
+) -> String {
     let mut predicates = Vec::new();
     if !query.project_names.is_empty() {
         predicates.push(format!(
@@ -768,12 +805,56 @@ fn run_source_pushdown_where_sql(query: &RunQuery) -> String {
             "start_time_unix_nano <= {start_time_max_unix_nano}"
         ));
     }
+    if let Some(candidate_predicate) = candidate_run_source_pushdown_sql(candidate_run_keys) {
+        predicates.push(candidate_predicate);
+    }
 
     if predicates.is_empty() {
         "true".to_owned()
     } else {
         predicates.join(" AND ")
     }
+}
+
+fn candidate_run_source_pushdown_sql(
+    candidate_run_keys: Option<&std::collections::HashSet<RunKey>>,
+) -> Option<String> {
+    const MAX_CANDIDATE_RUN_KEYS_SOURCE_PUSHDOWN: usize = 1024;
+
+    let candidate_run_keys = candidate_run_keys?;
+    if candidate_run_keys.is_empty()
+        || candidate_run_keys.len() > MAX_CANDIDATE_RUN_KEYS_SOURCE_PUSHDOWN
+    {
+        return None;
+    }
+
+    let mut spans_by_trace =
+        std::collections::BTreeMap::<(&str, &str), std::collections::BTreeSet<&str>>::new();
+    for key in candidate_run_keys {
+        spans_by_trace
+            .entry((key.project_name.as_str(), key.trace_id.as_str()))
+            .or_default()
+            .insert(key.span_id.as_str());
+    }
+
+    let predicates = spans_by_trace
+        .into_iter()
+        .map(|((project_name, trace_id), span_ids)| {
+            let span_ids = span_ids
+                .into_iter()
+                .map(sql_string_literal)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "(project_name = {} AND trace_id = {} AND span_id IN ({}))",
+                sql_string_literal(project_name),
+                sql_string_literal(trace_id),
+                span_ids
+            )
+        })
+        .collect::<Vec<_>>();
+
+    Some(format!("({})", predicates.join(" OR ")))
 }
 
 pub(crate) fn attributes_json_sql(include_payload: bool) -> &'static str {

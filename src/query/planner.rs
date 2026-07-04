@@ -17,7 +17,7 @@ pub(crate) struct RunQueryPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SegmentSource {
     pub(crate) uri: String,
-    pub(crate) schema_version: i64,
+    pub(crate) total_bytes: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -65,25 +65,23 @@ pub(crate) async fn load_run_query_plan(
         .await
         .context("load run query candidates")?;
     let mut candidate_run_keys = HashSet::new();
-    let mut segment_bytes = std::collections::BTreeMap::<(String, i64), i64>::new();
+    let mut segment_bytes = std::collections::BTreeMap::<String, i64>::new();
 
     for row in rows {
         let uri: String = row.get(0);
-        let schema_version: i64 = row.get(1);
-        let total_bytes: i64 = row.get(2);
+        let total_bytes: i64 = row.get(1);
         candidate_run_keys.insert(RunKey {
-            project_name: row.get(3),
-            trace_id: row.get(4),
-            span_id: row.get(5),
+            project_name: row.get(2),
+            trace_id: row.get(3),
+            span_id: row.get(4),
         });
-        segment_bytes
-            .entry((uri, schema_version))
-            .or_insert(total_bytes);
+        segment_bytes.entry(uri).or_insert(total_bytes);
     }
 
     let candidate_runs = candidate_run_keys.len();
     let candidate_bytes = segment_bytes.values().copied().sum::<i64>();
-    let estimated_object_store_requests = segment_bytes.len();
+    let estimated_object_store_requests =
+        estimate_vortex_object_store_requests(segment_bytes.len());
     enforce_limits(
         query,
         segment_bytes.len(),
@@ -92,17 +90,10 @@ pub(crate) async fn load_run_query_plan(
     )?;
 
     let mut segments = segment_bytes
-        .into_keys()
-        .map(|(uri, schema_version)| SegmentSource {
-            uri,
-            schema_version,
-        })
+        .into_iter()
+        .map(|(uri, total_bytes)| SegmentSource { uri, total_bytes })
         .collect::<Vec<_>>();
-    segments.sort_by(|left, right| {
-        left.uri
-            .cmp(&right.uri)
-            .then(left.schema_version.cmp(&right.schema_version))
-    });
+    segments.sort_by(|left, right| left.uri.cmp(&right.uri));
     Ok(RunQueryPlan {
         segments,
         candidate_run_keys,
@@ -125,17 +116,15 @@ fn run_candidate_runs_sql(query: &RunQuery) -> Result<String> {
     Ok(format!(
         "SELECT
             candidate.uri,
-            candidate.schema_version,
             candidate.total_bytes,
             candidate.project_name,
             candidate.trace_id,
             candidate.span_id
-        FROM (
-            SELECT
-                trace_segments.uri,
-                trace_segments.schema_version,
-                trace_segments.total_bytes,
-                run_heads.project_name,
+            FROM (
+                SELECT
+                    trace_segments.uri,
+                    trace_segments.total_bytes,
+                    run_heads.project_name,
                 run_heads.trace_id,
                 run_heads.span_id,
                 run_heads.start_time_unix_nano,
@@ -245,6 +234,14 @@ fn enforce_limits(
         ));
     }
     Ok(())
+}
+
+pub(crate) fn estimate_vortex_object_store_requests(candidate_segments: usize) -> usize {
+    // Local Vortex scans currently issue roughly 30-45 object-store requests per
+    // opened file. Use a conservative pre-read estimate so request limits are real
+    // guardrails instead of a segment-count proxy.
+    const ESTIMATED_REQUESTS_PER_VORTEX_FILE: usize = 48;
+    candidate_segments.saturating_mul(ESTIMATED_REQUESTS_PER_VORTEX_FILE)
 }
 
 pub(crate) async fn load_deleted_run_keys(

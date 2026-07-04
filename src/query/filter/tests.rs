@@ -131,3 +131,13 @@ fn anchored_negative_values_stay_on_the_same_index_row() {
     assert!(compiled.predicate_sql.contains("key = 'quality'"));
     assert!(compiled.predicate_sql.contains("score_number <> 0"));
 }
+
+#[test]
+fn contains_escapes_like_wildcards() {
+    let compiled = FilterExpr::parse(r#"contains(name, "100%_ok\\done")"#)
+        .and_then(|expr| expr.compile_run_head_filter("run_heads"))
+        .expect("compile contains wildcard filter");
+
+    assert!(compiled.predicate_sql.contains("LIKE '%100\\%\\_ok"));
+    assert!(compiled.predicate_sql.contains("\\\\done%' ESCAPE '\\'"));
+}

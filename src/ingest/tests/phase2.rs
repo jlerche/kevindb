@@ -175,7 +175,7 @@ async fn planner_rejects_queries_that_exceed_fanout_limits() {
         .expect_err("object-store request limit should reject");
     assert!(
         err.to_string()
-            .contains("estimated object-store requests 1 exceed limit 0")
+            .contains("estimated object-store requests 48 exceed limit 0")
     );
 
     let mut bytes_limited = RunQuery::new("demo");
@@ -242,7 +242,7 @@ async fn filters_use_scalar_indexes_feedback_and_projection() {
     );
     query.include_payload = false;
     query.limits.max_candidate_segments = Some(1);
-    query.limits.max_estimated_object_store_requests = Some(1);
+    query.limits.max_estimated_object_store_requests = Some(48);
 
     let result = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store)
         .list_runs_with_diagnostics(query)
@@ -254,7 +254,7 @@ async fn filters_use_scalar_indexes_feedback_and_projection() {
     assert_eq!(result.runs[0].attributes_json, "{}");
     assert_eq!(result.diagnostics.candidate_runs, 1);
     assert_eq!(result.diagnostics.candidate_segments, 1);
-    assert_eq!(result.diagnostics.estimated_object_store_requests, 1);
+    assert_eq!(result.diagnostics.estimated_object_store_requests, 48);
     assert!(result.diagnostics.candidate_bytes > 0);
 
     mockgres.stop().await.expect("stop mockgres");

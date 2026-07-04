@@ -452,15 +452,21 @@ fn compile_contains(
                 _ => unreachable!(),
             };
             format!(
-                "LOWER({run_alias}.{column}) LIKE {}",
-                sql_string_literal(&format!("%{}%", value.to_ascii_lowercase()))
+                "LOWER({run_alias}.{column}) LIKE {} ESCAPE '\\'",
+                sql_string_literal(&format!(
+                    "%{}%",
+                    escape_like_pattern(&value.to_ascii_lowercase())
+                ))
             )
         }
         FilterField::MetadataValue => metadata_exists_sql(
             run_alias,
             &[format!(
-                "LOWER(value) LIKE {}",
-                sql_string_literal(&format!("%{}%", value.to_ascii_lowercase()))
+                "LOWER(value) LIKE {} ESCAPE '\\'",
+                sql_string_literal(&format!(
+                    "%{}%",
+                    escape_like_pattern(&value.to_ascii_lowercase())
+                ))
             )],
         ),
         _ => {
@@ -829,6 +835,17 @@ fn sql_string_list(values: &[String]) -> String {
 
 fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 #[cfg(test)]

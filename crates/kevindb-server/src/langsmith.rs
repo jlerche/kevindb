@@ -8,7 +8,6 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use chrono::{DateTime, SecondsFormat, Utc};
 use kevindb::otlp::{RunEventKind, SpanRecord};
-use kevindb::query::filter::FilterExpr;
 use kevindb::query::{
     RunProjection, RunQuery, RunQueryDiagnostics, RunQueryLimits, RunSummary, generated_run_id,
 };
@@ -20,8 +19,10 @@ use uuid::Uuid;
 use crate::{ApiError, ServerState};
 
 mod feedback;
+mod filter;
 pub use feedback::FeedbackResponse;
 pub(crate) use feedback::{create_feedback, list_feedback, list_run_feedback, read_feedback};
+use filter::parse_filter;
 
 impl ServerState {
     async fn list_project_names(
@@ -239,8 +240,8 @@ pub(super) async fn query_runs(
         offset,
         retention_cutoff_unix_nano: None,
         include_deleted: false,
-        filter: parse_filter(request.filter.as_deref(), "filter")?,
-        trace_filter: parse_filter(request.trace_filter.as_deref(), "trace_filter")?,
+        filter: parse_filter(request.filter.as_ref(), "filter")?,
+        trace_filter: parse_filter(request.trace_filter.as_ref(), "trace_filter")?,
         include_payload,
         newest_first: true,
         limits: RunQueryLimits {
@@ -623,9 +624,9 @@ pub struct RunsQueryRequest {
     #[serde(default)]
     pub cursor: Option<String>,
     #[serde(default)]
-    pub filter: Option<String>,
+    pub filter: Option<Value>,
     #[serde(default)]
-    pub trace_filter: Option<String>,
+    pub trace_filter: Option<Value>,
     #[serde(default)]
     pub tree_filter: Option<String>,
     #[serde(default)]
@@ -859,14 +860,6 @@ fn runs_with_children(mut runs: Vec<RunResponse>) -> Vec<RunResponse> {
     }
 
     runs
-}
-
-fn parse_filter(value: Option<&str>, field: &str) -> Result<Option<FilterExpr>, ApiError> {
-    value
-        .filter(|value| !value.trim().is_empty())
-        .map(FilterExpr::parse)
-        .transpose()
-        .map_err(|error| ApiError::bad_request(format!("{field}: {error}")))
 }
 
 fn query_error(error: anyhow::Error) -> ApiError {

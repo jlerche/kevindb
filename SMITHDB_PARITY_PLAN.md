@@ -235,7 +235,9 @@ Tasks:
 
 Subtasks:
 
-- [x] Add migration and backfill behavior for existing local data.
+- [x] Use a current-only development schema for row locators; existing legacy
+  local data must be reset instead of silently backfilled with incomplete
+  generated run IDs.
 - [x] Add object-store missing-object detection around row-locator reads.
 - [x] Add unit tests for stale locators after compaction.
 
@@ -960,72 +962,21 @@ Exit criteria:
 
 Goal: make the system credible as a deployable database, not only a local demo.
 
-### [ ] Epic 10.1: Reliability
-
 Tasks:
 
-- [ ] Add crash/restart tests around:
-  - object write succeeds, metadata fails
-  - metadata commit succeeds, ack fails
-  - compaction partially succeeds
-  - delete vector written, object cleanup fails
-- [ ] Add orphan object reconciliation.
-- [ ] Add migration compatibility tests.
-- [ ] Add backup/restore notes for Postgres metastore plus object storage.
+- [ ] Add crash/restart tests for ingest, compaction, delete vectors, and ack
+  failure boundaries.
+- [ ] Add orphan object reconciliation plus backup/restore notes for the
+  Postgres metastore and object storage.
+- [ ] Emit production metrics for ingest, compaction, query planning/execution,
+  object-store I/O, fanout, and cache behavior.
+- [ ] Add structured query-plan tracing, slow query logging, production config,
+  Docker/local compose, S3 support, and self-hosted deployment docs.
 
 Exit criteria:
 
-- [ ] Known failure modes are documented and tested.
-
-### [ ] Epic 10.2: Observability
-
-Tasks:
-
-- [ ] Emit metrics:
-  - ingest ack latency
-  - flush latency
-  - segment bytes written
-  - compaction throughput
-  - query planner time
-  - DataFusion execution time
-  - object-store requests
-  - object-store bytes read
-  - query fanout
-  - cache hit rate
-- [ ] Add structured tracing for query plans.
-- [ ] Add slow query logging.
-
-Exit criteria:
-
-- [ ] Users can explain why a query is slow.
-
-### [ ] Epic 10.3: Packaging
-
-Tasks:
-
-- [ ] Add production config files.
-- [ ] Add Docker image.
-- [ ] Add local compose setup with Postgres-compatible storage and object store.
-- [ ] Add S3 object store support.
-- [ ] Add self-hosted deployment docs.
-
-Exit criteria:
-
-- [ ] A user can run KevinDB locally and in a basic self-hosted environment.
-
-## Recommended Implementation Order
-
-1. Phase 0: measurement and performance guardrails.
-2. Phase 1: row locators and direct random access.
-3. Phase 2: filter AST, scalar metadata filtering, fanout planner.
-4. Phase 3: tree-aware query indexes.
-5. Phase 4: thread reconstruction.
-6. Phase 5: aggregations and rollups.
-7. Phase 7: production compaction/retention lifecycle.
-8. Phase 9: API parity expansion in parallel with phases 2-5.
-9. Phase 6: full-text and JSON filtering once the planner, compaction, and
-   benchmark infrastructure are mature.
-10. Phase 8 and Phase 10: distributed execution and release hardening.
+- [ ] Known failure modes are documented and tested, users can explain slow
+  queries, and KevinDB can run locally and in a basic self-hosted environment.
 
 ## Explicit Non-Goals Until Phase 6
 
@@ -1034,14 +985,3 @@ full-text search, Postgres JSONB storage for large `inputs` or `outputs`,
 production token tables, phrase search without positions, JSON path/value
 search without path-aware postings, or index formats that cannot be compacted
 with Vortex row-order changes.
-
-## Near-Term Next Slices
-
-Recommended next engineering slices:
-
-1. Add a LangSmith filter AST and reject unsupported search/JSON predicates
-   explicitly.
-2. Add scalar metadata and feedback filters with fanout diagnostics.
-3. Add fanout-aware planning limits for high-cardinality filters.
-4. Add tree index metadata for root/descendant filters.
-5. Add thread materialization for bounded thread trace listing.

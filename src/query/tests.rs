@@ -260,7 +260,7 @@ fn datafusion_sql_pushes_projection_and_source_predicates() {
     query.start_time_min_unix_nano = Some(10);
     query.start_time_max_unix_nano = Some(20);
 
-    let source_where = run_source_pushdown_where_sql(&query);
+    let source_where = run_source_pushdown_where_sql(&query, None);
     assert_eq!(
         source_where,
         "project_name IN ('demo', 'other''s') AND trace_id = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' AND run_type = 'llm' AND start_time_unix_nano >= 10 AND start_time_unix_nano <= 20"
@@ -273,11 +273,41 @@ fn datafusion_sql_pushes_projection_and_source_predicates() {
         ],
         &query,
         false,
+        None,
     );
 
     assert_eq!(sql.matches(&format!("WHERE {source_where}")).count(), 2);
     assert!(sql.contains("'{}' AS attributes_json"));
     assert!(sql.contains("WHERE run_version = 1 AND project_name IN ('demo', 'other''s')"));
+}
+
+#[test]
+fn datafusion_sql_pushes_candidate_run_keys_to_sources() {
+    let query = RunQuery::new("demo");
+    let candidate_run_keys = std::collections::HashSet::from([
+        RunKey {
+            project_name: "demo".to_owned(),
+            trace_id: TRACE_ID.to_owned(),
+            span_id: "child".to_owned(),
+        },
+        RunKey {
+            project_name: "demo".to_owned(),
+            trace_id: TRACE_ID.to_owned(),
+            span_id: "root".to_owned(),
+        },
+    ]);
+
+    let sql = run_head_datafusion_sql(
+        &[current_segment_source(
+            "projects/demo/trace-segments/a.vortex".to_owned(),
+        )],
+        &query,
+        false,
+        Some(&candidate_run_keys),
+    );
+
+    assert!(sql.contains("span_id IN ('child', 'root')"));
+    assert!(sql.contains("trace_id = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"));
 }
 
 fn run(

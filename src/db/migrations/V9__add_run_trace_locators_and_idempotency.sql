@@ -53,39 +53,3 @@ CREATE TABLE IF NOT EXISTS trace_locators (
 
 CREATE INDEX IF NOT EXISTS ix_trace_locators_trace
     ON trace_locators(project_name, trace_id, trace_segment_id);
-
-INSERT INTO run_locators(
-    project_name, run_id, generated_run_id, trace_id, span_id,
-    trace_segment_id, row_index, event_type, event_time_unix_nano, run_event_id
-)
-SELECT
-    project_name,
-    run_id,
-    generated_run_id,
-    trace_id,
-    span_id,
-    last_trace_segment_id,
-    last_row_index,
-    last_event_type,
-    last_event_time_unix_nano,
-    last_run_event_id
-FROM run_heads
-ON CONFLICT (project_name, trace_id, span_id)
-DO NOTHING;
-
-INSERT INTO trace_locators(
-    project_name, trace_id, span_id, trace_segment_id, row_index,
-    event_type, event_time_unix_nano, run_event_id
-)
-SELECT
-    project_name,
-    trace_id,
-    span_id,
-    last_trace_segment_id,
-    last_row_index,
-    last_event_type,
-    last_event_time_unix_nano,
-    last_run_event_id
-FROM run_heads
-ON CONFLICT (project_name, trace_id, span_id)
-DO NOTHING;
