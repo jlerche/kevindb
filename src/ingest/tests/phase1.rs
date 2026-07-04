@@ -241,3 +241,148 @@ async fn event_ordering_preserves_streaming_updates_errors_and_late_arrivals() {
 
     mockgres.stop().await.expect("stop mockgres");
 }
+
+#[tokio::test]
+async fn trace_load_uses_row_index_for_same_time_updates_and_supports_projections() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 64,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+
+    let mut first = sample_record("1111111111111111", 10);
+    first.end_time_unix_nano = 0;
+    first.status_code = 0;
+    first.event_kind = RunEventKind::Update;
+    first.attributes_json = r#"{"stage":"first"}"#.to_owned();
+    let mut second = first.clone();
+    second.attributes_json = r#"{"stage":"second"}"#.to_owned();
+
+    ingestor
+        .ingest_records(vec![first, second])
+        .await
+        .expect("ingest same-time updates");
+
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store);
+    let trace_runs = query_engine
+        .list_runs_in_trace("demo", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .await
+        .expect("load trace");
+    assert_eq!(trace_runs.len(), 1);
+    assert_eq!(trace_runs[0].attributes_json, r#"{"stage":"second"}"#);
+
+    let summary = query_engine
+        .load_run_by_id_with_projection("1111111111111111", RunProjection::Summary)
+        .await
+        .expect("load summary projection")
+        .run
+        .expect("summary run");
+    assert_eq!(summary.attributes_json, "{}");
+
+    let full = query_engine
+        .load_run_by_id_with_projection("1111111111111111", RunProjection::FullPayload)
+        .await
+        .expect("load full projection")
+        .run
+        .expect("full run");
+    assert_eq!(full.attributes_json, r#"{"stage":"second"}"#);
+
+    let events = query_engine
+        .load_run_by_id_with_projection("1111111111111111", RunProjection::Events)
+        .await
+        .expect("load events projection");
+    assert_eq!(
+        events
+            .events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["update", "update"]
+    );
+    assert_eq!(
+        events.run.expect("events projection run").attributes_json,
+        "{}"
+    );
+
+    let trace_events = query_engine
+        .load_trace_with_projection(
+            "demo",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            RunProjection::Events,
+        )
+        .await
+        .expect("load trace events projection");
+    assert_eq!(trace_events.events.len(), 2);
+    assert_eq!(trace_events.runs[0].attributes_json, "{}");
+
+    mockgres.stop().await.expect("stop mockgres");
+}
+
+#[tokio::test]
+async fn duplicate_conflict_after_object_write_rolls_back_visible_segment() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        Arc::new(InMemory::new()),
+        IngestConfig {
+            max_spans_per_segment: 1,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+    let record = sample_record("1111111111111111", 10);
+
+    let first = ingestor
+        .ingest_records(vec![record.clone()])
+        .await
+        .expect("first ingest");
+    assert_eq!(first.flushed_segments, 1);
+
+    let conflict = ingestor
+        .persist_segment(&record_partition_key(&record), vec![record])
+        .await
+        .expect("persist duplicate segment");
+    assert!(matches!(
+        conflict,
+        PersistSegmentResult::DuplicateConflict(_)
+    ));
+
+    let (client, connection) = tokio_postgres::connect(mockgres.postgres_url(), NoTls)
+        .await
+        .expect("connect postgres");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let segment_count: i64 = client
+        .query_one("SELECT count(*) FROM trace_segments", &[])
+        .await
+        .expect("count trace segments")
+        .get(0);
+    let event_count: i64 = client
+        .query_one("SELECT count(*) FROM run_events", &[])
+        .await
+        .expect("count run events")
+        .get(0);
+    let span_count: i64 = client
+        .query_one("SELECT count(*) FROM trace_segment_spans", &[])
+        .await
+        .expect("count trace segment spans")
+        .get(0);
+    assert_eq!(segment_count, 1);
+    assert_eq!(event_count, 1);
+    assert_eq!(span_count, 1);
+
+    mockgres.stop().await.expect("stop mockgres");
+}

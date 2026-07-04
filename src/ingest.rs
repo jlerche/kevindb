@@ -300,28 +300,35 @@ impl Ingestor {
         partition: &PartitionKey,
         records: Vec<SpanRecord>,
     ) -> std::result::Result<Vec<FlushReceipt>, PersistError> {
-        let mut remaining_records = self
-            .filter_duplicate_records(records)
-            .await
-            .map_err(|(records, error)| PersistError { records, error })?;
+        let mut remaining_records = records;
         let mut receipts = Vec::new();
 
-        while !remaining_records.is_empty() {
+        loop {
+            remaining_records = self
+                .filter_duplicate_records(remaining_records)
+                .await
+                .map_err(|(records, error)| PersistError { records, error })?;
+            if remaining_records.is_empty() {
+                return Ok(receipts);
+            }
+
             let segment_span_count = self.max_spans_per_segment().min(remaining_records.len());
             let segment_records = remaining_records
                 .drain(..segment_span_count)
                 .collect::<Vec<_>>();
 
             match self.persist_segment(partition, segment_records).await {
-                Ok(receipt) => receipts.push(receipt),
+                Ok(PersistSegmentResult::Written(receipt)) => receipts.push(receipt),
+                Ok(PersistSegmentResult::DuplicateConflict(mut records)) => {
+                    records.append(&mut remaining_records);
+                    remaining_records = records;
+                }
                 Err(mut error) => {
                     error.records.append(&mut remaining_records);
                     return Err(error);
                 }
             }
         }
-
-        Ok(receipts)
     }
 
     async fn filter_duplicate_records(
@@ -378,7 +385,7 @@ impl Ingestor {
         &self,
         partition: &PartitionKey,
         records: Vec<SpanRecord>,
-    ) -> std::result::Result<FlushReceipt, PersistError> {
+    ) -> std::result::Result<PersistSegmentResult, PersistError> {
         if let Err(error) = validate_partition_records(partition, &records) {
             return Err(PersistError { records, error });
         }
@@ -424,7 +431,7 @@ impl Ingestor {
                 records: records.clone(),
                 error,
             })?;
-        persist_metadata(
+        let metadata_inserted = persist_metadata(
             &tx,
             partition,
             &segment_uri,
@@ -437,6 +444,16 @@ impl Ingestor {
             records: records.clone(),
             error,
         })?;
+        if !metadata_inserted {
+            tx.rollback()
+                .await
+                .context("rollback duplicate ingest metadata transaction")
+                .map_err(|error| PersistError {
+                    records: records.clone(),
+                    error,
+                })?;
+            return Ok(PersistSegmentResult::DuplicateConflict(records));
+        }
         tx.commit()
             .await
             .context("commit ingest metadata transaction")
@@ -445,11 +462,11 @@ impl Ingestor {
                 error,
             })?;
 
-        Ok(FlushReceipt {
+        Ok(PersistSegmentResult::Written(FlushReceipt {
             segment_uri,
             span_count: records.len(),
             total_bytes: payload.len(),
-        })
+        }))
     }
 
     fn max_spans_per_segment(&self) -> usize {
@@ -512,9 +529,16 @@ impl Ingestor {
     }
 }
 
+#[derive(Debug)]
 struct PersistError {
     records: Vec<SpanRecord>,
     error: anyhow::Error,
+}
+
+#[derive(Debug)]
+enum PersistSegmentResult {
+    Written(FlushReceipt),
+    DuplicateConflict(Vec<SpanRecord>),
 }
 
 async fn wait_for_flush_receivers(receivers: Vec<FlushReceiver>) -> Result<Vec<FlushReceipt>> {
@@ -580,7 +604,7 @@ async fn persist_metadata(
     etag: &str,
     total_bytes: usize,
     records: &[SpanRecord],
-) -> Result<()> {
+) -> Result<bool> {
     let first = records
         .first()
         .ok_or_else(|| anyhow!("cannot persist empty segment"))?;
@@ -652,7 +676,7 @@ async fn persist_metadata(
             .await
             .context("insert run event")?;
         let Some(event_row) = event_row else {
-            continue;
+            return Ok(false);
         };
         let run_event_id: i64 = event_row.get(0);
         let generated_id =
@@ -824,7 +848,7 @@ async fn persist_metadata(
         .context("upsert trace locator")?;
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn status_from_record(record: &SpanRecord) -> String {

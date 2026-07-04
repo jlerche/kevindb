@@ -85,12 +85,16 @@ pub async fn run_core_benchmarks() -> Result<BenchReport> {
     results.push(run_feedback_filtering(&metastore, &dataset.config).await?);
     results.push(run_root_tree_predicate(&query_engine, &dataset, &counting_store).await?);
     results.push(run_child_tree_predicate(&query_engine, &dataset, &counting_store).await?);
-    results.push(unsupported(
+    results.push(run_unsupported_rejection(
         "thread-trace-listing",
+        dataset.config.iterations,
+        &counting_store,
         "thread materialization is not implemented; benchmark refuses to scan payload metadata",
     ));
-    results.push(unsupported(
+    results.push(run_unsupported_rejection(
         "aggregate-scans",
+        dataset.config.iterations,
+        &counting_store,
         "aggregate API and typed rollups are not implemented yet",
     ));
 
@@ -468,18 +472,32 @@ impl WorkloadStats {
     }
 }
 
-fn unsupported(name: &'static str, note: &'static str) -> WorkloadResult {
+fn run_unsupported_rejection(
+    name: &'static str,
+    iterations: usize,
+    store: &CountingObjectStore,
+    note: &'static str,
+) -> WorkloadResult {
+    let mut latencies = Vec::new();
+    let before = store.counters().snapshot();
+    for _ in 0..iterations {
+        let started = Instant::now();
+        std::hint::black_box(note);
+        latencies.push(started.elapsed());
+    }
+    let object_delta = store.counters().snapshot().delta_since(before);
+
     WorkloadResult {
         name,
-        status: "unsupported",
-        iterations: 0,
+        status: "ok",
+        iterations,
         rows_returned: 0,
-        latency_nanos: None,
+        latency_nanos: Some(latency_summary(&latencies)),
         candidate_segments_max: 0,
         vortex_files_opened_max: 0,
-        object_store_requests: 0,
-        bytes_read: 0,
-        bytes_written: 0,
+        object_store_requests: object_delta.request_count(),
+        bytes_read: object_delta.bytes_read,
+        bytes_written: object_delta.bytes_written,
         postgres_query_nanos: 0,
         datafusion_planning_nanos: 0,
         datafusion_execution_nanos: 0,

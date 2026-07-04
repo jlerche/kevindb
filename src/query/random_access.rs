@@ -9,15 +9,42 @@ use tokio_postgres::{NoTls, Row};
 
 use super::{
     DataFusionQueryTiming, QueryEngine, RunKey, RunQuery, RunQueryDiagnostics, RunQueryResult,
-    RunSummary, load_deleted_run_keys, run_matches_retention_filter, run_summaries_from_batches,
-    segment_source_sql, sql_object_store_path, sql_string_literal, vortex_session_context,
+    RunSummary, SegmentSource, attributes_json_sql, load_deleted_run_keys,
+    query_segment_sources_with_datafusion_timed, run_matches_retention_filter,
+    run_summaries_from_batches, segment_source_sql, sql_object_store_path, sql_string_literal,
+    vortex_session_context,
 };
 use crate::segment::ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunLoadResult {
     pub run: Option<RunSummary>,
+    pub events: Vec<RunEventSummary>,
     pub diagnostics: RunQueryDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceLoadResult {
+    pub runs: Vec<RunSummary>,
+    pub events: Vec<RunEventSummary>,
+    pub diagnostics: RunQueryDiagnostics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunProjection {
+    Summary,
+    FullPayload,
+    Events,
+}
+
+impl RunProjection {
+    fn include_payload(self) -> bool {
+        matches!(self, Self::FullPayload)
+    }
+
+    fn include_events(self) -> bool {
+        matches!(self, Self::Events)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,9 +78,19 @@ impl QueryEngine {
     }
 
     pub async fn load_run_by_id_with_diagnostics(&self, run_id: &str) -> Result<RunLoadResult> {
+        self.load_run_by_id_with_projection(run_id, RunProjection::FullPayload)
+            .await
+    }
+
+    pub async fn load_run_by_id_with_projection(
+        &self,
+        run_id: &str,
+        projection: RunProjection,
+    ) -> Result<RunLoadResult> {
         if run_id.is_empty() {
             return Ok(RunLoadResult {
                 run: None,
+                events: Vec::new(),
                 diagnostics: RunQueryDiagnostics::default(),
             });
         }
@@ -62,6 +99,7 @@ impl QueryEngine {
         let Some(locator) = load_run_locator(&self.postgres_url, run_id, false).await? else {
             return Ok(RunLoadResult {
                 run: None,
+                events: Vec::new(),
                 diagnostics: RunQueryDiagnostics {
                     postgres_query_time: postgres_started.elapsed(),
                     ..RunQueryDiagnostics::default()
@@ -69,9 +107,18 @@ impl QueryEngine {
             });
         };
         let postgres_query_time = postgres_started.elapsed();
+        let events = if projection.include_events() {
+            load_run_events(&self.postgres_url, &locator).await?
+        } else {
+            Vec::new()
+        };
 
-        let (run, datafusion_timing) =
-            query_run_locator_segment(Arc::clone(&self.object_store), &locator).await?;
+        let (run, datafusion_timing) = query_run_locator_segment(
+            Arc::clone(&self.object_store),
+            &locator,
+            projection.include_payload(),
+        )
+        .await?;
         Ok(RunLoadResult {
             diagnostics: RunQueryDiagnostics {
                 candidate_segments: 1,
@@ -82,6 +129,7 @@ impl QueryEngine {
                 datafusion_execution_time: datafusion_timing.execution_time,
             },
             run,
+            events,
         })
     }
 
@@ -108,7 +156,8 @@ impl QueryEngine {
             return Ok(None);
         };
         let (run, _) =
-            query_run_locator_segment(Arc::clone(&self.object_store), &replayed_locator).await?;
+            query_run_locator_segment(Arc::clone(&self.object_store), &replayed_locator, true)
+                .await?;
         Ok(run)
     }
 
@@ -124,6 +173,21 @@ impl QueryEngine {
         project_name: &str,
         trace_id: &str,
     ) -> Result<RunQueryResult> {
+        let result = self
+            .load_trace_with_projection(project_name, trace_id, RunProjection::FullPayload)
+            .await?;
+        Ok(RunQueryResult {
+            runs: result.runs,
+            diagnostics: result.diagnostics,
+        })
+    }
+
+    pub async fn load_trace_with_projection(
+        &self,
+        project_name: &str,
+        trace_id: &str,
+        projection: RunProjection,
+    ) -> Result<TraceLoadResult> {
         let query = RunQuery {
             project_names: vec![project_name.to_owned()],
             trace_id: Some(trace_id.to_owned()),
@@ -141,17 +205,23 @@ impl QueryEngine {
         };
 
         let postgres_started = Instant::now();
-        let segment_uris = load_trace_segment_uris(&self.postgres_url, project_name, trace_id)
+        let segments = load_trace_segment_sources(&self.postgres_url, project_name, trace_id)
             .await
             .context("load trace locator segment uris")?;
         let deleted_runs = load_deleted_run_keys(&self.postgres_url, &query).await?;
         let postgres_query_time = postgres_started.elapsed();
-        let candidate_segments = segment_uris.len();
+        let candidate_segments = segments.len();
+        let events = if projection.include_events() {
+            load_trace_events(&self.postgres_url, project_name, trace_id).await?
+        } else {
+            Vec::new()
+        };
 
-        let (runs, datafusion_timing) = super::query_trace_segments_with_datafusion_timed(
+        let (runs, datafusion_timing) = query_segment_sources_with_datafusion_timed(
             Arc::clone(&self.object_store),
-            segment_uris,
+            segments,
             &query,
+            projection.include_payload(),
         )
         .await?;
         let runs = runs
@@ -160,7 +230,7 @@ impl QueryEngine {
             .filter(|run| run_matches_retention_filter(run, &query))
             .collect::<Vec<_>>();
 
-        Ok(RunQueryResult {
+        Ok(TraceLoadResult {
             diagnostics: RunQueryDiagnostics {
                 candidate_segments,
                 vortex_files_opened: candidate_segments,
@@ -170,6 +240,7 @@ impl QueryEngine {
                 datafusion_execution_time: datafusion_timing.execution_time,
             },
             runs,
+            events,
         })
     }
 }
@@ -250,9 +321,10 @@ fn run_locator_from_row(row: Row) -> RunLocator {
 async fn query_run_locator_segment(
     object_store: Arc<dyn ObjectStore>,
     locator: &RunLocator,
+    include_payload: bool,
 ) -> Result<(Option<RunSummary>, DataFusionQueryTiming)> {
     let context = vortex_session_context(Arc::clone(&object_store))?;
-    let sql = run_locator_datafusion_sql(locator);
+    let sql = run_locator_datafusion_sql(locator, include_payload);
     let result = collect_run_locator_query(context, &sql).await;
 
     match result {
@@ -300,7 +372,7 @@ async fn collect_run_locator_query(
     ))
 }
 
-fn run_locator_datafusion_sql(locator: &RunLocator) -> String {
+fn run_locator_datafusion_sql(locator: &RunLocator, include_payload: bool) -> String {
     let row_index_predicate = if locator.schema_version >= ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION {
         format!(" AND row_index = {}", locator.row_index)
     } else {
@@ -331,12 +403,19 @@ fn run_locator_datafusion_sql(locator: &RunLocator) -> String {
                     event_type,
                     event_time_unix_nano,
                     row_index,
-                    attributes_json
-                FROM {}",
-            sql_object_store_path(&locator.segment_uri)
+                    {attributes_json_sql}
+                FROM {path}",
+            attributes_json_sql = attributes_json_sql(include_payload),
+            path = sql_object_store_path(&locator.segment_uri)
         )
     } else {
-        segment_source_sql(&locator.segment_uri)
+        segment_source_sql(
+            &SegmentSource {
+                uri: locator.segment_uri.clone(),
+                schema_version: locator.schema_version,
+            },
+            include_payload,
+        )
     };
 
     format!(
@@ -349,7 +428,7 @@ fn run_locator_datafusion_sql(locator: &RunLocator) -> String {
                 *,
                 ROW_NUMBER() OVER (
                     PARTITION BY project_name, trace_id, span_id
-                    ORDER BY event_time_unix_nano DESC, end_time_unix_nano DESC, start_time_unix_nano DESC
+                    ORDER BY event_time_unix_nano DESC, end_time_unix_nano DESC, start_time_unix_nano DESC, row_index DESC
                 ) AS run_version
             FROM (
                 SELECT
@@ -369,6 +448,7 @@ fn run_locator_datafusion_sql(locator: &RunLocator) -> String {
                     start_time_unix_nano,
                     end_time_unix_nano,
                     event_time_unix_nano,
+                    row_index,
                     parent_span_id IS NULL AS is_root,
                     attributes_json
                 FROM ({source_sql}) AS segment_spans
@@ -385,11 +465,11 @@ fn run_locator_datafusion_sql(locator: &RunLocator) -> String {
     )
 }
 
-async fn load_trace_segment_uris(
+async fn load_trace_segment_sources(
     postgres_url: &str,
     project_name: &str,
     trace_id: &str,
-) -> Result<Vec<String>> {
+) -> Result<Vec<SegmentSource>> {
     let (client, connection) = tokio_postgres::connect(postgres_url, NoTls)
         .await
         .context("connect postgres for trace locator lookup")?;
@@ -401,7 +481,7 @@ async fn load_trace_segment_uris(
 
     let rows = client
         .query(
-            "SELECT DISTINCT trace_segments.uri
+            "SELECT DISTINCT trace_segments.uri, trace_segments.schema_version
             FROM trace_locators
             INNER JOIN trace_segments
                 ON trace_segments.id = trace_locators.trace_segment_id
@@ -413,16 +493,26 @@ async fn load_trace_segment_uris(
                 AND trace_locators.trace_id = $2
                 AND trace_segments.compacted_at IS NULL
                 AND run_deletions.span_id IS NULL
-            ORDER BY trace_segments.uri",
+            ORDER BY trace_segments.uri, trace_segments.schema_version",
             &[&project_name, &trace_id],
         )
         .await
         .context("load trace locator segment uris")?;
 
-    let mut uris = rows.into_iter().map(|row| row.get(0)).collect::<Vec<_>>();
-    uris.sort();
-    uris.dedup();
-    Ok(uris)
+    let mut segments = rows
+        .into_iter()
+        .map(|row| SegmentSource {
+            uri: row.get(0),
+            schema_version: row.get(1),
+        })
+        .collect::<Vec<_>>();
+    segments.sort_by(|left, right| {
+        left.uri
+            .cmp(&right.uri)
+            .then(left.schema_version.cmp(&right.schema_version))
+    });
+    segments.dedup();
+    Ok(segments)
 }
 
 async fn load_run_events(postgres_url: &str, locator: &RunLocator) -> Result<Vec<RunEventSummary>> {
@@ -480,6 +570,67 @@ async fn load_run_events(postgres_url: &str, locator: &RunLocator) -> Result<Vec
             }
         })
         .collect())
+}
+
+async fn load_trace_events(
+    postgres_url: &str,
+    project_name: &str,
+    trace_id: &str,
+) -> Result<Vec<RunEventSummary>> {
+    let (client, connection) = tokio_postgres::connect(postgres_url, NoTls)
+        .await
+        .context("connect postgres for trace event listing")?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "postgres trace event listing connection failed");
+        }
+    });
+
+    let rows = client
+        .query(
+            "SELECT
+                run_events.project_name,
+                run_events.run_id,
+                run_locators.generated_run_id,
+                run_events.trace_id,
+                run_events.span_id,
+                run_events.event_type,
+                run_events.event_time_unix_nano,
+                trace_segments.uri,
+                run_events.row_index
+            FROM run_events
+            INNER JOIN trace_segments
+                ON trace_segments.id = run_events.trace_segment_id
+            INNER JOIN run_locators
+                ON run_locators.project_name = run_events.project_name
+                AND run_locators.trace_id = run_events.trace_id
+                AND run_locators.span_id = run_events.span_id
+            WHERE run_events.project_name = $1
+                AND run_events.trace_id = $2
+            ORDER BY
+                run_events.event_time_unix_nano ASC,
+                run_events.id ASC",
+            &[&project_name, &trace_id],
+        )
+        .await
+        .context("load trace events")?;
+
+    Ok(rows.into_iter().map(run_event_summary_from_row).collect())
+}
+
+fn run_event_summary_from_row(row: Row) -> RunEventSummary {
+    let run_id = row.get::<_, String>(1);
+    RunEventSummary {
+        project_name: row.get(0),
+        run_id: (!run_id.is_empty()).then_some(run_id),
+        generated_run_id: row.get(2),
+        trace_id: row.get(3),
+        span_id: row.get(4),
+        event_type: row.get(5),
+        event_time_unix_nano: row.get(6),
+        segment_uri: row.get(7),
+        row_index: row.get(8),
+    }
 }
 
 async fn load_latest_event_locator(
@@ -550,16 +701,19 @@ mod tests {
 
     #[test]
     fn schema_v2_run_locator_sql_filters_by_row_index() {
-        let sql = run_locator_datafusion_sql(&RunLocator {
-            segment_uri: "projects/demo/trace-segments/test.vortex".to_owned(),
-            project_name: "demo".to_owned(),
-            stored_run_id: "1111111111111111".to_owned(),
-            generated_run_id: "generated".to_owned(),
-            trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-            span_id: "1111111111111111".to_owned(),
-            row_index: 7,
-            schema_version: ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION,
-        });
+        let sql = run_locator_datafusion_sql(
+            &RunLocator {
+                segment_uri: "projects/demo/trace-segments/test.vortex".to_owned(),
+                project_name: "demo".to_owned(),
+                stored_run_id: "1111111111111111".to_owned(),
+                generated_run_id: "generated".to_owned(),
+                trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                span_id: "1111111111111111".to_owned(),
+                row_index: 7,
+                schema_version: ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION,
+            },
+            true,
+        );
 
         assert!(sql.contains("row_index = 7"));
         assert!(sql.contains("AND run_id = '1111111111111111'"));
@@ -567,32 +721,38 @@ mod tests {
 
     #[test]
     fn generated_run_locator_sql_filters_by_empty_run_id_and_span_id() {
-        let sql = run_locator_datafusion_sql(&RunLocator {
-            segment_uri: "projects/demo/trace-segments/test.vortex".to_owned(),
-            project_name: "demo".to_owned(),
-            stored_run_id: String::new(),
-            generated_run_id: "generated".to_owned(),
-            trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-            span_id: "1111111111111111".to_owned(),
-            row_index: 7,
-            schema_version: ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION,
-        });
+        let sql = run_locator_datafusion_sql(
+            &RunLocator {
+                segment_uri: "projects/demo/trace-segments/test.vortex".to_owned(),
+                project_name: "demo".to_owned(),
+                stored_run_id: String::new(),
+                generated_run_id: "generated".to_owned(),
+                trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                span_id: "1111111111111111".to_owned(),
+                row_index: 7,
+                schema_version: ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION,
+            },
+            true,
+        );
 
         assert!(sql.contains("run_id = '' AND span_id = '1111111111111111'"));
     }
 
     #[test]
     fn legacy_run_locator_sql_does_not_filter_by_missing_row_index() {
-        let sql = run_locator_datafusion_sql(&RunLocator {
-            segment_uri: "projects/demo/trace-segments/test.vortex".to_owned(),
-            project_name: "demo".to_owned(),
-            stored_run_id: "1111111111111111".to_owned(),
-            generated_run_id: "generated".to_owned(),
-            trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-            span_id: "1111111111111111".to_owned(),
-            row_index: 7,
-            schema_version: 1,
-        });
+        let sql = run_locator_datafusion_sql(
+            &RunLocator {
+                segment_uri: "projects/demo/trace-segments/test.vortex".to_owned(),
+                project_name: "demo".to_owned(),
+                stored_run_id: "1111111111111111".to_owned(),
+                generated_run_id: "generated".to_owned(),
+                trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                span_id: "1111111111111111".to_owned(),
+                row_index: 7,
+                schema_version: 1,
+            },
+            true,
+        );
 
         assert!(!sql.contains("row_index = 7"));
     }

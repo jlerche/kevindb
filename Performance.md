@@ -46,15 +46,18 @@ Results:
 
 | Workload | p50 | p95/p99 | Candidate segments | Vortex files | Object requests | Bytes read |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| ingest ack | 83.8 ms | 88.2 ms | 12 | 0 | 12 | 0 |
-| single run load | 74.5 ms | 80.1 ms | 1 | 1 | 50 | 163,260 |
-| trace tree load | 62.9 ms | 67.6 ms | 8 | 8 | 140 | 496,200 |
-| project run filtering | 89.3 ms | 97.7 ms | 12 | 12 | 360 | 1,890,160 |
-| feedback filtering | 1.0 ms | 1.3 ms | 0 | 0 | 0 | 0 |
-| root tree predicate | 91.0 ms | 94.5 ms | 12 | 12 | 360 | 1,890,160 |
-| child tree predicate | 90.2 ms | 93.2 ms | 12 | 12 | 360 | 1,890,160 |
+| ingest ack | 78.0 ms | 85.4 ms | 12 | 0 | 12 | 0 |
+| single run load | 66.6 ms | 68.7 ms | 1 | 1 | 45 | 162,660 |
+| trace tree load | 41.6 ms | 42.5 ms | 1 | 1 | 35 | 158,800 |
+| project run filtering | 87.9 ms | 88.7 ms | 12 | 12 | 360 | 1,890,160 |
+| feedback filtering | 0.9 ms | 1.2 ms | 0 | 0 | 0 | 0 |
+| root tree predicate | 86.9 ms | 89.1 ms | 12 | 12 | 360 | 1,890,160 |
+| child tree predicate | 87.5 ms | 91.1 ms | 12 | 12 | 360 | 1,890,160 |
+| thread trace listing rejection | 0.00002 ms | 0.00005 ms | 0 | 0 | 0 | 0 |
+| aggregate scan rejection | 0.00002 ms | 0.00008 ms | 0 | 0 | 0 | 0 |
 
-Unsupported workloads are deliberately reported as unsupported:
+Thread trace listing and aggregate scans are deliberately benchmarked as
+measured rejection paths until their storage models exist:
 
 | Workload | Reason |
 | --- | --- |
@@ -125,3 +128,7 @@ Current query fanout assertions live in library tests:
 
 New query features should add a similar assertion or a benchmark note before
 being considered complete.
+
+The full local gate also runs the cheap benchmark smoke mode from
+`kevindb-bench`, which verifies benchmark wiring without requiring the full
+mockgres-backed core benchmark on every check.

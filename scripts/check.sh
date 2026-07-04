@@ -41,6 +41,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 echo "running tests"
 cargo test --workspace
 
+echo "running benchmark smoke"
+cargo run -p kevindb-bench --quiet
+
 echo "checking unit coverage"
 cargo llvm-cov --workspace --lib --fail-under-lines "$coverage_threshold" \
   --summary-only --json --output-path target/coverage-summary.json

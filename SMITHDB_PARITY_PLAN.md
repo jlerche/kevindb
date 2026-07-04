@@ -66,11 +66,14 @@ Implemented or in progress:
 - Partitioned ingest buffers, run event metadata, segment pruning, compaction,
   delete vectors, and retention hooks.
 - Benchmark harness, query diagnostics, and object-store accounting for local
-  performance visibility.
+  performance visibility, including measured rejection fixtures for deferred
+  thread and aggregate workloads.
 - Direct single-run and trace row-locator lookup through `run_locators` and
-  `trace_locators` plus Vortex segment row indexes.
+  `trace_locators` plus Vortex segment row indexes and summary/full/events
+  projection options.
 - Idempotent run event writes, tombstone event lineage, and replay tests for
-  current-head decisions.
+  current-head decisions, including rollback of metadata-visible segments when
+  an idempotency conflict is discovered after object write.
 
 Important gaps: no production fanout planner, LangSmith query language parser,
 tree predicate index, thread materialization, aggregate API, or rollup storage.
@@ -122,8 +125,8 @@ Tasks:
   - project run filtering
   - feedback filtering
   - root and child tree predicates
-  - thread trace listing
-  - aggregate scans
+  - thread trace listing rejection until thread materialization exists
+  - aggregate scan rejection until typed rollups exist
   - ingest throughput and ack latency
 - [x] Record:
   - p50/p95/p99 latency

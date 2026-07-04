@@ -414,54 +414,11 @@ impl ServerState {
     }
 
     async fn load_run_summary_by_id(&self, run_id: &str) -> Result<Option<RunSummary>, ApiError> {
-        if let Some(run) = self
+        Ok(self
             .query_engine()
             .load_run_by_id(run_id)
             .await
-            .context("load run summary by id")?
-        {
-            return Ok(Some(run));
-        }
-
-        self.load_generated_run_summary_by_id(run_id).await
-    }
-
-    async fn load_generated_run_summary_by_id(
-        &self,
-        run_id: &str,
-    ) -> Result<Option<RunSummary>, ApiError> {
-        let (client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
-            .await
-            .context("connect postgres for generated run lookup")?;
-        tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                tracing::warn!(error = %err, "postgres generated run lookup connection failed");
-            }
-        });
-
-        let scopes = client
-            .query(
-                "SELECT DISTINCT project_name, trace_id FROM run_heads ORDER BY project_name, trace_id",
-                &[],
-            )
-            .await
-            .context("load run lookup scopes")?;
-
-        for scope in scopes {
-            let project_name: String = scope.get(0);
-            let trace_id: String = scope.get(1);
-            let runs = self
-                .query_engine()
-                .list_runs_in_trace(&project_name, &trace_id)
-                .await
-                .context("load generated run lookup trace")?;
-
-            if let Some(run) = runs.into_iter().find(|run| response_run_id(run) == run_id) {
-                return Ok(Some(run));
-            }
-        }
-
-        Ok(None)
+            .context("load run summary by id")?)
     }
 
     async fn load_run_payload(&self, run_id: &str) -> Result<LangSmithPayload, ApiError> {
@@ -775,12 +732,6 @@ fn runs_with_children(mut runs: Vec<RunResponse>) -> Vec<RunResponse> {
     }
 
     runs
-}
-
-fn response_run_id(run: &RunSummary) -> String {
-    run.run_id
-        .clone()
-        .unwrap_or_else(|| generated_run_id(&run.project_name, &run.trace_id, &run.span_id))
 }
 
 fn tenant_uuid() -> Uuid {

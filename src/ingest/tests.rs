@@ -12,7 +12,7 @@ use tokio::time::{sleep, timeout};
 
 use super::*;
 use crate::db::run_migrations;
-use crate::query::{QueryEngine, RunQuery, generated_run_id};
+use crate::query::{QueryEngine, RunProjection, RunQuery, generated_run_id};
 
 mod phase1;
 

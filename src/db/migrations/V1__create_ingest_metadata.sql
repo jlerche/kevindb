@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS trace_segment_spans (
     status_code INTEGER NOT NULL,
     row_index BIGINT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(project_name, trace_id, span_id, trace_segment_id)
+    UNIQUE(project_name, trace_id, span_id, trace_segment_id, row_index)
 );
 
 CREATE INDEX IF NOT EXISTS ix_trace_segment_spans_trace

@@ -3,8 +3,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch};
-use arrow_array::{StringArray, StringViewArray, cast::AsArray};
 use datafusion::common::GetExt;
 use datafusion::datasource::provider::DefaultTableFactory;
 use datafusion::execution::SessionStateBuilder;
@@ -16,10 +14,13 @@ use uuid::Uuid;
 use vortex_datafusion::VortexFormatFactory;
 
 use crate::otlp::RunEventKind;
+use crate::segment::ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION;
 
 mod random_access;
+mod rows;
 mod tree;
-pub use random_access::{RunEventSummary, RunLoadResult};
+pub use random_access::{RunEventSummary, RunLoadResult, RunProjection, TraceLoadResult};
+pub(crate) use rows::run_summaries_from_batches;
 pub(crate) use tree::trace_tree_from_runs;
 pub use tree::{RunNode, TraceTree};
 
@@ -99,6 +100,12 @@ pub struct RunQueryDiagnostics {
     pub datafusion_execution_time: Duration,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SegmentSource {
+    uri: String,
+    schema_version: i64,
+}
+
 pub struct QueryEngine {
     postgres_url: String,
     object_store: Arc<dyn ObjectStore>,
@@ -121,18 +128,15 @@ impl QueryEngine {
     }
 
     pub async fn list_runs(&self, query: RunQuery) -> Result<Vec<RunSummary>> {
-        let segment_uris = load_run_query_segment_uris(&self.postgres_url, &query).await?;
+        let segments = load_run_query_segment_sources(&self.postgres_url, &query).await?;
         let deleted_runs = if query.include_deleted {
             HashSet::new()
         } else {
             load_deleted_run_keys(&self.postgres_url, &query).await?
         };
-        let runs = query_trace_segments_with_datafusion(
-            Arc::clone(&self.object_store),
-            segment_uris,
-            &query,
-        )
-        .await?;
+        let runs =
+            query_segment_sources_with_datafusion(Arc::clone(&self.object_store), segments, &query)
+                .await?;
         Ok(runs
             .into_iter()
             .filter(|run| !deleted_runs.contains(&RunKey::from(run)))
@@ -142,19 +146,20 @@ impl QueryEngine {
 
     pub async fn list_runs_with_diagnostics(&self, query: RunQuery) -> Result<RunQueryResult> {
         let postgres_started = Instant::now();
-        let segment_uris = load_run_query_segment_uris(&self.postgres_url, &query).await?;
+        let segments = load_run_query_segment_sources(&self.postgres_url, &query).await?;
         let deleted_runs = if query.include_deleted {
             HashSet::new()
         } else {
             load_deleted_run_keys(&self.postgres_url, &query).await?
         };
         let postgres_query_time = postgres_started.elapsed();
-        let candidate_segments = segment_uris.len();
+        let candidate_segments = segments.len();
 
-        let (runs, datafusion_timing) = query_trace_segments_with_datafusion_timed(
+        let (runs, datafusion_timing) = query_segment_sources_with_datafusion_timed(
             Arc::clone(&self.object_store),
-            segment_uris,
+            segments,
             &query,
+            true,
         )
         .await?;
         let runs = runs
@@ -305,7 +310,10 @@ impl From<&RunSummary> for RunKey {
     }
 }
 
-async fn load_run_query_segment_uris(postgres_url: &str, query: &RunQuery) -> Result<Vec<String>> {
+async fn load_run_query_segment_sources(
+    postgres_url: &str,
+    query: &RunQuery,
+) -> Result<Vec<SegmentSource>> {
     if query.project_names.is_empty() {
         return Ok(Vec::new());
     }
@@ -323,10 +331,20 @@ async fn load_run_query_segment_uris(postgres_url: &str, query: &RunQuery) -> Re
         .query(run_candidate_segments_sql(query).as_str(), &[])
         .await
         .context("load run query segment uris")?;
-    let mut uris = rows.into_iter().map(|row| row.get(0)).collect::<Vec<_>>();
-    uris.sort();
-    uris.dedup();
-    Ok(uris)
+    let mut segments = rows
+        .into_iter()
+        .map(|row| SegmentSource {
+            uri: row.get(0),
+            schema_version: row.get(1),
+        })
+        .collect::<Vec<_>>();
+    segments.sort_by(|left, right| {
+        left.uri
+            .cmp(&right.uri)
+            .then(left.schema_version.cmp(&right.schema_version))
+    });
+    segments.dedup();
+    Ok(segments)
 }
 
 fn run_candidate_segments_sql(query: &RunQuery) -> String {
@@ -339,9 +357,13 @@ fn run_candidate_segments_sql(query: &RunQuery) -> String {
         .unwrap_or_default();
 
     format!(
-        "SELECT DISTINCT candidate.uri
+        "SELECT DISTINCT candidate.uri, candidate.schema_version
         FROM (
-            SELECT trace_segments.uri, run_heads.start_time_unix_nano, run_heads.span_id
+            SELECT
+                trace_segments.uri,
+                trace_segments.schema_version,
+                run_heads.start_time_unix_nano,
+                run_heads.span_id
             FROM run_heads
             INNER JOIN trace_segments
                 ON trace_segments.id = run_heads.last_trace_segment_id
@@ -349,7 +371,7 @@ fn run_candidate_segments_sql(query: &RunQuery) -> String {
             WHERE {where_sql}
             ORDER BY run_heads.start_time_unix_nano ASC, run_heads.span_id ASC{candidate_limit}
         ) AS candidate
-        ORDER BY candidate.uri",
+        ORDER BY candidate.uri, candidate.schema_version",
         joins = run_head_join_sql(query),
     )
 }
@@ -615,17 +637,30 @@ async fn delete_run_in_tx(
     Ok(true)
 }
 
+#[cfg(test)]
 async fn query_trace_segments_with_datafusion(
     object_store: Arc<dyn ObjectStore>,
     segment_uris: Vec<String>,
     query: &RunQuery,
 ) -> Result<Vec<RunSummary>> {
-    if segment_uris.is_empty() {
+    let segments = segment_uris
+        .into_iter()
+        .map(current_segment_source)
+        .collect::<Vec<_>>();
+    query_segment_sources_with_datafusion(object_store, segments, query).await
+}
+
+pub(crate) async fn query_segment_sources_with_datafusion(
+    object_store: Arc<dyn ObjectStore>,
+    segments: Vec<SegmentSource>,
+    query: &RunQuery,
+) -> Result<Vec<RunSummary>> {
+    if segments.is_empty() {
         return Ok(Vec::new());
     }
 
     let context = vortex_session_context(object_store)?;
-    let sql = run_head_datafusion_sql(&segment_uris, query);
+    let sql = run_head_datafusion_sql(&segments, query, true);
     let dataframe = context
         .sql(&sql)
         .await
@@ -639,22 +674,23 @@ async fn query_trace_segments_with_datafusion(
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct DataFusionQueryTiming {
+pub(crate) struct DataFusionQueryTiming {
     planning_time: Duration,
     execution_time: Duration,
 }
 
-async fn query_trace_segments_with_datafusion_timed(
+pub(crate) async fn query_segment_sources_with_datafusion_timed(
     object_store: Arc<dyn ObjectStore>,
-    segment_uris: Vec<String>,
+    segments: Vec<SegmentSource>,
     query: &RunQuery,
+    include_payload: bool,
 ) -> Result<(Vec<RunSummary>, DataFusionQueryTiming)> {
-    if segment_uris.is_empty() {
+    if segments.is_empty() {
         return Ok((Vec::new(), DataFusionQueryTiming::default()));
     }
 
     let context = vortex_session_context(object_store)?;
-    let sql = run_head_datafusion_sql(&segment_uris, query);
+    let sql = run_head_datafusion_sql(&segments, query, include_payload);
 
     let planning_started = Instant::now();
     let dataframe = context
@@ -679,10 +715,14 @@ async fn query_trace_segments_with_datafusion_timed(
     ))
 }
 
-fn run_head_datafusion_sql(segment_uris: &[String], query: &RunQuery) -> String {
-    let source_sql = segment_uris
+fn run_head_datafusion_sql(
+    segments: &[SegmentSource],
+    query: &RunQuery,
+    include_payload: bool,
+) -> String {
+    let source_sql = segments
         .iter()
-        .map(|uri| segment_source_sql(uri))
+        .map(|segment| segment_source_sql(segment, include_payload))
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
     let where_sql = run_query_where_sql(query);
@@ -706,7 +746,7 @@ fn run_head_datafusion_sql(segment_uris: &[String], query: &RunQuery) -> String 
                 *,
                 ROW_NUMBER() OVER (
                     PARTITION BY project_name, trace_id, span_id
-                    ORDER BY event_time_unix_nano DESC, end_time_unix_nano DESC, start_time_unix_nano DESC
+                    ORDER BY event_time_unix_nano DESC, end_time_unix_nano DESC, start_time_unix_nano DESC, row_index DESC
                 ) AS run_version
             FROM (
                 SELECT
@@ -726,6 +766,7 @@ fn run_head_datafusion_sql(segment_uris: &[String], query: &RunQuery) -> String 
                     start_time_unix_nano,
                     end_time_unix_nano,
                     event_time_unix_nano,
+                    row_index,
                     parent_span_id IS NULL AS is_root,
                     attributes_json
                 FROM ({source_sql}) AS segment_spans
@@ -736,7 +777,22 @@ fn run_head_datafusion_sql(segment_uris: &[String], query: &RunQuery) -> String 
     )
 }
 
-fn segment_source_sql(uri: &str) -> String {
+#[cfg(test)]
+fn current_segment_source(uri: String) -> SegmentSource {
+    SegmentSource {
+        uri,
+        schema_version: ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION,
+    }
+}
+
+fn segment_source_sql(segment: &SegmentSource, include_payload: bool) -> String {
+    let row_index_sql = if segment.schema_version >= ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION {
+        "row_index".to_owned()
+    } else {
+        "0 AS row_index".to_owned()
+    };
+    let attributes_json_sql = attributes_json_sql(include_payload);
+
     format!(
         "SELECT
             project_name,
@@ -752,10 +808,19 @@ fn segment_source_sql(uri: &str) -> String {
             status_code,
             event_type,
             event_time_unix_nano,
-            attributes_json
+            {row_index_sql},
+            {attributes_json_sql}
         FROM {}",
-        sql_object_store_path(uri)
+        sql_object_store_path(&segment.uri)
     )
+}
+
+pub(crate) fn attributes_json_sql(include_payload: bool) -> &'static str {
+    if include_payload {
+        "attributes_json"
+    } else {
+        "'{}' AS attributes_json"
+    }
 }
 
 fn run_query_where_sql(query: &RunQuery) -> String {
@@ -864,45 +929,6 @@ fn vortex_session_context(object_store: Arc<dyn ObjectStore>) -> Result<SessionC
     Ok(SessionContext::new_with_state(state.build()).enable_url_table())
 }
 
-fn run_summaries_from_batches(batches: &[RecordBatch]) -> Result<Vec<RunSummary>> {
-    let mut runs = Vec::new();
-    for batch in batches {
-        let project_names = string_column(batch, 0, "project_name")?;
-        let run_ids = string_column(batch, 1, "run_id")?;
-        let trace_ids = string_column(batch, 2, "trace_id")?;
-        let span_ids = string_column(batch, 3, "span_id")?;
-        let parent_run_ids = string_column(batch, 4, "parent_run_id")?;
-        let parent_span_ids = string_column(batch, 5, "parent_span_id")?;
-        let names = string_column(batch, 6, "name")?;
-        let run_types = string_column(batch, 7, "run_type")?;
-        let statuses = string_column(batch, 8, "status")?;
-        let start_times = int64_column(batch, 9, "start_time_unix_nano")?;
-        let end_times = int64_column(batch, 10, "end_time_unix_nano")?;
-        let roots = bool_column(batch, 11, "is_root")?;
-        let attributes_json_values = string_column(batch, 12, "attributes_json")?;
-
-        for row in 0..batch.num_rows() {
-            runs.push(RunSummary {
-                project_name: project_names.value(row).to_owned(),
-                run_id: optional_string_value(&run_ids, row),
-                trace_id: trace_ids.value(row).to_owned(),
-                span_id: span_ids.value(row).to_owned(),
-                parent_run_id: optional_string_value(&parent_run_ids, row),
-                parent_span_id: optional_string_value(&parent_span_ids, row),
-                name: names.value(row).to_owned(),
-                run_type: run_types.value(row).to_owned(),
-                status: statuses.value(row).to_owned(),
-                start_time_unix_nano: start_times.value(row),
-                end_time_unix_nano: end_times.value(row),
-                is_root: roots.value(row),
-                attributes_json: attributes_json_values.value(row).to_owned(),
-            });
-        }
-    }
-
-    Ok(runs)
-}
-
 fn run_matches_retention_filter(run: &RunSummary, query: &RunQuery) -> bool {
     if let Some(cutoff) = query.retention_cutoff_unix_nano
         && run.start_time_unix_nano < cutoff
@@ -911,63 +937,6 @@ fn run_matches_retention_filter(run: &RunSummary, query: &RunQuery) -> bool {
     }
 
     true
-}
-
-fn optional_string_value(column: &StringColumn<'_>, row: usize) -> Option<String> {
-    if column.is_null(row) {
-        None
-    } else {
-        Some(column.value(row).to_owned())
-    }
-}
-
-enum StringColumn<'a> {
-    Utf8(&'a StringArray),
-    Utf8View(&'a StringViewArray),
-}
-
-impl StringColumn<'_> {
-    fn is_null(&self, row: usize) -> bool {
-        match self {
-            Self::Utf8(column) => column.is_null(row),
-            Self::Utf8View(column) => column.is_null(row),
-        }
-    }
-
-    fn value(&self, row: usize) -> &str {
-        match self {
-            Self::Utf8(column) => column.value(row),
-            Self::Utf8View(column) => column.value(row),
-        }
-    }
-}
-
-fn string_column<'a>(batch: &'a RecordBatch, index: usize, name: &str) -> Result<StringColumn<'a>> {
-    let column = batch.column(index);
-    if let Some(column) = column.as_string_opt::<i32>() {
-        return Ok(StringColumn::Utf8(column));
-    }
-    if let Some(column) = column.as_string_view_opt() {
-        return Ok(StringColumn::Utf8View(column));
-    }
-
-    Err(anyhow::anyhow!("column {name} is not Utf8 or Utf8View"))
-}
-
-fn int64_column<'a>(batch: &'a RecordBatch, index: usize, name: &str) -> Result<&'a Int64Array> {
-    batch
-        .column(index)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .with_context(|| format!("column {name} is not Int64"))
-}
-
-fn bool_column<'a>(batch: &'a RecordBatch, index: usize, name: &str) -> Result<&'a BooleanArray> {
-    batch
-        .column(index)
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .with_context(|| format!("column {name} is not Boolean"))
 }
 
 fn sql_string_literal(value: &str) -> String {
