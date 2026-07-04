@@ -2477,6 +2477,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "bytes",
+ "chrono",
  "datafusion",
  "hex",
  "object_store",

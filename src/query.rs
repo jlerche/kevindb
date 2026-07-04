@@ -16,6 +16,7 @@ use vortex_datafusion::VortexFormatFactory;
 use crate::otlp::RunEventKind;
 use crate::segment::ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION;
 
+pub mod filter;
 mod random_access;
 mod rows;
 mod tree;
