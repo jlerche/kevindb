@@ -16,6 +16,7 @@ use crate::query::{QueryEngine, RunProjection, RunQuery, generated_run_id};
 
 mod phase1;
 mod phase2;
+mod phase3;
 
 #[tokio::test]
 async fn ingest_otlp_flushes_to_object_store_and_postgres() {
@@ -165,6 +166,7 @@ async fn query_diagnostics_report_segment_fanout() {
             include_deleted: false,
             filter: None,
             trace_filter: None,
+            tree_filter: None,
             include_payload: true,
             newest_first: false,
             limits: Default::default(),
@@ -259,6 +261,7 @@ async fn project_time_filter_diagnostics_reject_full_project_fanout() {
             include_deleted: false,
             filter: None,
             trace_filter: None,
+            tree_filter: None,
             include_payload: true,
             newest_first: false,
             limits: Default::default(),
@@ -583,6 +586,7 @@ async fn compacts_and_respects_deletes_and_retention() {
             include_deleted: false,
             filter: None,
             trace_filter: None,
+            tree_filter: None,
             include_payload: true,
             newest_first: false,
             limits: Default::default(),

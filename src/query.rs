@@ -21,6 +21,7 @@ mod planner;
 mod random_access;
 mod rows;
 mod tree;
+mod tree_filter;
 use filter::FilterExpr;
 use object_store_stats::{
     MeasuringObjectStore, ObjectStoreReadLimits, ObjectStoreReadSnapshot, datafusion_batch_query,
@@ -35,6 +36,7 @@ pub use random_access::{RunEventSummary, RunLoadResult, RunProjection, TraceLoad
 pub(crate) use rows::run_summaries_from_batches;
 pub(crate) use tree::trace_tree_from_runs;
 pub use tree::{RunNode, TraceTree};
+pub use tree_filter::{TreeFilterExpr, TreeFilterMode, TreeFilterScope};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunSummary {
@@ -70,6 +72,7 @@ pub struct RunQuery {
     pub include_deleted: bool,
     pub filter: Option<FilterExpr>,
     pub trace_filter: Option<FilterExpr>,
+    pub tree_filter: Option<TreeFilterExpr>,
     pub include_payload: bool,
     pub newest_first: bool,
     pub limits: RunQueryLimits,
@@ -102,6 +105,7 @@ impl RunQuery {
             include_deleted: false,
             filter: None,
             trace_filter: None,
+            tree_filter: None,
             include_payload: true,
             newest_first: false,
             limits: RunQueryLimits::default(),

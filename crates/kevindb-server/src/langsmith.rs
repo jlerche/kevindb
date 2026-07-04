@@ -22,7 +22,7 @@ mod feedback;
 mod filter;
 pub use feedback::FeedbackResponse;
 pub(crate) use feedback::{create_feedback, list_feedback, list_run_feedback, read_feedback};
-use filter::parse_filter;
+use filter::{parse_filter, parse_tree_filter};
 
 impl ServerState {
     async fn list_project_names(
@@ -171,16 +171,6 @@ pub(super) async fn query_runs(
             "project_name, session, or run_ids is required".to_owned(),
         ));
     }
-    if let Some(tree_filter) = request
-        .tree_filter
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        return Err(ApiError::bad_request(format!(
-            "tree_filter is not supported until Phase 3: {tree_filter}"
-        )));
-    }
-
     let parent_run_id = request
         .parent_run_id
         .as_deref()
@@ -246,6 +236,7 @@ pub(super) async fn query_runs(
         include_deleted: false,
         filter: parse_filter(request.filter.as_ref(), "filter")?,
         trace_filter: parse_filter(request.trace_filter.as_ref(), "trace_filter")?,
+        tree_filter: parse_tree_filter(request.tree_filter.as_deref())?,
         include_payload,
         newest_first: true,
         limits: RunQueryLimits {

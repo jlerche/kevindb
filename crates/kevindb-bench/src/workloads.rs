@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use kevindb::ingest::{IngestConfig, Ingestor};
 use kevindb::query::filter::FilterExpr;
-use kevindb::query::{QueryEngine, RunQuery, RunQueryDiagnostics};
+use kevindb::query::{QueryEngine, RunQuery, RunQueryDiagnostics, TreeFilterExpr};
 use kevindb_metastore_postgres::{FeedbackFilter, FeedbackRecord, PostgresMetastore};
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
@@ -226,6 +226,7 @@ async fn run_project_run_filtering(
             include_deleted: false,
             filter: None,
             trace_filter: None,
+            tree_filter: None,
             include_payload: true,
             newest_first: false,
             limits: Default::default(),
@@ -286,33 +287,12 @@ async fn run_root_tree_predicate(
     dataset: &SyntheticDataset,
     store: &CountingObjectStore,
 ) -> Result<WorkloadResult> {
-    run_query_workload(
-        "root-tree-predicate",
-        query_engine,
-        dataset,
-        store,
-        RunQuery {
-            project_names: vec![dataset.config.project_name.clone()],
-            trace_id: None,
-            parent_run_id: None,
-            parent_span_id: None,
-            run_type: None,
-            is_root: Some(true),
-            error: None,
-            start_time_min_unix_nano: None,
-            start_time_max_unix_nano: None,
-            limit: Some(100),
-            offset: None,
-            retention_cutoff_unix_nano: None,
-            include_deleted: false,
-            filter: None,
-            trace_filter: None,
-            include_payload: true,
-            newest_first: false,
-            limits: Default::default(),
-        },
-    )
-    .await
+    let mut query = RunQuery::new(dataset.config.project_name.clone());
+    query.is_root = Some(true);
+    query.tree_filter = Some(TreeFilterExpr::parse(r#"eq(run_type, "tool")"#)?);
+    query.limit = Some(100);
+    query.include_payload = false;
+    run_query_workload("root-tree-predicate", query_engine, dataset, store, query).await
 }
 
 async fn run_child_tree_predicate(
@@ -320,33 +300,12 @@ async fn run_child_tree_predicate(
     dataset: &SyntheticDataset,
     store: &CountingObjectStore,
 ) -> Result<WorkloadResult> {
-    run_query_workload(
-        "child-tree-predicate",
-        query_engine,
-        dataset,
-        store,
-        RunQuery {
-            project_names: vec![dataset.config.project_name.clone()],
-            trace_id: None,
-            parent_run_id: None,
-            parent_span_id: None,
-            run_type: Some("tool".to_owned()),
-            is_root: Some(false),
-            error: None,
-            start_time_min_unix_nano: None,
-            start_time_max_unix_nano: None,
-            limit: Some(100),
-            offset: None,
-            retention_cutoff_unix_nano: None,
-            include_deleted: false,
-            filter: None,
-            trace_filter: None,
-            include_payload: true,
-            newest_first: false,
-            limits: Default::default(),
-        },
-    )
-    .await
+    let mut query = RunQuery::new(dataset.config.project_name.clone());
+    query.run_type = Some("llm".to_owned());
+    query.tree_filter = Some(TreeFilterExpr::parse(r#"child(eq(run_type, "tool"))"#)?);
+    query.limit = Some(100);
+    query.include_payload = false;
+    run_query_workload("child-tree-predicate", query_engine, dataset, store, query).await
 }
 
 async fn run_query_workload(

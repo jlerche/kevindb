@@ -1,3 +1,4 @@
+use kevindb::query::TreeFilterExpr;
 use kevindb::query::filter::FilterExpr;
 use serde_json::Value;
 
@@ -23,6 +24,16 @@ pub(super) fn parse_filter(
     FilterExpr::parse(&text)
         .map(Some)
         .map_err(|error| ApiError::bad_request(format!("{field}: {error}")))
+}
+
+pub(super) fn parse_tree_filter(value: Option<&str>) -> Result<Option<TreeFilterExpr>, ApiError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    TreeFilterExpr::parse(value)
+        .map(Some)
+        .map_err(|error| ApiError::bad_request(format!("tree_filter: {error}")))
 }
 
 fn structured_filter_to_text(value: &Value) -> Result<String, String> {

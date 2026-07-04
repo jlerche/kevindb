@@ -208,6 +208,7 @@ impl QueryEngine {
             include_deleted: false,
             filter: None,
             trace_filter: None,
+            tree_filter: None,
             include_payload: projection.include_payload(),
             newest_first: false,
             limits: Default::default(),

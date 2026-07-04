@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use anyhow::{Context, Result, anyhow};
 use tokio_postgres::NoTls;
 
-use super::{RunQuery, RunSummary};
+use super::{RunQuery, RunSummary, TreeFilterExpr, TreeFilterMode, TreeFilterScope};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunQueryPlan {
@@ -234,8 +234,72 @@ fn run_head_where_sql(query: &RunQuery) -> Result<String> {
             )"
         ));
     }
+    if let Some(tree_filter) = &query.tree_filter {
+        predicates.push(tree_filter_predicate_sql(
+            "run_heads",
+            tree_filter,
+            query.include_deleted,
+        )?);
+    }
 
     Ok(predicates.join(" AND "))
+}
+
+fn tree_filter_predicate_sql(
+    run_alias: &str,
+    tree_filter: &TreeFilterExpr,
+    include_deleted: bool,
+) -> Result<String> {
+    let target_predicate = tree_filter
+        .predicate()
+        .compile_run_head_filter("tree_filter")
+        .map_err(|err| anyhow!(err))?
+        .predicate_sql;
+    let scope_predicate = match tree_filter.scope() {
+        TreeFilterScope::Trace => "true".to_owned(),
+        TreeFilterScope::Root => "target_tree.depth = 0".to_owned(),
+        TreeFilterScope::Child => "target_tree.parent_span_id = returned_tree.span_id".to_owned(),
+        TreeFilterScope::Descendant => "target_tree.subtree_start > returned_tree.subtree_start
+                AND target_tree.subtree_end < returned_tree.subtree_end"
+            .to_owned(),
+    };
+    let mode_predicate = match tree_filter.mode() {
+        TreeFilterMode::ShowAll => "true",
+        TreeFilterMode::FilteredOnly => "target_tree.span_id = returned_tree.span_id",
+        TreeFilterMode::MostRelevant => {
+            "returned_tree.subtree_start <= target_tree.subtree_start
+                AND returned_tree.subtree_end >= target_tree.subtree_end"
+        }
+    };
+    let deletion_predicate = if include_deleted {
+        "true"
+    } else {
+        "tree_filter.deleted_at_unix_nano IS NULL"
+    };
+
+    Ok(format!(
+        "{} IN (
+            SELECT {}
+            FROM run_tree_nodes returned_tree
+            INNER JOIN run_tree_nodes target_tree
+                ON target_tree.project_name = returned_tree.project_name
+                AND target_tree.trace_id = returned_tree.trace_id
+            INNER JOIN run_heads tree_filter
+                ON tree_filter.project_name = target_tree.project_name
+                AND tree_filter.trace_id = target_tree.trace_id
+                AND tree_filter.span_id = target_tree.span_id
+            WHERE {scope_predicate}
+                AND {mode_predicate}
+                AND {deletion_predicate}
+                AND {target_predicate}
+        )",
+        planner_run_key_sql(run_alias),
+        planner_run_key_sql("returned_tree")
+    ))
+}
+
+fn planner_run_key_sql(alias: &str) -> String {
+    format!("{alias}.project_name || '\u{1f}' || {alias}.trace_id || '\u{1f}' || {alias}.span_id")
 }
 
 fn enforce_limits(

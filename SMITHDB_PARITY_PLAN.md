@@ -420,35 +420,35 @@ Phase 2 evidence:
 - `src/query.rs` executes candidate segments in bounded DataFusion batches and
   pushes row-locator predicates into each segment source.
 - `crates/kevindb-server/src/langsmith.rs` accepts `filter`, `trace_filter`,
-  `select`, direct `run_ids`, and debug diagnostics while rejecting Phase 3
-  `tree_filter` and Phase 6 search/JSON predicates clearly.
+  `tree_filter`, `select`, direct `run_ids`, and debug diagnostics while
+  rejecting Phase 6 search/JSON predicates clearly.
 - Focused tests cover documented filter examples, negative metadata/feedback
   semantics, scalar materialization limits, feedback joins, payload projection,
   high-fanout rejection, DataFusion source-predicate pushdown, server debug
   diagnostics, and unsupported full-text rejection.
 
-## [ ] Phase 3: Tree-Aware Queries
+## [x] Phase 3: Tree-Aware Queries
 
 Goal: support filters over root, child, descendant, and trace tree context.
 
-### [ ] Epic 3.1: Tree Index Model
+### [x] Epic 3.1: Tree Index Model
 
 Tasks:
 
-- [ ] Add trace tree metadata:
+- [x] Add trace tree metadata:
   - root run ID
   - parent-child edges
   - depth
   - sibling order
   - subtree start/end order or nested-set interval
   - descendant count
-- [ ] Maintain this model on ingest and compaction.
-- [ ] Support orphan and late parent resolution.
+- [x] Maintain this model on ingest and compaction.
+- [x] Support orphan and late parent resolution.
 
 Subtasks:
 
-- [ ] Add migration for tree edge and closure/nested-set metadata.
-- [ ] Add tests for:
+- [x] Add migration for tree edge and closure/nested-set metadata.
+- [x] Add tests for:
   - simple tree
   - multiple roots
   - orphan repair
@@ -457,29 +457,35 @@ Subtasks:
 
 Exit criteria:
 
-- [ ] Trace tree reconstruction does not require reading every run payload.
+- [x] Trace tree reconstruction does not require reading every run payload.
 
-### [ ] Epic 3.2: Tree Predicate Planning
+### [x] Epic 3.2: Tree Predicate Planning
 
 Tasks:
 
-- [ ] Support documented tree filters:
+- [x] Support documented tree filters:
   - root run has property
   - child/descendant run has property
   - trace contains a matching node
   - return filtered only vs show all vs most relevant
-- [ ] Compile tree filters into metastore predicates first.
-- [ ] Fetch row data only after candidate trace/run IDs are narrowed.
+- [x] Compile tree filters into metastore predicates first.
+- [x] Fetch row data only after candidate trace/run IDs are narrowed.
 
 Subtasks:
 
-- [ ] Add query AST nodes for root and descendant scopes.
-- [ ] Add tests based on documented LangSmith tree filter examples.
-- [ ] Add benchmark for "trace contains child tool call" over large projects.
+- [x] Add query AST nodes for root and descendant scopes.
+- [x] Add tests based on documented LangSmith tree filter examples.
+- [x] Add benchmark for "trace contains child tool call" over large projects.
 
 Exit criteria:
 
-- [ ] Tree filters avoid scanning all runs in all traces.
+- [x] Tree filters avoid scanning all runs in all traces.
+
+Phase 3 evidence:
+- `V12__add_phase3_tree_indexes.sql` adds tree nodes, edges, intervals, depth, sibling order, descendant counts, and guard flags.
+- `src/ingest/tree.rs` refreshes trace tree metadata from current heads on ingest and compaction.
+- `src/query/tree_filter.rs` and `src/query/planner.rs` compile tree filters into metastore candidate-key predicates before Vortex reads.
+- `src/ingest/tests/phase3.rs` covers late parent repair, multiple roots, descendant filters, and cycle guarding; bench workloads now use real tree filters.
 
 ## [ ] Phase 4: Thread Reconstruction
 
