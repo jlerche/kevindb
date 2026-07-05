@@ -250,6 +250,64 @@ async fn event_ordering_preserves_streaming_updates_errors_and_late_arrivals() {
 }
 
 #[tokio::test]
+async fn error_update_without_end_time_is_not_reported_as_pending() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 1,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+
+    let mut start = sample_record("1111111111111111", 10);
+    start.end_time_unix_nano = 0;
+    start.status_code = 0;
+    start.event_kind = RunEventKind::Start;
+    ingestor
+        .ingest_records(vec![start])
+        .await
+        .expect("ingest start");
+
+    let mut error_update = sample_record("1111111111111111", 20);
+    error_update.end_time_unix_nano = 0;
+    error_update.status_code = 2;
+    error_update.event_kind = RunEventKind::Update;
+    error_update.attributes_json = r#"{"stage":"error-update"}"#.to_owned();
+    ingestor
+        .ingest_records(vec![error_update])
+        .await
+        .expect("ingest error update");
+
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store);
+    let loaded = query_engine
+        .load_run_by_id("1111111111111111")
+        .await
+        .expect("load run")
+        .expect("run exists");
+    assert_eq!(loaded.status, "error");
+    assert_eq!(loaded.end_time_unix_nano, 0);
+
+    let errored = query_engine
+        .list_runs(RunQuery {
+            error: Some(true),
+            ..RunQuery::new("demo")
+        })
+        .await
+        .expect("list errored runs");
+    assert_eq!(errored.len(), 1);
+    assert_eq!(errored[0].status, "error");
+
+    mockgres.stop().await.expect("stop mockgres");
+}
+
+#[tokio::test]
 async fn trace_load_uses_row_index_for_same_time_updates_and_supports_projections() {
     let mockgres = Mockgres::start().await.expect("start mockgres");
     run_migrations(mockgres.postgres_url())

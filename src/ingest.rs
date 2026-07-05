@@ -617,10 +617,10 @@ fn span_record_from_run_summary(run: &RunSummary) -> SpanRecord {
 }
 
 fn status_from_record(record: &SpanRecord) -> String {
-    if record.end_time_unix_nano == 0 {
-        "pending".to_owned()
-    } else if record.status_code == 2 {
+    if record.status_code == 2 {
         "error".to_owned()
+    } else if record.end_time_unix_nano == 0 {
+        "pending".to_owned()
     } else {
         "success".to_owned()
     }

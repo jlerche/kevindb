@@ -54,12 +54,17 @@ pub(super) async fn try_rollup_aggregate(
 }
 
 fn rollup_eligible(query: &RunAggregateQuery) -> bool {
+    let Some(kind) = rollup_kind(query) else {
+        return false;
+    };
+
     query.filter.is_none()
         && query.trace_filter.is_none()
         && query.tree_filter.is_none()
         && !query.include_deleted
         && query.time_bucket_nanos == Some(AGGREGATE_ROLLUP_BUCKET_UNIX_NANOS)
-        && rollup_kind(query).is_some()
+        && rollup_filters_are_exact(query, kind)
+        && time_filters_cover_whole_rollup_buckets(query)
 }
 
 fn rollup_kind(query: &RunAggregateQuery) -> Option<&'static str> {
@@ -101,6 +106,26 @@ fn rollup_kind(query: &RunAggregateQuery) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn rollup_filters_are_exact(query: &RunAggregateQuery, kind: &str) -> bool {
+    match kind {
+        "run_type" => query.error.is_none(),
+        "error" => query.run_type.is_none(),
+        "project" | "model" | "feedback" => query.run_type.is_none() && query.error.is_none(),
+        _ => false,
+    }
+}
+
+fn time_filters_cover_whole_rollup_buckets(query: &RunAggregateQuery) -> bool {
+    query
+        .start_time_min_unix_nano
+        .is_none_or(|min| min.rem_euclid(AGGREGATE_ROLLUP_BUCKET_UNIX_NANOS) == 0)
+        && query.start_time_max_unix_nano.is_none_or(|max| {
+            max.checked_add(1).is_some_and(|exclusive_end| {
+                exclusive_end.rem_euclid(AGGREGATE_ROLLUP_BUCKET_UNIX_NANOS) == 0
+            })
+        })
 }
 
 fn rollup_sql(query: &RunAggregateQuery) -> Result<(String, RunAggregateSource)> {
@@ -325,5 +350,39 @@ mod tests {
         assert_eq!(source, RunAggregateSource::Rollup);
         assert!(sql.contains("FROM run_metric_rollups"));
         assert!(sql.contains("rollup_kind = 'run_type'"));
+    }
+
+    #[test]
+    fn rollups_are_ineligible_for_filters_not_encoded_by_the_rollup() {
+        let mut project_rollup = RunAggregateQuery::new("demo");
+        project_rollup.group_by = vec![RunAggregateGroup::Project, RunAggregateGroup::TimeBucket];
+        project_rollup.time_bucket_nanos = Some(AGGREGATE_ROLLUP_BUCKET_UNIX_NANOS);
+        project_rollup.run_type = Some("llm".to_owned());
+        assert!(!rollup_eligible(&project_rollup));
+
+        let mut run_type_rollup = project_rollup.clone();
+        run_type_rollup.group_by.push(RunAggregateGroup::RunType);
+        assert!(rollup_eligible(&run_type_rollup));
+
+        run_type_rollup.error = Some(true);
+        assert!(!rollup_eligible(&run_type_rollup));
+    }
+
+    #[test]
+    fn rollups_are_ineligible_for_partial_time_buckets() {
+        let mut query = RunAggregateQuery::new("demo");
+        query.group_by = vec![RunAggregateGroup::Project, RunAggregateGroup::TimeBucket];
+        query.time_bucket_nanos = Some(AGGREGATE_ROLLUP_BUCKET_UNIX_NANOS);
+        assert!(rollup_eligible(&query));
+
+        query.start_time_min_unix_nano = Some(1);
+        assert!(!rollup_eligible(&query));
+
+        query.start_time_min_unix_nano = Some(AGGREGATE_ROLLUP_BUCKET_UNIX_NANOS);
+        query.start_time_max_unix_nano = Some(2 * AGGREGATE_ROLLUP_BUCKET_UNIX_NANOS - 1);
+        assert!(rollup_eligible(&query));
+
+        query.start_time_max_unix_nano = Some(2 * AGGREGATE_ROLLUP_BUCKET_UNIX_NANOS);
+        assert!(!rollup_eligible(&query));
     }
 }

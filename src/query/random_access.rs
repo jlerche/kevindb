@@ -456,8 +456,8 @@ fn run_locator_datafusion_sql(locator: &RunLocator, include_payload: bool) -> St
                     name,
                     run_type,
                     CASE
-                        WHEN end_time_unix_nano = 0 THEN 'pending'
                         WHEN status_code = 2 THEN 'error'
+                        WHEN end_time_unix_nano = 0 THEN 'pending'
                         ELSE 'success'
                     END AS status,
                     start_time_unix_nano,

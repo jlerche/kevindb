@@ -280,7 +280,7 @@ fn aggregate_rows(
             groups
                 .entry(variant.group)
                 .or_default()
-                .push(&row, variant.feedback.as_ref());
+                .push(&row, &variant.feedback);
         }
     }
 
@@ -296,7 +296,7 @@ fn aggregate_rows(
 #[derive(Debug, Clone)]
 struct GroupVariant {
     group: BTreeMap<String, String>,
-    feedback: Option<FeedbackScore>,
+    feedback: Vec<FeedbackScore>,
 }
 
 fn group_variants(
@@ -307,7 +307,7 @@ fn group_variants(
 ) -> Vec<GroupVariant> {
     let mut variants = vec![GroupVariant {
         group: BTreeMap::new(),
-        feedback: None,
+        feedback: Vec::new(),
     }];
     for group in &query.group_by {
         variants = expand_group_variants(variants, *group, row, query, tags, feedback_scores);
@@ -414,7 +414,7 @@ fn expand_feedback_group(
             variant
                 .group
                 .insert("feedback_key".to_owned(), score.key.clone());
-            variant.feedback = Some(score.clone());
+            variant.feedback = vec![score.clone()];
             expanded.push(variant);
         }
     }
@@ -433,12 +433,16 @@ fn attach_feedback_metrics(
     let Some(run_id) = row.run_id.as_deref() else {
         return variants;
     };
-    if let Some(scores) = feedback_scores.get(run_id) {
+    let scores = feedback_scores
+        .get(run_id)
+        .into_iter()
+        .flatten()
+        .filter(|score| query.feedback_keys.contains(&score.key))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !scores.is_empty() {
         for variant in &mut variants {
-            variant.feedback = scores
-                .iter()
-                .find(|score| query.feedback_keys.contains(&score.key))
-                .cloned();
+            variant.feedback = scores.clone();
         }
     }
     variants
@@ -630,7 +634,7 @@ struct AggregateAccumulator {
 }
 
 impl AggregateAccumulator {
-    fn push(&mut self, row: &AggregateRunRow, feedback: Option<&FeedbackScore>) {
+    fn push(&mut self, row: &AggregateRunRow, feedback_scores: &[FeedbackScore]) {
         self.count += 1;
         if row.status == "error" {
             self.error_count += 1;
@@ -646,7 +650,7 @@ impl AggregateAccumulator {
         self.first_token_latency_nanos
             .push_optional_i64(row.first_token_latency_nanos);
         self.evaluator_score.push_optional_f64(row.evaluator_score);
-        if let Some(feedback) = feedback {
+        for feedback in feedback_scores {
             self.feedback_scores
                 .entry(feedback.key.clone())
                 .or_default()

@@ -749,8 +749,8 @@ fn run_head_datafusion_sql(
                     name,
                     run_type,
                     CASE
-                        WHEN end_time_unix_nano = 0 THEN 'pending'
                         WHEN status_code = 2 THEN 'error'
+                        WHEN end_time_unix_nano = 0 THEN 'pending'
                         ELSE 'success'
                     END AS status,
                     start_time_unix_nano,

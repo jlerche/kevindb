@@ -19,9 +19,12 @@ use uuid::Uuid;
 use crate::{ApiError, ServerState};
 
 pub(crate) mod aggregates;
+mod diagnostics;
+mod direct_runs;
 mod feedback;
 mod filter;
 mod threads;
+pub use diagnostics::RunQueryDiagnosticsResponse;
 pub use feedback::FeedbackResponse;
 pub(crate) use feedback::{create_feedback, list_feedback, list_run_feedback, read_feedback};
 use filter::{parse_filter, parse_tree_filter};
@@ -213,20 +216,12 @@ pub(super) async fn query_runs(
         } else {
             RunProjection::Summary
         };
-        let mut runs = Vec::new();
-        for run_id in direct_run_ids {
-            if let Some(run) = state
-                .query_engine()
-                .load_run_by_id_with_projection(&run_id, projection)
-                .await
-                .context("load requested run")?
-                .run
-            {
-                runs.push(run);
-            }
-        }
+        let direct = direct_runs::load_direct_runs(&state, direct_run_ids, projection).await?;
         return Ok(Json(RunsResponse::from_runs_with_limit_and_diagnostics(
-            runs, limit, offset, None,
+            direct.runs,
+            limit,
+            offset,
+            request.debug.unwrap_or(false).then_some(direct.diagnostics),
         )));
     }
 
@@ -755,39 +750,6 @@ impl RunsResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunQueryDiagnosticsResponse {
-    pub candidate_segments: usize,
-    pub candidate_runs: usize,
-    pub candidate_bytes: i64,
-    pub estimated_object_store_requests: usize,
-    pub actual_object_store_requests: u64,
-    pub actual_object_store_bytes_read: u64,
-    pub vortex_files_opened: usize,
-    pub rows_returned: usize,
-    pub postgres_query_time_nanos: u64,
-    pub datafusion_planning_time_nanos: u64,
-    pub datafusion_execution_time_nanos: u64,
-}
-
-impl From<RunQueryDiagnostics> for RunQueryDiagnosticsResponse {
-    fn from(diagnostics: RunQueryDiagnostics) -> Self {
-        Self {
-            candidate_segments: diagnostics.candidate_segments,
-            candidate_runs: diagnostics.candidate_runs,
-            candidate_bytes: diagnostics.candidate_bytes,
-            estimated_object_store_requests: diagnostics.estimated_object_store_requests,
-            actual_object_store_requests: diagnostics.actual_object_store_requests,
-            actual_object_store_bytes_read: diagnostics.actual_object_store_bytes_read,
-            vortex_files_opened: diagnostics.vortex_files_opened,
-            rows_returned: diagnostics.rows_returned,
-            postgres_query_time_nanos: duration_nanos(diagnostics.postgres_query_time),
-            datafusion_planning_time_nanos: duration_nanos(diagnostics.datafusion_planning_time),
-            datafusion_execution_time_nanos: duration_nanos(diagnostics.datafusion_execution_time),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunResponse {
     pub id: String,
     pub project_name: String,
@@ -882,10 +844,6 @@ fn query_error(error: anyhow::Error) -> ApiError {
     } else {
         ApiError::from(error)
     }
-}
-
-fn duration_nanos(duration: Duration) -> u64 {
-    duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 fn tenant_uuid() -> Uuid {

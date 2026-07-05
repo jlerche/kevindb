@@ -33,7 +33,7 @@ async fn aggregates_typed_vortex_columns_without_payload_json() {
             name: "child",
             run_type: "llm",
             start_time_unix_nano: 40,
-            end_time_unix_nano: 90,
+            end_time_unix_nano: 0,
             status_code: 2,
             prompt_tokens: 20,
             completion_tokens: 3,
@@ -89,6 +89,54 @@ async fn aggregates_typed_vortex_columns_without_payload_json() {
         llm.metrics.total_cost.as_ref().and_then(|stats| stats.sum),
         Some(0.02)
     );
+}
+
+#[test]
+fn ungrouped_feedback_aggregates_keep_all_requested_keys_without_recounting_runs() {
+    let row = AggregateRunRow {
+        project_name: "demo".to_owned(),
+        run_id: Some("run-a".to_owned()),
+        trace_id: TRACE_ID.to_owned(),
+        span_id: "span-a".to_owned(),
+        run_type: "llm".to_owned(),
+        status: "success".to_owned(),
+        start_time_unix_nano: 10,
+        latency_nanos: 20,
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
+        prompt_cost: None,
+        completion_cost: None,
+        total_cost: None,
+        first_token_latency_nanos: None,
+        evaluator_score: None,
+        model_name: None,
+        provider_name: None,
+    };
+    let query = RunAggregateQuery {
+        feedback_keys: vec!["quality".to_owned(), "cost".to_owned()],
+        ..RunAggregateQuery::new("demo")
+    };
+    let feedback_scores = HashMap::from([(
+        "run-a".to_owned(),
+        vec![
+            FeedbackScore {
+                key: "quality".to_owned(),
+                score: 0.8,
+            },
+            FeedbackScore {
+                key: "cost".to_owned(),
+                score: 0.2,
+            },
+        ],
+    )]);
+
+    let rows = aggregate_rows(vec![row], &query, &HashMap::new(), &feedback_scores);
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].metrics.count, 1);
+    assert_eq!(rows[0].metrics.feedback_scores["quality"].count, 1);
+    assert_eq!(rows[0].metrics.feedback_scores["cost"].count, 1);
 }
 
 struct TestSpan<'a> {
