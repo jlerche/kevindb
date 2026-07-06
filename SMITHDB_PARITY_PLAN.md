@@ -941,13 +941,13 @@ Exit criteria:
 
 - [x] Thread reconstruction can support a LangSmith-like thread UI.
 
-## [ ] Phase 10: Operations, Reliability, And Release Readiness
+## [x] Phase 10: Operations, Reliability, And Release Readiness
 
 Goal: make the system credible as a deployable database, not only a local demo.
 
 Tasks:
 
-- [ ] Add crash/restart tests for ingest, compaction, delete vectors, and ack
+- [x] Add crash/restart tests for ingest, compaction, delete vectors, and ack
   failure boundaries.
 - [x] Add orphan object reconciliation plus backup/restore notes for the
   Postgres metastore and object storage.
@@ -959,7 +959,7 @@ Tasks:
 
 Exit criteria:
 
-- [ ] Known failure modes are documented and tested, users can explain slow
+- [x] Known failure modes are documented and tested, users can explain slow
   queries, and KevinDB can run locally and in a basic self-hosted environment.
 
 ## Explicit Non-Goals Until Phase 6

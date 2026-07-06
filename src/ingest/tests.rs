@@ -15,6 +15,7 @@ use crate::db::run_migrations;
 use crate::query::{QueryEngine, RunProjection, RunQuery, generated_run_id};
 
 mod phase1;
+mod phase10;
 mod phase2;
 mod phase3;
 mod phase4;
