@@ -47,6 +47,8 @@ Optional environment variables:
 The server always runs migrations on startup.
 
 For a local Postgres + MinIO deployment, see [docs/operations.md](docs/operations.md).
+The LangSmith-compatible OpenAPI snapshot is checked in at
+[docs/openapi/langsmith-compat.openapi.json](docs/openapi/langsmith-compat.openapi.json).
 
 Current endpoints:
 

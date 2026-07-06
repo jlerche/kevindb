@@ -900,7 +900,7 @@ Tasks:
 Subtasks:
 
 - [ ] Add Python SDK compatibility tests for each query family.
-- [ ] Add OpenAPI snapshots.
+- [x] Add OpenAPI snapshots.
 
 Exit criteria:
 

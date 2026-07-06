@@ -1,0 +1,304 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "KevinDB LangSmith-Compatible API",
+    "version": "0.0.1",
+    "description": "Snapshot of KevinDB's public LangSmith-compatible HTTP surface."
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "operationId": "healthz",
+        "responses": {
+          "200": {
+            "description": "Process health."
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "operationId": "readyz",
+        "responses": {
+          "200": {
+            "description": "Readiness after metadata connectivity checks."
+          }
+        }
+      }
+    },
+    "/sessions": {
+      "get": {
+        "operationId": "listSessions",
+        "parameters": [
+          {"name": "name", "in": "query", "schema": {"type": "string"}},
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1}},
+          {"name": "include_stats", "in": "query", "schema": {"type": "boolean"}}
+        ],
+        "responses": {
+          "200": {
+            "description": "Projects visible as LangSmith sessions.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {"$ref": "#/components/schemas/ProjectResponse"}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/runs": {
+      "post": {
+        "operationId": "createRun",
+        "requestBody": {"$ref": "#/components/requestBodies/JsonObject"},
+        "responses": {"200": {"description": "Run accepted."}}
+      }
+    },
+    "/runs/{run_id}": {
+      "get": {
+        "operationId": "readRun",
+        "parameters": [{"$ref": "#/components/parameters/RunId"}],
+        "responses": {
+          "200": {
+            "description": "Run response.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RunResponse"}}}
+          },
+          "404": {"description": "Run not found."}
+        }
+      },
+      "patch": {
+        "operationId": "updateRun",
+        "parameters": [{"$ref": "#/components/parameters/RunId"}],
+        "requestBody": {"$ref": "#/components/requestBodies/JsonObject"},
+        "responses": {"200": {"description": "Run update accepted."}}
+      }
+    },
+    "/runs/{run_id}/feedback": {
+      "get": {
+        "operationId": "listRunFeedback",
+        "parameters": [{"$ref": "#/components/parameters/RunId"}],
+        "responses": {
+          "200": {
+            "description": "Feedback for one run.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {"$ref": "#/components/schemas/FeedbackResponse"}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/runs/query": {
+      "post": {
+        "operationId": "queryRuns",
+        "requestBody": {"$ref": "#/components/requestBodies/JsonObject"},
+        "responses": {
+          "200": {
+            "description": "Paged runs response.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RunsResponse"}}}
+          }
+        }
+      }
+    },
+    "/runs/aggregate": {
+      "post": {
+        "operationId": "queryRunAggregates",
+        "requestBody": {"$ref": "#/components/requestBodies/JsonObject"},
+        "responses": {
+          "200": {
+            "description": "Aggregate rows.",
+            "content": {"application/json": {"schema": {"type": "object"}}}
+          }
+        }
+      }
+    },
+    "/feedback": {
+      "get": {
+        "operationId": "listFeedback",
+        "responses": {
+          "200": {
+            "description": "Feedback rows.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {"$ref": "#/components/schemas/FeedbackResponse"}
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "createFeedback",
+        "requestBody": {"$ref": "#/components/requestBodies/JsonObject"},
+        "responses": {
+          "200": {
+            "description": "Created feedback.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/FeedbackResponse"}}}
+          }
+        }
+      }
+    },
+    "/feedback/{feedback_id}": {
+      "get": {
+        "operationId": "readFeedback",
+        "parameters": [{"$ref": "#/components/parameters/FeedbackId"}],
+        "responses": {
+          "200": {
+            "description": "Feedback row.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/FeedbackResponse"}}}
+          },
+          "404": {"description": "Feedback not found."}
+        }
+      }
+    },
+    "/v1/projects/{project_name}/traces": {
+      "post": {
+        "operationId": "ingestTrace",
+        "parameters": [{"$ref": "#/components/parameters/ProjectName"}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-protobuf": {
+              "schema": {"type": "string", "format": "binary"}
+            }
+          }
+        },
+        "responses": {"200": {"description": "OTLP ingest receipt."}}
+      }
+    },
+    "/v1/projects/{project_name}/traces/{trace_id}": {
+      "get": {
+        "operationId": "readProjectTrace",
+        "parameters": [
+          {"$ref": "#/components/parameters/ProjectName"},
+          {"$ref": "#/components/parameters/TraceId"}
+        ],
+        "responses": {
+          "200": {
+            "description": "Trace response.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TraceResponse"}}}
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_name}/traces/{trace_id}/runs": {
+      "get": {
+        "operationId": "listTraceRuns",
+        "parameters": [
+          {"$ref": "#/components/parameters/ProjectName"},
+          {"$ref": "#/components/parameters/TraceId"}
+        ],
+        "responses": {
+          "200": {
+            "description": "Runs in one trace.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RunsResponse"}}}
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_name}/route": {
+      "get": {
+        "operationId": "readProjectRoute",
+        "parameters": [{"$ref": "#/components/parameters/ProjectName"}],
+        "responses": {"200": {"description": "Current project route metadata."}}
+      }
+    },
+    "/v2/threads/query": {
+      "post": {
+        "operationId": "queryThreads",
+        "requestBody": {"$ref": "#/components/requestBodies/JsonObject"},
+        "responses": {"200": {"description": "Paged thread summaries."}}
+      }
+    },
+    "/v2/threads/{thread_id}/traces": {
+      "get": {
+        "operationId": "queryThreadTraces",
+        "parameters": [{"$ref": "#/components/parameters/ThreadId"}],
+        "responses": {"200": {"description": "Paged thread trace summaries."}}
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "FeedbackId": {"name": "feedback_id", "in": "path", "required": true, "schema": {"type": "string"}},
+      "ProjectName": {"name": "project_name", "in": "path", "required": true, "schema": {"type": "string"}},
+      "RunId": {"name": "run_id", "in": "path", "required": true, "schema": {"type": "string"}},
+      "ThreadId": {"name": "thread_id", "in": "path", "required": true, "schema": {"type": "string"}},
+      "TraceId": {"name": "trace_id", "in": "path", "required": true, "schema": {"type": "string"}}
+    },
+    "requestBodies": {
+      "JsonObject": {
+        "required": true,
+        "content": {
+          "application/json": {"schema": {"type": "object"}}
+        }
+      }
+    },
+    "schemas": {
+      "FeedbackResponse": {
+        "type": "object",
+        "required": ["id", "key"],
+        "properties": {
+          "id": {"type": "string"},
+          "run_id": {"type": ["string", "null"]},
+          "trace_id": {"type": ["string", "null"]},
+          "key": {"type": "string"},
+          "score": {"type": ["number", "null"]},
+          "value": true,
+          "comment": {"type": ["string", "null"]}
+        }
+      },
+      "ProjectResponse": {
+        "type": "object",
+        "required": ["id", "name", "tenant_id"],
+        "properties": {
+          "id": {"type": "string"},
+          "name": {"type": "string"},
+          "tenant_id": {"type": "string"}
+        }
+      },
+      "RunResponse": {
+        "type": "object",
+        "required": ["id", "name", "run_type", "trace_id", "inputs", "extra", "events", "tags"],
+        "properties": {
+          "id": {"type": "string"},
+          "name": {"type": "string"},
+          "run_type": {"type": "string"},
+          "trace_id": {"type": "string"},
+          "parent_run_id": {"type": ["string", "null"]},
+          "inputs": true,
+          "outputs": true,
+          "extra": true,
+          "events": {"type": "array"},
+          "tags": {"type": "array", "items": {"type": "string"}},
+          "error": {"type": ["string", "null"]},
+          "child_run_ids": {"type": "array", "items": {"type": "string"}}
+        }
+      },
+      "RunsResponse": {
+        "type": "object",
+        "required": ["runs", "cursors"],
+        "properties": {
+          "runs": {"type": "array", "items": {"$ref": "#/components/schemas/RunResponse"}},
+          "cursors": {"type": "object"}
+        }
+      },
+      "TraceResponse": {
+        "type": "object",
+        "required": ["runs", "root_run_ids"],
+        "properties": {
+          "runs": {"type": "array", "items": {"$ref": "#/components/schemas/RunResponse"}},
+          "root_run_ids": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  }
+}

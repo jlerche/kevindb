@@ -173,4 +173,39 @@ mod tests {
             None,
         )
     }
+
+    #[test]
+    fn openapi_snapshot_documents_langsmith_compat_routes() {
+        let spec: Value = serde_json::from_str(include_str!(
+            "../../../docs/openapi/langsmith-compat.openapi.json"
+        ))
+        .expect("openapi snapshot json");
+        assert_eq!(spec["openapi"], "3.1.0");
+        let paths = spec["paths"].as_object().expect("openapi paths");
+        for (path, method) in [
+            ("/healthz", "get"),
+            ("/readyz", "get"),
+            ("/sessions", "get"),
+            ("/runs", "post"),
+            ("/runs/{run_id}", "get"),
+            ("/runs/{run_id}", "patch"),
+            ("/runs/{run_id}/feedback", "get"),
+            ("/runs/query", "post"),
+            ("/runs/aggregate", "post"),
+            ("/feedback", "get"),
+            ("/feedback", "post"),
+            ("/feedback/{feedback_id}", "get"),
+            ("/v1/projects/{project_name}/traces", "post"),
+            ("/v1/projects/{project_name}/traces/{trace_id}", "get"),
+            ("/v1/projects/{project_name}/traces/{trace_id}/runs", "get"),
+            ("/v1/projects/{project_name}/route", "get"),
+            ("/v2/threads/query", "post"),
+            ("/v2/threads/{thread_id}/traces", "get"),
+        ] {
+            assert!(
+                paths.get(path).and_then(|path| path.get(method)).is_some(),
+                "missing {method} {path} from OpenAPI snapshot"
+            );
+        }
+    }
 }
