@@ -532,6 +532,9 @@ async fn load_trace_segment_sources(
                 uri,
                 total_bytes,
                 schema_version,
+                search_index_uri: None,
+                search_index_bytes: 0,
+                search_index_schema_version: 0,
                 candidate_rows: Vec::new(),
             })
             .candidate_rows

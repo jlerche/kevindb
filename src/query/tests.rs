@@ -323,6 +323,9 @@ fn datafusion_sql_pushes_segment_candidate_rows_to_sources() {
             uri: "projects/demo/trace-segments/a.vortex".to_owned(),
             total_bytes: 123,
             schema_version: crate::segment::SPAN_SEGMENT_SCHEMA_VERSION,
+            search_index_uri: None,
+            search_index_bytes: 0,
+            search_index_schema_version: 0,
             candidate_rows: vec![
                 SegmentCandidateRow {
                     project_name: "demo".to_owned(),
@@ -361,6 +364,9 @@ fn datafusion_sql_omits_candidate_key_pushdown_when_row_locators_exist() {
             uri: "projects/demo/trace-segments/a.vortex".to_owned(),
             total_bytes: 123,
             schema_version: crate::segment::SPAN_SEGMENT_SCHEMA_VERSION,
+            search_index_uri: None,
+            search_index_bytes: 0,
+            search_index_schema_version: 0,
             candidate_rows: vec![SegmentCandidateRow {
                 project_name: "demo".to_owned(),
                 trace_id: TRACE_ID.to_owned(),

@@ -19,6 +19,7 @@ mod phase2;
 mod phase3;
 mod phase4;
 mod phase5;
+mod phase6;
 
 #[tokio::test]
 async fn ingest_otlp_flushes_to_object_store_and_postgres() {
@@ -90,6 +91,11 @@ async fn ingest_otlp_flushes_to_object_store_and_postgres() {
         .await
         .expect("load trace segment schema version")
         .get(0);
+    let search_index_uri: Option<String> = client
+        .query_one("SELECT search_index_uri FROM trace_segments", &[])
+        .await
+        .expect("load search index uri")
+        .get(0);
     let (last_row_index, last_run_event_id): (i64, Option<i64>) = {
         let row = client
             .query_one(
@@ -109,6 +115,13 @@ async fn ingest_otlp_flushes_to_object_store_and_postgres() {
     assert_eq!(run_locator_count, 2);
     assert_eq!(trace_locator_count, 2);
     assert_eq!(schema_version, crate::segment::SPAN_SEGMENT_SCHEMA_VERSION);
+    let search_index_uri = search_index_uri.expect("search index uri");
+    assert!(
+        object_store
+            .head(&Path::from(search_index_uri.as_str()))
+            .await
+            .is_ok()
+    );
     assert_eq!(last_row_index, 1);
     assert!(last_run_event_id.is_some());
 

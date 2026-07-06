@@ -109,9 +109,29 @@ impl Parser {
                 }
             }
             "search" => {
+                let field = self.parse_optional_field_prefix()?;
                 let value = self.parse_value()?.as_string("search")?;
                 FilterExpr {
-                    kind: FilterKind::Search(value),
+                    kind: FilterKind::Search {
+                        field,
+                        query: value,
+                    },
+                }
+            }
+            "json_key" => {
+                let field = self.parse_optional_field_prefix()?;
+                let pattern = self.parse_value()?.as_string("json_key")?;
+                FilterExpr {
+                    kind: FilterKind::JsonKey { field, pattern },
+                }
+            }
+            "json_key_search" => {
+                let field = self.parse_optional_field_prefix()?;
+                let path = self.parse_value()?.as_string("json_key_search")?;
+                self.expect(Token::Comma)?;
+                let query = self.parse_value()?.as_string("json_key_search")?;
+                FilterExpr {
+                    kind: FilterKind::JsonKeySearch { field, path, query },
                 }
             }
             _ => {
@@ -154,6 +174,20 @@ impl Parser {
         }
         self.expect(Token::RBracket)?;
         Ok(values)
+    }
+
+    fn parse_optional_field_prefix(&mut self) -> Result<Option<FilterField>, FilterError> {
+        match (
+            self.tokens.get(self.offset),
+            self.tokens.get(self.offset + 1),
+        ) {
+            (Some(Token::Ident(field)), Some(Token::Comma)) => {
+                let field = parse_field(field)?;
+                self.offset += 2;
+                Ok(Some(field))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn expect_ident(&mut self) -> Result<String, FilterError> {
@@ -243,9 +277,10 @@ fn parse_field(value: &str) -> Result<FilterField, FilterError> {
         "completion_tokens" => Ok(FilterField::CompletionTokens),
         "total_tokens" => Ok(FilterField::TotalTokens),
         "total_cost" => Ok(FilterField::TotalCost),
-        "inputs" | "outputs" | "extra" | "attributes_json" => Err(FilterError::Unsupported(
-            "payload JSON filters require the Phase 6 object-store index".to_owned(),
-        )),
+        "inputs" => Ok(FilterField::Inputs),
+        "outputs" => Ok(FilterField::Outputs),
+        "extra" => Ok(FilterField::Extra),
+        "attributes_json" => Ok(FilterField::AttributesJson),
         other => Err(FilterError::Unsupported(format!(
             "field {other} is not indexed"
         ))),

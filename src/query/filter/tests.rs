@@ -67,13 +67,73 @@ fn rejects_full_text_and_payload_filters() {
         Err(FilterError::Unsupported(message)) if message.contains("full-text search")
     ));
     assert!(matches!(
-        FilterExpr::parse(r#"eq(inputs, "value")"#),
+        FilterExpr::parse(r#"eq(inputs, "value")"#)
+            .and_then(|expr| expr.compile_run_head_filter("run_heads")),
         Err(FilterError::Unsupported(message)) if message.contains("payload JSON")
     ));
     assert!(matches!(
         FilterExpr::parse(r#"gt(id, "00000000-0000-0000-0000-000000000000")"#)
             .and_then(|expr| expr.compile_run_head_filter("run_heads")),
         Err(FilterError::Unsupported(message)) if message.contains("id only supports")
+    ));
+}
+
+#[test]
+fn extracts_phase6_search_predicates_from_payload_filters() {
+    let expr = FilterExpr::parse(
+        r#"and(eq(run_type, "llm"), json_key("metadata.*"), json_key_search("langsmith.outputs.answer", "\"hello world\""), contains(inputs, "invoice"))"#,
+    )
+    .expect("parse phase 6 filter");
+
+    let prefilter = expr
+        .compile_run_head_prefilter_for_projects("run_heads", &["demo".to_owned()])
+        .expect("compile scalar prefilter")
+        .expect("scalar prefilter");
+    assert_eq!(prefilter.predicate_sql, "run_heads.run_type = 'llm'");
+
+    let predicate = expr
+        .phase6_search_predicate()
+        .expect("extract search predicate")
+        .expect("search predicate");
+    assert!(matches!(predicate, crate::search::SearchPredicate::And(_)));
+}
+
+#[test]
+fn extracts_blog_scoped_phase6_search_predicates() {
+    let expr = FilterExpr::parse(
+        r#"and(json_key(inputs, "author.%"), json_key_search(outputs, "answer", "\"hello world\""), search(inputs, "invoice"), search(status, "error"))"#,
+    )
+    .expect("parse scoped phase 6 filter");
+
+    let predicate = expr
+        .phase6_search_predicate()
+        .expect("extract scoped search predicate")
+        .expect("scoped search predicate");
+
+    assert!(matches!(predicate, crate::search::SearchPredicate::And(_)));
+}
+
+#[test]
+fn rejects_json_key_on_non_payload_fields() {
+    let err = FilterExpr::parse(r#"json_key(status, "metadata.thread_id")"#)
+        .and_then(|expr| expr.phase6_search_predicate().map(|_| expr))
+        .expect_err("status is not a payload JSON field");
+
+    assert!(matches!(
+        err,
+        FilterError::Unsupported(message) if message.contains("search index")
+    ));
+}
+
+#[test]
+fn rejects_mixed_scalar_and_search_or_filters() {
+    let err = FilterExpr::parse(r#"or(eq(run_type, "llm"), search("invoice"))"#)
+        .and_then(|expr| expr.phase6_search_predicate().map(|_| expr))
+        .expect_err("mixed or should reject");
+
+    assert!(matches!(
+        err,
+        FilterError::Unsupported(message) if message.contains("ORed")
     ));
 }
 

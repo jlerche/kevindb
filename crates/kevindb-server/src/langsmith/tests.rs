@@ -111,15 +111,36 @@ fn parses_structured_tree_filters() {
 }
 
 #[test]
-fn structured_filters_reject_payload_fields() {
-    let error = parse_filter(
+fn structured_filters_accept_phase6_payload_fields() {
+    let filter = parse_filter(
         Some(&json!({"field": "inputs", "operator": "eq", "value": "secret"})),
         "filter",
     )
-    .expect_err("payload filter should be rejected");
+    .expect("payload filter should parse")
+    .expect("filter should exist");
+    assert!(matches!(
+        filter.compile_run_head_filter("run_heads"),
+        Err(kevindb::query::filter::FilterError::Unsupported(message))
+            if message.contains("payload JSON")
+    ));
+}
 
-    match error {
-        ApiError::BadRequest(message) => assert!(message.contains("payload JSON")),
-        other => panic!("expected bad request, got {other:?}"),
-    }
+#[test]
+fn structured_filters_parse_json_key_search() {
+    let filter = parse_filter(
+        Some(&json!({
+            "operator": "json_key_search",
+            "path": "langsmith.outputs.answer",
+            "query": "\"hello world\""
+        })),
+        "filter",
+    )
+    .expect("json key search filter should parse")
+    .expect("filter should exist");
+
+    assert!(matches!(
+        filter.compile_run_head_filter("run_heads"),
+        Err(kevindb::query::filter::FilterError::Unsupported(message))
+            if message.contains("payload JSON")
+    ));
 }

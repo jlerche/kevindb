@@ -19,6 +19,9 @@ pub(crate) struct SegmentSource {
     pub(crate) uri: String,
     pub(crate) total_bytes: i64,
     pub(crate) schema_version: i64,
+    pub(crate) search_index_uri: Option<String>,
+    pub(crate) search_index_bytes: i64,
+    pub(crate) search_index_schema_version: i64,
     pub(crate) candidate_rows: Vec<SegmentCandidateRow>,
 }
 
@@ -81,10 +84,13 @@ pub(crate) async fn load_run_query_plan(
         let uri: String = row.get(0);
         let total_bytes: i64 = row.get(1);
         let schema_version: i64 = row.get(2);
-        let project_name: String = row.get(3);
-        let trace_id: String = row.get(4);
-        let span_id: String = row.get(5);
-        let row_index: i64 = row.get(6);
+        let search_index_uri: Option<String> = row.get(3);
+        let search_index_bytes: i64 = row.get(4);
+        let search_index_schema_version: i64 = row.get(5);
+        let project_name: String = row.get(6);
+        let trace_id: String = row.get(7);
+        let span_id: String = row.get(8);
+        let row_index: i64 = row.get(9);
         candidate_run_keys.insert(RunKey {
             project_name: project_name.clone(),
             trace_id: trace_id.clone(),
@@ -96,6 +102,9 @@ pub(crate) async fn load_run_query_plan(
                 uri,
                 total_bytes,
                 schema_version,
+                search_index_uri,
+                search_index_bytes,
+                search_index_schema_version,
                 candidate_rows: Vec::new(),
             })
             .candidate_rows
@@ -108,12 +117,21 @@ pub(crate) async fn load_run_query_plan(
     }
 
     let candidate_runs = candidate_run_keys.len();
+    let has_phase6_predicate = query_has_phase6_predicate(query);
     let candidate_bytes = segments_by_uri
         .values()
-        .map(|segment| segment.total_bytes)
+        .map(|segment| {
+            segment.total_bytes
+                + if has_phase6_predicate {
+                    segment.search_index_bytes
+                } else {
+                    0
+                }
+        })
         .sum::<i64>();
     let estimated_object_store_requests =
-        estimate_vortex_object_store_requests(segments_by_uri.len());
+        estimate_vortex_object_store_requests(segments_by_uri.len())
+            + estimate_search_index_object_store_requests(query, segments_by_uri.values());
     enforce_limits(
         query,
         segments_by_uri.len(),
@@ -152,6 +170,9 @@ fn run_candidate_runs_sql(query: &RunQuery) -> Result<String> {
             candidate.uri,
             candidate.total_bytes,
             candidate.schema_version,
+            candidate.search_index_uri,
+            candidate.search_index_bytes,
+            candidate.search_index_schema_version,
             candidate.project_name,
             candidate.trace_id,
             candidate.span_id,
@@ -161,6 +182,9 @@ fn run_candidate_runs_sql(query: &RunQuery) -> Result<String> {
                     trace_segments.uri,
                     trace_segments.total_bytes,
                     trace_segments.schema_version,
+                    trace_segments.search_index_uri,
+                    trace_segments.search_index_bytes,
+                    trace_segments.search_index_schema_version,
                     run_heads.project_name,
                 run_heads.trace_id,
                 run_heads.span_id,
@@ -216,13 +240,12 @@ fn run_head_where_sql(query: &RunQuery) -> Result<String> {
         predicates.push(format!("run_heads.start_time_unix_nano >= {cutoff}"));
     }
 
-    if let Some(filter) = &query.filter {
-        predicates.push(
-            filter
-                .compile_run_head_filter_for_projects("run_heads", &query.project_names)
-                .map_err(|err| anyhow!(err))?
-                .predicate_sql,
-        );
+    if let Some(filter) = &query.filter
+        && let Some(prefilter) = filter
+            .compile_run_head_prefilter_for_projects("run_heads", &query.project_names)
+            .map_err(|err| anyhow!(err))?
+    {
+        predicates.push(prefilter.predicate_sql);
     }
     if let Some(trace_filter) = &query.trace_filter {
         let root_predicate = trace_filter
@@ -355,6 +378,28 @@ pub(crate) fn estimate_vortex_object_store_requests(candidate_segments: usize) -
     // guardrails instead of a segment-count proxy.
     const ESTIMATED_REQUESTS_PER_VORTEX_FILE: usize = 48;
     candidate_segments.saturating_mul(ESTIMATED_REQUESTS_PER_VORTEX_FILE)
+}
+
+fn estimate_search_index_object_store_requests<'a>(
+    query: &RunQuery,
+    segments: impl Iterator<Item = &'a SegmentSource>,
+) -> usize {
+    if !query_has_phase6_predicate(query) {
+        return 0;
+    }
+
+    segments
+        .filter(|segment| segment.search_index_uri.is_some())
+        .count()
+}
+
+fn query_has_phase6_predicate(query: &RunQuery) -> bool {
+    query.filter.as_ref().is_some_and(|filter| {
+        filter
+            .phase6_search_predicate()
+            .map(|predicate| predicate.is_some())
+            .unwrap_or(false)
+    })
 }
 
 pub(crate) async fn load_deleted_run_keys(

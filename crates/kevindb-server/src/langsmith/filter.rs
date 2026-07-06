@@ -89,6 +89,35 @@ fn structured_filter_to_text(value: &Value) -> Result<String, String> {
                     .ok_or_else(|| "search filter requires query or value".to_owned())?;
                 return Ok(format!("search({})", structured_filter_literal(query)?));
             }
+            if operator == "json_key" {
+                let path = object
+                    .get("path")
+                    .or_else(|| object.get("key"))
+                    .or_else(|| object.get("field"))
+                    .or_else(|| object.get("value"))
+                    .ok_or_else(|| {
+                        "json_key filter requires path, key, field, or value".to_owned()
+                    })?;
+                return Ok(format!("json_key({})", structured_filter_literal(path)?));
+            }
+            if operator == "json_key_search" {
+                let path = object
+                    .get("path")
+                    .or_else(|| object.get("key"))
+                    .or_else(|| object.get("field"))
+                    .ok_or_else(|| {
+                        "json_key_search filter requires path, key, or field".to_owned()
+                    })?;
+                let query = object
+                    .get("query")
+                    .or_else(|| object.get("value"))
+                    .ok_or_else(|| "json_key_search filter requires query or value".to_owned())?;
+                return Ok(format!(
+                    "json_key_search({}, {})",
+                    structured_filter_literal(path)?,
+                    structured_filter_literal(query)?
+                ));
+            }
 
             let field = object
                 .get("field")
@@ -147,6 +176,8 @@ fn normalize_structured_operator(operator: &str) -> Result<String, String> {
         "and" => "and",
         "or" => "or",
         "search" => "search",
+        "json_key" => "json_key",
+        "json_key_search" => "json_key_search",
         other => return Err(format!("operator {other} is not supported")),
     };
     Ok(normalized.to_owned())

@@ -14,12 +14,19 @@ use super::thread::{refresh_trace_thread_metadata, replace_run_preview};
 use super::tree::refresh_trace_tree_metadata;
 use super::{PartitionKey, event_time_unix_nano, run_event_idempotency_key, status_from_record};
 
+pub(super) struct SegmentObjectMetadata<'a> {
+    pub segment_uri: &'a str,
+    pub etag: &'a str,
+    pub total_bytes: usize,
+    pub search_index_uri: &'a str,
+    pub search_index_bytes: usize,
+    pub search_index_schema_version: i64,
+}
+
 pub(super) async fn persist_metadata(
     tx: &tokio_postgres::Transaction<'_>,
     partition: &PartitionKey,
-    segment_uri: &str,
-    etag: &str,
-    total_bytes: usize,
+    object_metadata: SegmentObjectMetadata<'_>,
     records: &[SpanRecord],
 ) -> Result<bool> {
     let first = records
@@ -48,20 +55,24 @@ pub(super) async fn persist_metadata(
             "INSERT INTO trace_segments(
                 project_name, uri, etag, total_bytes, span_count,
                 min_start_time_unix_nano, max_end_time_unix_nano,
-                time_bucket_start_unix_nano, schema_version
+                time_bucket_start_unix_nano, schema_version,
+                search_index_uri, search_index_bytes, search_index_schema_version
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             RETURNING id",
             &[
                 &first.project_name,
-                &segment_uri,
-                &etag,
-                &(total_bytes as i64),
+                &object_metadata.segment_uri,
+                &object_metadata.etag,
+                &(object_metadata.total_bytes as i64),
                 &(records.len() as i64),
                 &min_start,
                 &max_end,
                 &partition.time_bucket_start_unix_nano,
                 &SPAN_SEGMENT_SCHEMA_VERSION,
+                &object_metadata.search_index_uri,
+                &(object_metadata.search_index_bytes as i64),
+                &object_metadata.search_index_schema_version,
             ],
         )
         .await

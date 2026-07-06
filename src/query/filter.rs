@@ -7,6 +7,7 @@ const MAX_FILTER_DEPTH: usize = 16;
 const MAX_FILTER_NODES: usize = 128;
 
 mod parser;
+mod phase6;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FilterExpr {
@@ -35,7 +36,19 @@ enum FilterKind {
         value: FilterValue,
         negated: bool,
     },
-    Search(String),
+    Search {
+        field: Option<FilterField>,
+        query: String,
+    },
+    JsonKey {
+        field: Option<FilterField>,
+        pattern: String,
+    },
+    JsonKeySearch {
+        field: Option<FilterField>,
+        path: String,
+        query: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +88,10 @@ enum FilterField {
     TotalTokens,
     TotalCost,
     Error,
+    Inputs,
+    Outputs,
+    Extra,
+    AttributesJson,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,10 +174,15 @@ fn compile_expr(
             value,
             negated,
         } => compile_contains(*field, value, *negated, run_alias, project_names),
-        FilterKind::Search(query) => {
+        FilterKind::Search { query, .. } => {
             let _query_len = query.len();
             Err(FilterError::Unsupported(
                 "full-text search requires the Phase 6 object-store index".to_owned(),
+            ))
+        }
+        FilterKind::JsonKey { .. } | FilterKind::JsonKeySearch { .. } => {
+            Err(FilterError::Unsupported(
+                "payload JSON filters require the Phase 6 object-store index".to_owned(),
             ))
         }
     }
@@ -335,6 +357,12 @@ fn compile_compare(
             let boolean = value.as_bool("error")?;
             compile_error_column(op, &format!("{run_alias}.status"), boolean)
         }
+        FilterField::Inputs
+        | FilterField::Outputs
+        | FilterField::Extra
+        | FilterField::AttributesJson => Err(FilterError::Unsupported(
+            "payload JSON filters require the Phase 6 object-store index".to_owned(),
+        )),
     }
 }
 

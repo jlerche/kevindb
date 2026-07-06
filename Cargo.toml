@@ -23,6 +23,7 @@ bytes = "1.11.0"
 chrono = { version = "0.4.42", default-features = false, features = ["std"] }
 datafusion = { version = "54.0.0", default-features = false, features = ["sql"] }
 futures-util = "0.3.31"
+fst = "0.4.7"
 hex = "0.4.3"
 object_store = "0.13.2"
 opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic-messages", "trace"] }

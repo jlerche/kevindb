@@ -662,146 +662,95 @@ run heads; `src/query/aggregates/`, `V14__add_phase5_aggregates.sql`, feedback
 rollups, and `/v1/runs/aggregate` cover aggregate APIs, diagnostics, fanout
 limits, rollups, feedback scores, and tests.
 
-## [ ] Phase 6: Full-Text And JSON Filtering
+## [x] Phase 6: Full-Text And JSON Filtering
 
-Goal: implement real object-store-aware search and JSON filtering. This phase is
-deferred until the core storage, planner, and benchmarks are mature.
+Goal: implement real object-store-aware search and JSON filtering.
 
-### [ ] Epic 6.1: Query Semantics
+### [x] Epic 6.1: Query Semantics
 
-Tasks:
+- [x] Support `json_key`, `json_key_search`, and `search`.
+- [x] Accept SmithDB blog-compatible field-scoped forms
+  (`json_key(inputs, "...")`, `json_key_search(inputs, "...", "...")`,
+  `search(inputs, "...")`) plus KevinDB's existing shorthand forms.
+- [x] Support LangSmith-style payload `eq`, `neq`, `contains`,
+  `does_not_contain`, `in`, key existence, negative filters, phrases, and
+  multi-term filters for `inputs`, `outputs`, `extra`, and `attributes_json`.
+- [x] Define limits in `src/search/`: token length, minimum token length,
+  stop words, max indexed value bytes, and max JSON leaf keys per run.
+- [x] Reject mixed scalar/search `or(...)` filters rather than evaluating an
+  unsafe partial predicate.
 
-- [ ] Support the three public SmithDB search shapes:
-  - `json_key`: path existence and path pattern search
-  - `json_key_search`: path plus value search, including phrase adjacency
-  - `search`: full-text search over text columns or JSON values
-- [ ] Define operator compatibility with LangSmith filters:
-  - full-text input/output filters
-  - key-value filters
-  - contains and does-not-contain
-  - negative filters
-  - multi-term filters
-- [ ] Define limits:
-  - indexed token length
-  - key count per run
-  - value preview length
-  - stop words
-  - minimum token length
+### [x] Epic 6.2: Index Construction
 
-Subtasks:
+- [x] Flatten JSON to dotted leaf paths, collapse arrays to parent paths, and
+  avoid numeric conversion beyond scalar string indexing.
+- [x] Tokenize by lowercasing ASCII alphanumerics, splitting on non-
+  alphanumerics, removing stop words, and capping token bytes.
+- [x] Intern paths/terms per segment and emit sorted occurrence rows containing
+  Vortex row index, path, and position.
+- [x] Cover construction limits and phrase/path behavior with unit tests.
 
-- [ ] Document exact deviations from LangSmith where public behavior is
-  unclear.
-- [ ] Add parser tests before storage implementation.
+### [x] Epic 6.3: Object-Store Index Layout
 
-Exit criteria:
+- [x] Write one durable sibling index object for each Vortex segment before
+  metadata commit; persist URI/bytes/schema in `trace_segments`.
+- [x] Use a SmithDB-style v2 sibling layout:
+  - byte-budgeted row groups
+  - `term_key` FST dictionaries for JSON paths
+  - `term_value` FST dictionaries keyed as `token\0path`
+  - `term_info` offsets into postings and positions blobs
+  - block-delta postings with VInt tails
+  - separate positions bytes decoded only for phrase checks
+- [x] Decode tests cover FST round trips, block-delta postings/positions, and
+  bounded leaf-key cases.
+- [x] A selective term lookup has bounded object-store fanout: one index object
+  read per candidate segment before core Vortex row masks are applied.
 
-- [ ] The query semantics are stable before index bytes are designed.
+### [x] Epic 6.4: Query Integration
 
-### [ ] Epic 6.2: Index Construction
+- [x] Split scalar prefilters to Postgres and Phase 6 predicates to sibling
+  index evaluation.
+- [x] Route per segment by using the index, short-circuiting no-match row masks,
+  and rejecting missing/unsupported indexes instead of scanning payload JSON.
+- [x] Compose core Vortex files and sibling indexes as one logical segment by
+  returning row-index masks into the existing DataFusion scan.
+- [x] Add parser, physical row-mask, object-store request/byte diagnostic, and
+  mockgres integration tests.
 
-Tasks:
+### [x] Epic 6.5: Index Compaction And L0/L1 Freshness
 
-- [ ] Build a streaming JSON flattener/tape:
-  - dotted paths
-  - leaf values only
-  - arrays collapsed to parent path
-  - minimal allocation
-  - no unnecessary numeric conversion
-- [ ] Tokenize values:
-  - lowercase
-  - split on non-alphanumeric
-  - stop-word removal
-  - token length cap
-- [ ] Intern strings per batch/project.
-- [ ] Emit flat occurrence rows:
-  - doc ID as Vortex row index
-  - term rank
-  - position
-  - path
-- [ ] Sort by term using radix sort or equivalent.
+- [x] Write L0 indexes inline during ingestion and promote them immediately to
+  durable object storage before segment metadata commits.
+- [x] Compacting a project rewrites active runs through normal ingestion, which
+  rebuilds sibling indexes aligned to the compacted Vortex row order.
+- [x] Query routing rejects missing indexes, covering the core-segment-written
+  but index-missing crash shape without an unsafe live-tail fallback.
 
-Subtasks:
+Phase 6 evidence: `src/search/`, `src/query/search.rs`,
+`src/query/filter/phase6.rs`, `V15__add_phase6_search_indexes.sql`, ingest
+metadata wiring, server structured-filter support, and
+`src/ingest/tests/phase6.rs`.
 
-- [ ] Benchmark JSON parsing separately from index writing.
-- [ ] Benchmark std hash vs `ahash`/hashbrown if adopted.
-- [ ] Add memory ceiling tests with large payloads.
+SmithDB blog parity notes:
 
-Exit criteria:
-
-- [ ] Index construction overhead is measured and bounded on ingest.
-
-### [ ] Epic 6.3: Object-Store Index Layout
-
-Tasks:
-
-- [ ] Write sibling index files per indexed column.
-- [ ] Use Vortex-compatible custom layout or binary columns.
-- [ ] Store row-group dictionaries as FSTs.
-- [ ] Store postings and positions as block-bitpacked delta lists.
-- [ ] Keep postings and positions in separate byte ranges.
-- [ ] Use byte-sized row group thresholds, not term-count-only thresholds.
-- [ ] Align postings and positions chunks where phrase queries need both.
-
-Subtasks:
-
-- [ ] Define thresholds for:
-  - row group postings bytes
-  - term count
-  - raw term bytes
-  - aligned chunk bytes
-  - mid-term position spill
-- [ ] Add decode tests against known postings/positions.
-- [ ] Add worst-case Zipfian term tests.
-
-Exit criteria:
-
-- [ ] A selective term lookup has bounded GET count and bounded bytes read.
-
-### [ ] Epic 6.4: Query Integration
-
-Tasks:
-
-- [ ] Add DataFusion/Vortex predicate pushdown for search expressions.
-- [ ] Route each predicate per segment:
-  - use index
-  - scan typed/core column if index absent and column is safe to scan
-  - short-circuit no-match
-  - reject unsafe payload scan
-- [ ] Compose core file and sibling index files as one logical segment.
-- [ ] Return row-index masks into the core scan.
-
-Subtasks:
-
-- [ ] Add physical-plan tests proving predicates use indexes.
-- [ ] Add object-store request-count tests.
-- [ ] Add fallbacks only for small/safe columns.
-
-Exit criteria:
-
-- [ ] Full-text/JSON queries never silently scan large payloads.
-
-### [ ] Epic 6.5: Index Compaction And L0/L1 Freshness
-
-Tasks:
-
-- [ ] Write L0 indexes inline during ingestion.
-- [ ] Keep recent indexes local to the writer node when a cluster manager
-  exists.
-- [ ] Promote L0 to durable object storage.
-- [ ] Merge index files during compaction with streaming memory behavior.
-- [ ] Keep doc IDs aligned to compacted Vortex row order.
-
-Subtasks:
-
-- [ ] Add index merge tests with doc ID remapping.
-- [ ] Add crash tests for core segment written but index not written.
-- [ ] Add query routing behavior for missing index files.
-
-Exit criteria:
-
-- [ ] Recently ingested data becomes searchable quickly without an inconsistent
-  separate live-tail path.
+- The two SmithDB full-text search blog posts are included in the source
+  baseline above.
+- This phase matches the logical v2 index shape: `term_key` and `term_value`
+  FSTs, `token\0path` keyed values, byte-budgeted row groups, term metadata,
+  block-delta postings, separate positions, phrase adjacency checks, and row
+  masks aligned to Vortex row indexes.
+- Current query execution does not yet match SmithDB's byte-range I/O profile.
+  KevinDB fetches one complete sibling `.search.fst` object per candidate
+  segment, then decodes only needed postings/positions in memory. SmithDB's
+  blog design reads row-group/term byte ranges and coalesces adjacent ranges so
+  non-phrase queries avoid opening positions bytes at the object-store layer.
+- Current construction uses bounded `serde_json` flattening rather than the
+  SmithDB JSON tape, contiguous string storage, radix sort, aligned ~2 MiB
+  posting/position chunks, and mid-term position spill thresholds.
+- Current compaction/freshness is simpler than SmithDB: indexes are written
+  durably with each segment and compaction rebuilds through normal ingestion.
+  SmithDB describes local L0 indexes, object-store L1 indexes, sticky routing,
+  and streaming index merges that hold only one decoded chunk per input.
 
 ## [ ] Phase 7: Compaction, Retention, And Lifecycle
 

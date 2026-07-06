@@ -16,6 +16,10 @@ use tokio_postgres::NoTls;
 
 use crate::otlp::{RunEventKind, SpanRecord, span_records_from_export};
 use crate::query::{QueryEngine, RunQuery, RunSummary};
+use crate::search::{
+    SEARCH_INDEX_SCHEMA_VERSION, build_search_index, encode_search_index,
+    search_index_uri_for_segment,
+};
 use crate::segment::encode_span_records;
 
 const INGEST_TIME_BUCKET_UNIX_NANOS: i64 = 60 * 60 * 1_000_000_000;
@@ -24,7 +28,7 @@ mod indexes;
 mod metadata;
 mod thread;
 mod tree;
-use metadata::persist_metadata;
+use metadata::{SegmentObjectMetadata, persist_metadata};
 
 pub(crate) async fn refresh_trace_materialized_metadata(
     tx: &tokio_postgres::Transaction<'_>,
@@ -417,12 +421,33 @@ impl Ingestor {
             records: records.clone(),
             error,
         })?;
+        let search_index = build_search_index(&records).map_err(|error| PersistError {
+            records: records.clone(),
+            error,
+        })?;
+        let search_index_payload =
+            encode_search_index(&search_index).map_err(|error| PersistError {
+                records: records.clone(),
+                error,
+            })?;
+        let search_index_uri = search_index_uri_for_segment(&segment_uri);
         let path = Path::from(segment_uri.as_str());
         let put_result = self
             .object_store
             .put(&path, PutPayload::from_bytes(payload.clone()))
             .await
             .context("write Vortex segment to object store")
+            .map_err(|error| PersistError {
+                records: records.clone(),
+                error,
+            })?;
+        self.object_store
+            .put(
+                &Path::from(search_index_uri.as_str()),
+                PutPayload::from_bytes(search_index_payload.clone()),
+            )
+            .await
+            .context("write search index to object store")
             .map_err(|error| PersistError {
                 records: records.clone(),
                 error,
@@ -452,9 +477,14 @@ impl Ingestor {
         let metadata_inserted = persist_metadata(
             &tx,
             partition,
-            &segment_uri,
-            put_result.e_tag.as_deref().unwrap_or(""),
-            payload.len(),
+            SegmentObjectMetadata {
+                segment_uri: &segment_uri,
+                etag: put_result.e_tag.as_deref().unwrap_or(""),
+                total_bytes: payload.len(),
+                search_index_uri: &search_index_uri,
+                search_index_bytes: search_index_payload.len(),
+                search_index_schema_version: SEARCH_INDEX_SCHEMA_VERSION,
+            },
             &records,
         )
         .await

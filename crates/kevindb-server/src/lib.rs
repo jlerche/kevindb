@@ -536,7 +536,7 @@ mod tests {
         assert!(diagnostics.actual_object_store_requests > 0);
         assert!(diagnostics.actual_object_store_bytes_read > 0);
 
-        let unsupported_filter_response = app
+        let search_filter_response = app
             .clone()
             .oneshot(
                 Request::builder()
@@ -549,10 +549,10 @@ mod tests {
                     })))?,
             )
             .await?;
-        assert_eq!(
-            unsupported_filter_response.status(),
-            StatusCode::BAD_REQUEST
-        );
+        assert_eq!(search_filter_response.status(), StatusCode::OK);
+        let search_filter_body: RunsResponse =
+            decode_response(search_filter_response.into_body()).await?;
+        assert!(search_filter_body.runs.is_empty());
 
         let filtered_response = app
             .clone()

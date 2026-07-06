@@ -22,6 +22,7 @@ mod object_store_stats;
 mod planner;
 mod random_access;
 mod rows;
+mod search;
 mod threads;
 mod tree;
 mod tree_access;
@@ -185,6 +186,9 @@ impl QueryEngine {
 
     async fn list_runs_inner(&self, query: RunQuery) -> Result<Vec<RunSummary>> {
         let plan = load_run_query_plan(&self.postgres_url, &query).await?;
+        let (plan, _) =
+            search::apply_phase6_search_indexes(Arc::clone(&self.object_store), plan, &query)
+                .await?;
         let deleted_runs = if query.include_deleted {
             std::collections::HashSet::new()
         } else {
@@ -229,6 +233,9 @@ impl QueryEngine {
             load_deleted_run_keys(&self.postgres_url, &query).await?
         };
         let postgres_query_time = postgres_started.elapsed();
+        let (plan, search_index_reads) =
+            search::apply_phase6_search_indexes(Arc::clone(&self.object_store), plan, &query)
+                .await?;
         let candidate_segments = plan.segments.len();
         let candidate_runs = plan.candidate_runs;
         let candidate_bytes = plan.candidate_bytes;
@@ -256,8 +263,12 @@ impl QueryEngine {
                 candidate_runs,
                 candidate_bytes,
                 estimated_object_store_requests,
-                actual_object_store_requests: object_store_reads.request_count(),
-                actual_object_store_bytes_read: object_store_reads.bytes_read,
+                actual_object_store_requests: object_store_reads
+                    .request_count()
+                    .saturating_add(search_index_reads.request_count()),
+                actual_object_store_bytes_read: object_store_reads
+                    .bytes_read
+                    .saturating_add(search_index_reads.bytes_read),
                 vortex_files_opened: candidate_segments,
                 rows_returned: runs.len(),
                 postgres_query_time,
@@ -774,6 +785,9 @@ fn current_segment_source(uri: String) -> SegmentSource {
         uri,
         total_bytes: 0,
         schema_version: crate::segment::SPAN_SEGMENT_SCHEMA_VERSION,
+        search_index_uri: None,
+        search_index_bytes: 0,
+        search_index_schema_version: 0,
         candidate_rows: Vec::new(),
     }
 }
