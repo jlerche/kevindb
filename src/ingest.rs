@@ -562,6 +562,7 @@ impl Ingestor {
         if segment_ids.is_empty() {
             return Ok(0);
         }
+        let compacted_at_unix_nano = current_time_unix_nano()?;
 
         let (client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
             .await
@@ -574,7 +575,8 @@ impl Ingestor {
 
         let sql = format!(
             "UPDATE trace_segments
-            SET compacted_at = CURRENT_TIMESTAMP
+            SET compacted_at = CURRENT_TIMESTAMP,
+                compacted_at_unix_nano = $1
             WHERE id IN ({}) AND compacted_at IS NULL",
             segment_ids
                 .iter()
@@ -583,7 +585,7 @@ impl Ingestor {
                 .join(", ")
         );
         let updated = client
-            .execute(sql.as_str(), &[])
+            .execute(sql.as_str(), &[&compacted_at_unix_nano])
             .await
             .context("mark segments compacted")?;
         Ok(updated as usize)
@@ -759,6 +761,14 @@ fn stable_hash(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+fn current_time_unix_nano() -> Result<i64> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before unix epoch")?
+        .as_nanos();
+    i64::try_from(nanos).context("system time exceeds i64 nanoseconds")
 }
 
 fn sql_string_literal(value: &str) -> String {

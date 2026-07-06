@@ -788,20 +788,20 @@ Exit criteria:
 
 - [ ] Compaction can be run concurrently without corrupting manifests.
 
-### [ ] Epic 7.2: Retention And Deletes
+### [x] Epic 7.2: Retention And Deletes
 
 Tasks:
 
 - [x] Enforce project retention policies.
 - [x] Materialize delete vectors per segment.
 - [x] Apply delete masks in query planning and DataFusion scans.
-- [ ] Reclaim compacted/deleted objects after a grace period.
+- [x] Reclaim compacted/deleted objects after a grace period.
 
 Subtasks:
 
 - [x] Add retention service tests.
 - [x] Add delete-vector pushdown tests.
-- [ ] Add object cleanup dry-run mode.
+- [x] Add object cleanup dry-run mode.
 
 Exit criteria:
 

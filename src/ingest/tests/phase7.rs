@@ -92,3 +92,80 @@ async fn retention_policy_expires_old_runs_and_pushes_delete_masks() {
 
     mockgres.stop().await.expect("stop mockgres");
 }
+
+#[tokio::test]
+async fn compacted_object_cleanup_supports_dry_run_and_reclaims_objects() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 1,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+    let first = ingestor
+        .ingest_records(vec![sample_record("1111111111111111", 10)])
+        .await
+        .expect("ingest first")
+        .flush
+        .expect("first flush");
+    let second = ingestor
+        .ingest_records(vec![sample_record("2222222222222222", 20)])
+        .await
+        .expect("ingest second")
+        .flush
+        .expect("second flush");
+    let compacted = ingestor
+        .compact_project("demo")
+        .await
+        .expect("compact demo");
+    assert_eq!(compacted.compacted_segments, 2);
+
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store.clone());
+    let dry_run = query_engine
+        .cleanup_compacted_objects_at(i64::MAX, Duration::ZERO, true)
+        .await
+        .expect("dry-run compacted cleanup");
+    assert!(dry_run.dry_run);
+    assert_eq!(dry_run.candidates.len(), 2);
+    assert_eq!(dry_run.deleted_objects, 0);
+    object_store
+        .head(&Path::from(first.segment_uri.as_str()))
+        .await
+        .expect("dry run keeps first compacted object");
+
+    let applied = query_engine
+        .cleanup_compacted_objects_at(i64::MAX, Duration::ZERO, false)
+        .await
+        .expect("apply compacted cleanup");
+    assert!(!applied.dry_run);
+    assert_eq!(applied.candidates.len(), 2);
+    assert_eq!(applied.deleted_objects, 4);
+    assert!(
+        object_store
+            .head(&Path::from(first.segment_uri.as_str()))
+            .await
+            .is_err()
+    );
+    assert!(
+        object_store
+            .head(&Path::from(second.segment_uri.as_str()))
+            .await
+            .is_err()
+    );
+
+    let repeated = query_engine
+        .cleanup_compacted_objects_at(i64::MAX, Duration::ZERO, false)
+        .await
+        .expect("repeat compacted cleanup");
+    assert!(repeated.candidates.is_empty());
+    assert_eq!(repeated.deleted_objects, 0);
+
+    mockgres.stop().await.expect("stop mockgres");
+}

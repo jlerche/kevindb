@@ -17,6 +17,7 @@ use crate::otlp::RunEventKind;
 const MAX_DATAFUSION_SEGMENTS_PER_BATCH: usize = 8;
 
 mod aggregates;
+mod cleanup;
 pub mod filter;
 mod object_store_stats;
 mod planner;
@@ -33,6 +34,7 @@ pub use aggregates::{
     FeedbackScoreStats, NumericStats, RunAggregateGroup, RunAggregateMetrics, RunAggregateQuery,
     RunAggregateResult, RunAggregateRow, RunAggregateSource,
 };
+pub use cleanup::{ObjectCleanupCandidate, ObjectCleanupReceipt};
 use filter::FilterExpr;
 use object_store_stats::{
     MeasuringObjectStore, ObjectStoreReadLimits, ObjectStoreReadSnapshot, datafusion_batch_query,
