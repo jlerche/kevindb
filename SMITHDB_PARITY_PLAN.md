@@ -772,16 +772,16 @@ Goal: make immutable object storage practical over time.
 Tasks:
 
 - [ ] Move explicit compaction into a service loop.
-- [ ] Use Postgres leases for compaction work.
-- [ ] Compact by project/time partition.
-- [ ] Rewrite small segments into query-optimized segments.
-- [ ] Merge run events into compacted snapshots when safe.
-- [ ] Merge or rebuild indexes when Phase 6 exists.
+- [x] Use Postgres leases for compaction work.
+- [x] Compact by project/time partition.
+- [x] Rewrite small segments into query-optimized segments.
+- [x] Merge run events into compacted snapshots when safe.
+- [x] Merge or rebuild indexes when Phase 6 exists.
 
 Subtasks:
 
-- [ ] Add lease migration and mockgres tests.
-- [ ] Add compaction idempotency.
+- [x] Add lease migration and mockgres tests.
+- [x] Add compaction idempotency.
 - [ ] Add orphaned object reconciliation.
 
 Exit criteria:

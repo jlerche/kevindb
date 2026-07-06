@@ -169,3 +169,83 @@ async fn compacted_object_cleanup_supports_dry_run_and_reclaims_objects() {
 
     mockgres.stop().await.expect("stop mockgres");
 }
+
+#[tokio::test]
+async fn compaction_service_respects_project_leases() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 64,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+    ingestor
+        .ingest_records(vec![sample_record("1111111111111111", 10)])
+        .await
+        .expect("ingest first segment");
+    ingestor
+        .ingest_records(vec![sample_record("2222222222222222", 20)])
+        .await
+        .expect("ingest second segment");
+
+    let (client, connection) = tokio_postgres::connect(mockgres.postgres_url(), NoTls)
+        .await
+        .expect("connect postgres");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .execute(
+            "INSERT INTO compaction_leases(
+                project_name, holder_id, lease_expires_at_unix_nano
+            )
+            VALUES ('demo', 'other-node', $1)",
+            &[&i64::MAX],
+        )
+        .await
+        .expect("insert competing lease");
+
+    let blocked = ingestor
+        .run_compaction_service_once(CompactionServiceConfig {
+            holder_id: "node-a".to_owned(),
+            lease_duration: Duration::from_secs(60),
+        })
+        .await
+        .expect("run blocked compaction pass");
+    assert_eq!(blocked.projects_scanned, 1);
+    assert_eq!(blocked.leases_acquired, 0);
+    assert_eq!(blocked.compacted_segments, 0);
+
+    let compacted = ingestor
+        .run_compaction_service_once(CompactionServiceConfig {
+            holder_id: "other-node".to_owned(),
+            lease_duration: Duration::from_secs(60),
+        })
+        .await
+        .expect("run lease-holder compaction pass");
+    assert_eq!(compacted.projects_scanned, 1);
+    assert_eq!(compacted.leases_acquired, 1);
+    assert_eq!(compacted.compacted_segments, 2);
+    assert_eq!(compacted.written_segments, 1);
+
+    let active_leases: i64 = client
+        .query_one("SELECT count(*) FROM compaction_leases", &[])
+        .await
+        .expect("count compaction leases")
+        .get(0);
+    assert_eq!(active_leases, 0);
+    let runs = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store)
+        .list_runs(RunQuery::new("demo"))
+        .await
+        .expect("list compacted runs");
+    assert_eq!(runs.len(), 2);
+
+    mockgres.stop().await.expect("stop mockgres");
+}

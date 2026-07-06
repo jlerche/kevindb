@@ -24,11 +24,13 @@ use crate::segment::encode_span_records;
 
 const INGEST_TIME_BUCKET_UNIX_NANOS: i64 = 60 * 60 * 1_000_000_000;
 
+mod compaction;
 mod indexes;
 mod metadata;
 mod routing;
 mod thread;
 mod tree;
+pub use compaction::{CompactionServiceConfig, CompactionServiceReceipt};
 use metadata::{SegmentObjectMetadata, persist_metadata};
 
 pub(crate) async fn refresh_trace_materialized_metadata(
@@ -304,7 +306,9 @@ impl Ingestor {
 
         let grouped_records = group_records_by_partition(
             runs.iter()
-                .map(span_record_from_run_summary)
+                .map(|run| {
+                    span_record_from_run_summary(run, &compaction_batch_key(&old_segment_ids))
+                })
                 .collect::<Vec<_>>(),
         );
         let mut flushes = Vec::new();
@@ -641,7 +645,7 @@ fn receipt_from_flushes(accepted_spans: usize, flushes: Vec<FlushReceipt>) -> In
     }
 }
 
-fn span_record_from_run_summary(run: &RunSummary) -> SpanRecord {
+fn span_record_from_run_summary(run: &RunSummary, compaction_batch_key: &str) -> SpanRecord {
     SpanRecord {
         project_name: run.project_name.clone(),
         run_id: run.run_id.clone().unwrap_or_default(),
@@ -662,7 +666,7 @@ fn span_record_from_run_summary(run: &RunSummary) -> SpanRecord {
         },
         event_kind: RunEventKind::Compact,
         attributes_json: run.attributes_json.clone(),
-        idempotency_key: Some(compaction_idempotency_key(run)),
+        idempotency_key: Some(compaction_idempotency_key(run, compaction_batch_key)),
     }
 }
 
@@ -740,17 +744,25 @@ fn run_event_idempotency_key(record: &SpanRecord) -> String {
     )
 }
 
-fn compaction_idempotency_key(run: &RunSummary) -> String {
-    static NEXT_COMPACTION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+fn compaction_batch_key(segment_ids: &[i64]) -> String {
+    segment_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
-    let sequence = NEXT_COMPACTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let now_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
+fn compaction_idempotency_key(run: &RunSummary, compaction_batch_key: &str) -> String {
     format!(
-        "compact:{}:{}:{}:{}:{}",
-        run.project_name, run.trace_id, run.span_id, now_ns, sequence
+        "compact:{}:{}:{}:{}:{}:{}:{}:{:016x}",
+        compaction_batch_key,
+        run.project_name,
+        run.trace_id,
+        run.span_id,
+        run.start_time_unix_nano,
+        run.end_time_unix_nano,
+        run.status,
+        stable_hash(run.attributes_json.as_bytes())
     )
 }
 
