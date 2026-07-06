@@ -383,7 +383,7 @@ pub(crate) fn estimate_vortex_object_store_requests(candidate_segments: usize) -
 pub(crate) fn estimate_search_index_object_store_requests_for_segments(
     candidate_segments: usize,
 ) -> usize {
-    const ESTIMATED_REQUESTS_PER_SEARCH_INDEX: usize = 3;
+    const ESTIMATED_REQUESTS_PER_SEARCH_INDEX: usize = 4;
     candidate_segments.saturating_mul(ESTIMATED_REQUESTS_PER_SEARCH_INDEX)
 }
 

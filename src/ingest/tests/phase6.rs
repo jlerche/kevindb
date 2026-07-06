@@ -100,6 +100,68 @@ async fn phase6_search_and_json_filters_use_sibling_indexes() {
     mockgres.stop().await.expect("stop mockgres");
 }
 
+#[tokio::test]
+async fn phase6_search_indexes_are_rebuilt_during_compaction() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 1,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+
+    ingestor
+        .ingest_records(vec![
+            searchable_record(SearchRecordArgs {
+                span_id: "1111111111111111",
+                start_time_unix_nano: 10,
+                prompt: "find invoice alpha",
+                answer: "hello brave world",
+                thread_id: "thread-a",
+            }),
+            searchable_record(SearchRecordArgs {
+                span_id: "2222222222222222",
+                start_time_unix_nano: 20,
+                prompt: "plain request",
+                answer: "ordinary result",
+                thread_id: "thread-b",
+            }),
+        ])
+        .await
+        .expect("ingest compactable search records");
+
+    let compacted = ingestor
+        .compact_project("demo")
+        .await
+        .expect("compact searchable project");
+    assert_eq!(compacted.compacted_segments, 2);
+    assert_eq!(compacted.written_segments, 2);
+
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store);
+    assert_filter_matches(&query_engine, r#"search("invoice")"#, &["1111111111111111"]).await;
+    assert_filter_matches(
+        &query_engine,
+        r#"json_key_search(outputs, "answer", "\"brave world\"")"#,
+        &["1111111111111111"],
+    )
+    .await;
+    assert_filter_matches(
+        &query_engine,
+        r#"json_key(inputs, "prompt")"#,
+        &["1111111111111111", "2222222222222222"],
+    )
+    .await;
+
+    mockgres.stop().await.expect("stop mockgres");
+}
+
 async fn assert_filter_matches(query_engine: &QueryEngine, filter: &str, span_ids: &[&str]) {
     let mut query = RunQuery::new("demo");
     query.filter = Some(FilterExpr::parse(filter).expect("parse filter"));

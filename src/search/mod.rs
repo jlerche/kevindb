@@ -9,12 +9,19 @@ use crate::otlp::SpanRecord;
 mod codec;
 mod indexer;
 mod predicate;
+mod selection;
 
 pub use codec::{
     SEARCH_INDEX_HEADER_LEN, SearchIndexDirectory, SearchIndexGroupDirectory, SearchIndexHeader,
-    SearchIndexRange, decode_search_index_directory, decode_search_index_header,
+    SearchIndexRange, SearchIndexTermInfo, decode_search_index_directory,
+    decode_search_index_header, decode_search_term_infos, encode_search_term_infos,
 };
 pub use predicate::{SearchField, SearchPredicate, SearchQuery, tokens_for_text};
+pub use selection::{
+    SearchIndexGroupDictionary, SearchIndexGroupSelection, SearchIndexGroupTermSlices,
+    SearchIndexTermSlice, SearchIndexTermSlices, decode_search_group_dictionary,
+    select_search_index_groups, select_search_index_terms,
+};
 
 use codec::{
     checked_range, checked_u32, decode_loaded_group, decode_positions, decode_u32_list,
@@ -82,13 +89,6 @@ struct DecodedTerm {
     path: String,
     rows: BTreeSet<u32>,
     positions_by_row: BTreeMap<u32, BTreeSet<u32>>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SearchIndexGroupSelection {
-    pub term_key_groups: BTreeSet<usize>,
-    pub term_value_groups: BTreeSet<usize>,
-    pub include_positions: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,15 +356,6 @@ pub fn search_index_uri_for_segment(segment_uri: &str) -> String {
         .unwrap_or_else(|| format!("{segment_uri}.search.fst"))
 }
 
-pub fn select_search_index_groups(
-    directory: &SearchIndexDirectory,
-    predicate: &SearchPredicate,
-) -> SearchIndexGroupSelection {
-    let mut selection = SearchIndexGroupSelection::default();
-    select_groups_for_predicate(directory, predicate, &mut selection);
-    selection
-}
-
 pub fn decode_search_index_chunks(
     directory: &SearchIndexDirectory,
     chunks: SearchIndexChunks,
@@ -398,103 +389,6 @@ fn decode_group_chunks(
             )
         })
         .collect()
-}
-
-fn select_groups_for_predicate(
-    directory: &SearchIndexDirectory,
-    predicate: &SearchPredicate,
-    selection: &mut SearchIndexGroupSelection,
-) {
-    match predicate {
-        SearchPredicate::And(children) | SearchPredicate::Or(children) => {
-            for child in children {
-                select_groups_for_predicate(directory, child, selection);
-            }
-        }
-        SearchPredicate::Not(child) => select_groups_for_predicate(directory, child, selection),
-        SearchPredicate::Text { field, query } => {
-            select_value_groups_for_query(directory, field, query, selection);
-        }
-        SearchPredicate::JsonKey { pattern } => {
-            select_key_groups_for_pattern(directory, pattern, selection);
-        }
-    }
-}
-
-fn select_key_groups_for_pattern(
-    directory: &SearchIndexDirectory,
-    pattern: &str,
-    selection: &mut SearchIndexGroupSelection,
-) {
-    let pattern = normalize_like_pattern(pattern);
-    if !pattern.contains('*') {
-        for (index, group) in directory.term_key_groups.iter().enumerate() {
-            if min_max_may_contain_exact(&group.min_term, &group.max_term, pattern.as_bytes()) {
-                selection.term_key_groups.insert(index);
-            }
-        }
-        return;
-    }
-
-    if let Some(prefix) = simple_trailing_wildcard_prefix(&pattern) {
-        for (index, group) in directory.term_key_groups.iter().enumerate() {
-            if min_max_overlaps_prefix(&group.min_term, &group.max_term, prefix.as_bytes()) {
-                selection.term_key_groups.insert(index);
-            }
-        }
-        return;
-    }
-
-    selection
-        .term_key_groups
-        .extend(0..directory.term_key_groups.len());
-}
-
-fn select_value_groups_for_query(
-    directory: &SearchIndexDirectory,
-    field: &SearchField,
-    query: &SearchQuery,
-    selection: &mut SearchIndexGroupSelection,
-) {
-    for term in query.terms() {
-        select_value_groups_for_token(directory, field, term, false, selection);
-    }
-    for phrase in query.phrases() {
-        let needs_positions = phrase.len() > 1;
-        for term in phrase {
-            select_value_groups_for_token(directory, field, term, needs_positions, selection);
-        }
-    }
-}
-
-fn select_value_groups_for_token(
-    directory: &SearchIndexDirectory,
-    field: &SearchField,
-    token: &str,
-    include_positions: bool,
-    selection: &mut SearchIndexGroupSelection,
-) {
-    if include_positions {
-        selection.include_positions = true;
-    }
-    match field {
-        SearchField::ExactPath(path) => {
-            let key = term_value_key(token, path);
-            for (index, group) in directory.term_value_groups.iter().enumerate() {
-                if min_max_may_contain_exact(&group.min_term, &group.max_term, &key) {
-                    selection.term_value_groups.insert(index);
-                }
-            }
-        }
-        SearchField::All | SearchField::PathPrefix(_) => {
-            let prefix = term_value_prefix(token);
-            for (index, group) in directory.term_value_groups.iter().enumerate() {
-                if min_max_overlaps_prefix(&group.min_term, &group.max_term, &prefix) {
-                    selection.term_value_groups.insert(index);
-                }
-            }
-        }
-    }
 }
 
 fn build_row_groups(
@@ -680,20 +574,20 @@ fn positions_by_row_path(terms: Vec<DecodedTerm>) -> BTreeMap<(u32, String), BTr
     positions
 }
 
-fn term_value_key(token: &str, path: &str) -> Vec<u8> {
+pub(super) fn term_value_key(token: &str, path: &str) -> Vec<u8> {
     let mut key = term_value_prefix(token);
     key.extend_from_slice(path.as_bytes());
     key
 }
 
-fn term_value_prefix(token: &str) -> Vec<u8> {
+pub(super) fn term_value_prefix(token: &str) -> Vec<u8> {
     let mut prefix = Vec::with_capacity(token.len() + 1);
     prefix.extend_from_slice(token.as_bytes());
     prefix.push(KEY_VALUE_SEPARATOR);
     prefix
 }
 
-fn term_path(term: &[u8]) -> String {
+pub(super) fn term_path(term: &[u8]) -> String {
     let path = term
         .iter()
         .position(|byte| *byte == KEY_VALUE_SEPARATOR)
@@ -710,11 +604,11 @@ fn group_overlaps_prefix(group: &RowGroup, prefix: &[u8]) -> bool {
     min_max_overlaps_prefix(&group.min_term, &group.max_term, prefix)
 }
 
-fn min_max_may_contain_exact(min_term: &[u8], max_term: &[u8], key: &[u8]) -> bool {
+pub(super) fn min_max_may_contain_exact(min_term: &[u8], max_term: &[u8], key: &[u8]) -> bool {
     min_term <= key && key <= max_term
 }
 
-fn min_max_overlaps_prefix(min_term: &[u8], max_term: &[u8], prefix: &[u8]) -> bool {
+pub(super) fn min_max_overlaps_prefix(min_term: &[u8], max_term: &[u8], prefix: &[u8]) -> bool {
     if max_term < prefix {
         return false;
     }
@@ -734,17 +628,17 @@ fn next_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-fn normalize_like_pattern(pattern: &str) -> String {
+pub(super) fn normalize_like_pattern(pattern: &str) -> String {
     pattern.replace('%', "*")
 }
 
-fn simple_trailing_wildcard_prefix(pattern: &str) -> Option<&str> {
+pub(super) fn simple_trailing_wildcard_prefix(pattern: &str) -> Option<&str> {
     pattern
         .strip_suffix('*')
         .filter(|prefix| !prefix.contains('*'))
 }
 
-fn path_matches_pattern(path: &str, pattern: &str) -> bool {
+pub(super) fn path_matches_pattern(path: &str, pattern: &str) -> bool {
     if !pattern.contains('*') {
         return path == pattern;
     }

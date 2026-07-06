@@ -684,6 +684,8 @@ Goal: implement real object-store-aware search and JSON filtering.
 
 - [x] Flatten JSON to dotted leaf paths, collapse arrays to parent paths, and
   avoid numeric conversion beyond scalar string indexing.
+- [x] Stream JSON construction with a serde visitor instead of materializing a
+  `serde_json::Value` tree for indexing.
 - [x] Tokenize by lowercasing ASCII alphanumerics, splitting on non-
   alphanumerics, removing stop words, and capping token bytes.
 - [x] Intern paths/terms per segment and emit sorted occurrence rows containing
@@ -705,8 +707,8 @@ Goal: implement real object-store-aware search and JSON filtering.
 - [x] Decode tests cover FST round trips, block-delta postings/positions, and
   bounded leaf-key cases.
 - [x] A selective term lookup has bounded object-store fanout: header,
-  directory, and selected row-group chunks are read before core Vortex row masks
-  are applied.
+  directory, selected FST/term-info chunks, and exact term postings/positions
+  subranges are read before core Vortex row masks are applied.
 
 ### [x] Epic 6.4: Query Integration
 
@@ -730,8 +732,8 @@ Goal: implement real object-store-aware search and JSON filtering.
 
 Phase 6 evidence: `src/search/`, `src/query/search.rs`,
 `src/query/filter/phase6.rs`, `V15__add_phase6_search_indexes.sql`, ingest
-metadata wiring, server structured-filter support, and
-`src/ingest/tests/phase6.rs`.
+metadata wiring, server structured-filter support, streaming JSON construction
+tests, range-read diagnostics tests, and `src/ingest/tests/phase6.rs`.
 
 SmithDB blog parity notes:
 
@@ -743,20 +745,21 @@ SmithDB blog parity notes:
   masks aligned to Vortex row indexes.
 - Current query execution uses object-store byte ranges instead of fetching the
   complete sibling `.search.fst` object. It reads the header and directory,
-  prunes row groups by min/max term bounds, fetches only selected row-group
-  FST/term-info/postings chunks, and skips positions ranges for non-phrase
-  predicates.
-- The remaining I/O delta is granularity: SmithDB reads exact postings/positions
-  subranges for selected terms and coalesces adjacent ranges. KevinDB currently
-  reads the postings chunk for each surviving row group, bounded by the same
-  byte-budgeted row-group design.
-- Current construction uses bounded `serde_json` flattening rather than the
-  SmithDB JSON tape, contiguous string storage, radix sort, aligned ~2 MiB
-  posting/position chunks, and mid-term position spill thresholds.
-- Current compaction/freshness is simpler than SmithDB: indexes are written
-  durably with each segment and compaction rebuilds through normal ingestion.
-  SmithDB describes local L0 indexes, object-store L1 indexes, sticky routing,
-  and streaming index merges that hold only one decoded chunk per input.
+  prunes row groups by min/max term bounds, fetches selected row-group
+  FST/term-info chunks, reads exact postings/positions subranges for matched
+  term ordinals, coalesces adjacent ranges, and skips positions ranges for
+  non-phrase predicates.
+- Current construction streams JSON leaves without building a `serde_json::Value`
+  tree, emits sorted term dictionaries through bounded accumulators, and uses
+  byte-budgeted row groups. KevinDB does not yet use SmithDB's exact JSON tape,
+  contiguous string storage, radix-sort occurrence pipeline, aligned ~2 MiB
+  posting/position chunks, or mid-term position spill thresholds.
+- Current compaction/freshness follows KevinDB's stateless-ingest storage rule:
+  indexes are written durably with each segment before metadata commits, and
+  compaction rebuilds sibling indexes through normal ingestion. Search after
+  compaction is covered by tests. SmithDB's local L0 indexes, sticky routing,
+  object-store L1 promotion, and streaming index merges remain distributed
+  runtime work tracked in Phase 8, not a Phase 6 correctness dependency.
 
 ## [ ] Phase 7: Compaction, Retention, And Lifecycle
 

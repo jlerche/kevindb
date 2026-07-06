@@ -9,9 +9,11 @@ use object_store::path::Path;
 
 use crate::search::{
     SEARCH_INDEX_HEADER_LEN, SEARCH_INDEX_SCHEMA_VERSION, SearchIndexChunks, SearchIndexDirectory,
-    SearchIndexGroupBytes, SearchIndexGroupDirectory, SearchIndexRange, SearchPredicate,
-    decode_search_index_chunks, decode_search_index_directory, decode_search_index_header,
-    select_search_index_groups,
+    SearchIndexGroupBytes, SearchIndexGroupDictionary, SearchIndexGroupDirectory,
+    SearchIndexGroupTermSlices, SearchIndexRange, SearchIndexTermInfo, SearchIndexTermSlices,
+    SearchPredicate, decode_search_group_dictionary, decode_search_index_chunks,
+    decode_search_index_directory, decode_search_index_header, encode_search_term_infos,
+    select_search_index_groups, select_search_index_terms,
 };
 
 use super::RunQuery;
@@ -97,7 +99,15 @@ async fn load_matching_rows(
     let path = Path::from(search_index_uri);
     let directory = load_search_index_directory(object_store, &path, stats).await?;
     let selection = select_search_index_groups(&directory, predicate);
-    let chunks = load_selected_chunks(object_store, &path, &directory, &selection, stats).await?;
+    let chunks = load_selected_chunks(
+        object_store,
+        &path,
+        &directory,
+        &selection,
+        predicate,
+        stats,
+    )
+    .await?;
     let index = decode_search_index_chunks(&directory, chunks)?;
     Ok(index.matching_rows(predicate))
 }
@@ -125,48 +135,66 @@ async fn load_selected_chunks(
     path: &Path,
     directory: &SearchIndexDirectory,
     selection: &crate::search::SearchIndexGroupSelection,
+    predicate: &SearchPredicate,
     stats: &mut ObjectStoreReadSnapshot,
 ) -> Result<SearchIndexChunks> {
+    let dictionaries = load_selected_dictionaries(object_store, path, directory, selection, stats)
+        .await
+        .context("load selected search dictionaries")?;
+    let term_slices = select_search_index_terms(
+        predicate,
+        &dictionaries.term_key_groups,
+        &dictionaries.term_value_groups,
+    );
+    load_term_slices(object_store, path, directory, term_slices, stats).await
+}
+
+async fn load_selected_dictionaries(
+    object_store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    directory: &SearchIndexDirectory,
+    selection: &crate::search::SearchIndexGroupSelection,
+    stats: &mut ObjectStoreReadSnapshot,
+) -> Result<SearchIndexDictionaries> {
     let mut ranges = Vec::new();
-    let term_key_plans = plan_group_ranges(
+    let term_key_plans = plan_dictionary_ranges(
         &selection.term_key_groups,
         &directory.term_key_groups,
-        false,
         &mut ranges,
     );
-    let term_value_plans = plan_group_ranges(
+    let term_value_plans = plan_dictionary_ranges(
         &selection.term_value_groups,
         &directory.term_value_groups,
-        selection.include_positions,
         &mut ranges,
     );
     let chunks = read_ranges(object_store, path, &ranges, stats).await?;
-    Ok(SearchIndexChunks {
-        term_key_groups: materialize_group_chunks(&chunks, term_key_plans),
-        term_value_groups: materialize_group_chunks(&chunks, term_value_plans),
+    Ok(SearchIndexDictionaries {
+        term_key_groups: materialize_dictionaries(
+            &chunks,
+            &directory.term_key_groups,
+            term_key_plans,
+        )?,
+        term_value_groups: materialize_dictionaries(
+            &chunks,
+            &directory.term_value_groups,
+            term_value_plans,
+        )?,
     })
 }
 
-fn plan_group_ranges(
+fn plan_dictionary_ranges(
     group_indexes: &BTreeSet<usize>,
     directories: &[SearchIndexGroupDirectory],
-    include_positions: bool,
     ranges: &mut Vec<Range<u64>>,
-) -> Vec<GroupRangePlan> {
+) -> Vec<DictionaryRangePlan> {
     group_indexes
         .iter()
         .filter_map(|group_index| {
             let directory = directories.get(*group_index)?;
-            Some(GroupRangePlan {
+            Some(DictionaryRangePlan {
                 group_index: *group_index,
                 fst: push_range(ranges, directory.fst),
                 term_infos: push_range(ranges, directory.term_infos),
-                postings: push_range(ranges, directory.postings),
-                positions: if include_positions && !directory.positions.is_empty() {
-                    Some(push_range(ranges, directory.positions))
-                } else {
-                    None
-                },
             })
         })
         .collect()
@@ -178,23 +206,179 @@ fn push_range(ranges: &mut Vec<Range<u64>>, range: SearchIndexRange) -> usize {
     index
 }
 
-fn materialize_group_chunks(
+fn materialize_dictionaries(
     chunks: &[Bytes],
-    plans: Vec<GroupRangePlan>,
-) -> Vec<SearchIndexGroupBytes> {
+    directories: &[SearchIndexGroupDirectory],
+    plans: Vec<DictionaryRangePlan>,
+) -> Result<Vec<SearchIndexGroupDictionary>> {
     plans
         .into_iter()
-        .map(|plan| SearchIndexGroupBytes {
-            group_index: plan.group_index,
-            fst_bytes: chunks[plan.fst].clone(),
-            term_info_bytes: chunks[plan.term_infos].clone(),
-            postings: chunks[plan.postings].clone(),
-            positions: plan
-                .positions
-                .map(|index| chunks[index].clone())
-                .unwrap_or_default(),
+        .map(|plan| {
+            let directory = directories
+                .get(plan.group_index)
+                .context("search dictionary plan group out of bounds")?;
+            decode_search_group_dictionary(
+                plan.group_index,
+                chunks[plan.fst].clone(),
+                &chunks[plan.term_infos],
+                directory.term_info_count,
+            )
         })
         .collect()
+}
+
+async fn load_term_slices(
+    object_store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    directory: &SearchIndexDirectory,
+    term_slices: SearchIndexTermSlices,
+    stats: &mut ObjectStoreReadSnapshot,
+) -> Result<SearchIndexChunks> {
+    let mut ranges = Vec::new();
+    let term_key_plans = plan_term_data_ranges(
+        term_slices.term_key_groups,
+        &directory.term_key_groups,
+        false,
+        &mut ranges,
+    )?;
+    let term_value_plans = plan_term_data_ranges(
+        term_slices.term_value_groups,
+        &directory.term_value_groups,
+        true,
+        &mut ranges,
+    )?;
+    let chunks = read_ranges(object_store, path, &ranges, stats).await?;
+    Ok(SearchIndexChunks {
+        term_key_groups: materialize_term_data_groups(&chunks, term_key_plans)?,
+        term_value_groups: materialize_term_data_groups(&chunks, term_value_plans)?,
+    })
+}
+
+fn plan_term_data_ranges(
+    groups: Vec<SearchIndexGroupTermSlices>,
+    directories: &[SearchIndexGroupDirectory],
+    allow_positions: bool,
+    ranges: &mut Vec<Range<u64>>,
+) -> Result<Vec<TermDataGroupPlan>> {
+    groups
+        .into_iter()
+        .map(|group| {
+            let directory = directories
+                .get(group.group_index)
+                .context("term data plan group out of bounds")?;
+            let terms = group
+                .terms
+                .into_iter()
+                .map(|term| {
+                    Ok(TermDataPlan {
+                        ordinal: term.ordinal,
+                        info: term.info,
+                        postings: push_range(
+                            ranges,
+                            subrange(
+                                directory.postings,
+                                term.info.postings_offset,
+                                term.info.postings_len,
+                            )?,
+                        ),
+                        positions: if allow_positions
+                            && term.include_positions
+                            && term.info.positions_len > 0
+                        {
+                            Some(push_range(
+                                ranges,
+                                subrange(
+                                    directory.positions,
+                                    term.info.positions_offset,
+                                    term.info.positions_len,
+                                )?,
+                            ))
+                        } else {
+                            None
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(TermDataGroupPlan {
+                group_index: group.group_index,
+                fst_bytes: group.fst_bytes,
+                term_info_count: group.term_info_count,
+                terms,
+            })
+        })
+        .collect()
+}
+
+fn materialize_term_data_groups(
+    chunks: &[Bytes],
+    plans: Vec<TermDataGroupPlan>,
+) -> Result<Vec<SearchIndexGroupBytes>> {
+    plans
+        .into_iter()
+        .map(|plan| {
+            let mut infos = vec![SearchIndexTermInfo::default(); plan.term_info_count as usize];
+            let mut postings = Vec::new();
+            let mut positions = Vec::new();
+            for term in plan.terms {
+                let postings_offset = checked_u32(postings.len(), "local postings offset")?;
+                let postings_chunk = chunks
+                    .get(term.postings)
+                    .context("missing postings chunk for selected term")?;
+                postings.extend_from_slice(postings_chunk);
+                let positions_offset = checked_u32(positions.len(), "local positions offset")?;
+                let positions_len = if let Some(index) = term.positions {
+                    let positions_chunk = chunks
+                        .get(index)
+                        .context("missing positions chunk for selected term")?;
+                    positions.extend_from_slice(positions_chunk);
+                    checked_u32(positions_chunk.len(), "local positions len")?
+                } else {
+                    0
+                };
+                if let Some(info) = infos.get_mut(term.ordinal) {
+                    *info = SearchIndexTermInfo {
+                        doc_count: term.info.doc_count,
+                        postings_offset,
+                        postings_len: checked_u32(postings_chunk.len(), "local postings len")?,
+                        positions_offset,
+                        positions_len,
+                    };
+                }
+            }
+            Ok(SearchIndexGroupBytes {
+                group_index: plan.group_index,
+                fst_bytes: plan.fst_bytes,
+                term_info_bytes: Bytes::from(encode_search_term_infos(&infos)),
+                postings: Bytes::from(postings),
+                positions: Bytes::from(positions),
+            })
+        })
+        .collect()
+}
+
+fn subrange(base: SearchIndexRange, offset: u32, len: u32) -> Result<SearchIndexRange> {
+    let offset = base
+        .offset
+        .checked_add(u64::from(offset))
+        .context("search term range offset overflow")?;
+    let end = offset
+        .checked_add(u64::from(len))
+        .context("search term range end overflow")?;
+    let base_end = base
+        .offset
+        .checked_add(base.len)
+        .context("search group range end overflow")?;
+    if end > base_end {
+        bail!("search term range exceeds row group range");
+    }
+    Ok(SearchIndexRange {
+        offset,
+        len: u64::from(len),
+    })
+}
+
+fn checked_u32(value: usize, label: &str) -> Result<u32> {
+    u32::try_from(value).with_context(|| format!("{label} does not fit in u32"))
 }
 
 async fn read_one_range(
@@ -218,24 +402,114 @@ async fn read_ranges(
     if ranges.is_empty() {
         return Ok(Vec::new());
     }
+    let (coalesced_ranges, plans) = coalesce_ranges(ranges);
     stats.get_ranges_requests = stats.get_ranges_requests.saturating_add(1);
-    let chunks = object_store
-        .get_ranges(path, ranges)
+    let coalesced_chunks = object_store
+        .get_ranges(path, &coalesced_ranges)
         .await
         .with_context(|| format!("read search index ranges from {path}"))?;
-    stats.bytes_read = stats
-        .bytes_read
-        .saturating_add(chunks.iter().map(|chunk| chunk.len() as u64).sum::<u64>());
+    stats.bytes_read = stats.bytes_read.saturating_add(
+        coalesced_chunks
+            .iter()
+            .map(|chunk| chunk.len() as u64)
+            .sum::<u64>(),
+    );
+    let mut chunks = vec![Bytes::new(); ranges.len()];
+    for plan in plans {
+        let parent = coalesced_chunks
+            .get(plan.coalesced_index)
+            .context("missing coalesced search range")?;
+        let base = coalesced_ranges
+            .get(plan.coalesced_index)
+            .context("missing coalesced search range plan")?;
+        let start = usize::try_from(plan.start.saturating_sub(base.start))
+            .context("coalesced search range start does not fit usize")?;
+        let len = usize::try_from(plan.end.saturating_sub(plan.start))
+            .context("coalesced search range len does not fit usize")?;
+        let end = start
+            .checked_add(len)
+            .context("coalesced search range slice overflow")?;
+        chunks[plan.original_index] = parent.slice(start..end);
+    }
     Ok(chunks)
 }
 
+fn coalesce_ranges(ranges: &[Range<u64>]) -> (Vec<Range<u64>>, Vec<CoalescedRangePlan>) {
+    const COALESCE_GAP_BYTES: u64 = 1024 * 1024;
+    const COALESCE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+    let mut indexed = ranges
+        .iter()
+        .enumerate()
+        .map(|(index, range)| (index, range.clone()))
+        .collect::<Vec<_>>();
+    indexed.sort_by(|(_, left), (_, right)| {
+        left.start
+            .cmp(&right.start)
+            .then_with(|| left.end.cmp(&right.end))
+    });
+
+    let mut coalesced = Vec::<Range<u64>>::new();
+    let mut plans = Vec::with_capacity(ranges.len());
+    for (original_index, range) in indexed {
+        let next_index = match coalesced.last_mut() {
+            Some(last)
+                if range.start <= last.end.saturating_add(COALESCE_GAP_BYTES)
+                    && range.end.saturating_sub(last.start) <= COALESCE_MAX_BYTES =>
+            {
+                last.end = last.end.max(range.end);
+                coalesced.len() - 1
+            }
+            _ => {
+                coalesced.push(range.clone());
+                coalesced.len() - 1
+            }
+        };
+        plans.push(CoalescedRangePlan {
+            original_index,
+            coalesced_index: next_index,
+            start: range.start,
+            end: range.end,
+        });
+    }
+    (coalesced, plans)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct GroupRangePlan {
+struct SearchIndexDictionaries {
+    term_key_groups: Vec<SearchIndexGroupDictionary>,
+    term_value_groups: Vec<SearchIndexGroupDictionary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DictionaryRangePlan {
     group_index: usize,
     fst: usize,
     term_infos: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TermDataGroupPlan {
+    group_index: usize,
+    fst_bytes: Bytes,
+    term_info_count: u32,
+    terms: Vec<TermDataPlan>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TermDataPlan {
+    ordinal: usize,
+    info: SearchIndexTermInfo,
     postings: usize,
     positions: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CoalescedRangePlan {
+    original_index: usize,
+    coalesced_index: usize,
+    start: u64,
+    end: u64,
 }
 
 fn filter_candidate_rows(
@@ -340,7 +614,7 @@ mod tests {
             vec![row(1)]
         );
         assert_eq!(stats.get_requests, 0);
-        assert_eq!(stats.get_ranges_requests, 3);
+        assert_eq!(stats.get_ranges_requests, 4);
         assert!(stats.bytes_read < full_index_len);
     }
 

@@ -2494,6 +2494,7 @@ dependencies = [
  "portpicker",
  "prost",
  "refinery",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-postgres",

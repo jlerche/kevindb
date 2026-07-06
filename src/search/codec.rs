@@ -51,6 +51,15 @@ impl SearchIndexRange {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchIndexTermInfo {
+    pub doc_count: u32,
+    pub postings_offset: u32,
+    pub postings_len: u32,
+    pub positions_offset: u32,
+    pub positions_len: u32,
+}
+
 pub(super) fn encode_search_index(index: &SearchIndex) -> Result<Bytes> {
     let mut key_groups = prepare_groups(&index.term_key_groups)?;
     let mut value_groups = prepare_groups(&index.term_value_groups)?;
@@ -270,7 +279,7 @@ fn decode_full_groups(bytes: &[u8], groups: &[SearchIndexGroupDirectory]) -> Res
         .collect()
 }
 
-fn encode_term_infos(term_infos: &[TermInfo]) -> Vec<u8> {
+pub fn encode_search_term_infos(term_infos: &[SearchIndexTermInfo]) -> Vec<u8> {
     let mut out = Vec::with_capacity(term_infos.len() * 20);
     for info in term_infos {
         put_u32(&mut out, info.doc_count);
@@ -282,7 +291,10 @@ fn encode_term_infos(term_infos: &[TermInfo]) -> Vec<u8> {
     out
 }
 
-fn decode_term_infos(bytes: &[u8], expected_count: usize) -> Result<Vec<TermInfo>> {
+pub fn decode_search_term_infos(
+    bytes: &[u8],
+    expected_count: usize,
+) -> Result<Vec<SearchIndexTermInfo>> {
     let expected_len = expected_count
         .checked_mul(20)
         .context("term_info len overflow")?;
@@ -292,7 +304,7 @@ fn decode_term_infos(bytes: &[u8], expected_count: usize) -> Result<Vec<TermInfo
     let mut input = ByteReader::new(bytes);
     let term_infos = (0..expected_count)
         .map(|_| {
-            Ok(TermInfo {
+            Ok(SearchIndexTermInfo {
                 doc_count: input.read_u32()?,
                 postings_offset: input.read_u32()?,
                 postings_len: input.read_u32()?,
@@ -303,6 +315,35 @@ fn decode_term_infos(bytes: &[u8], expected_count: usize) -> Result<Vec<TermInfo
         .collect::<Result<Vec<_>>>()?;
     input.expect_done()?;
     Ok(term_infos)
+}
+
+fn encode_term_infos(term_infos: &[TermInfo]) -> Vec<u8> {
+    let term_infos = term_infos
+        .iter()
+        .map(|info| SearchIndexTermInfo {
+            doc_count: info.doc_count,
+            postings_offset: info.postings_offset,
+            postings_len: info.postings_len,
+            positions_offset: info.positions_offset,
+            positions_len: info.positions_len,
+        })
+        .collect::<Vec<_>>();
+    encode_search_term_infos(&term_infos)
+}
+
+fn decode_term_infos(bytes: &[u8], expected_count: usize) -> Result<Vec<TermInfo>> {
+    decode_search_term_infos(bytes, expected_count).map(|term_infos| {
+        term_infos
+            .into_iter()
+            .map(|info| TermInfo {
+                doc_count: info.doc_count,
+                postings_offset: info.postings_offset,
+                postings_len: info.postings_len,
+                positions_offset: info.positions_offset,
+                positions_len: info.positions_len,
+            })
+            .collect()
+    })
 }
 
 fn next_range(offset: &mut u64, len: usize) -> Result<SearchIndexRange> {
