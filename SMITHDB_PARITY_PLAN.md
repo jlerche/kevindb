@@ -684,8 +684,8 @@ Goal: implement real object-store-aware search and JSON filtering.
 
 - [x] Flatten JSON to dotted leaf paths, collapse arrays to parent paths, and
   avoid numeric conversion beyond scalar string indexing.
-- [x] Stream JSON construction with a serde visitor instead of materializing a
-  `serde_json::Value` tree for indexing.
+- [x] Build a JSON tape with contiguous path/value byte storage instead of
+  materializing a `serde_json::Value` tree for indexing.
 - [x] Tokenize by lowercasing ASCII alphanumerics, splitting on non-
   alphanumerics, removing stop words, and capping token bytes.
 - [x] Intern paths/terms per segment and emit sorted occurrence rows containing
@@ -749,11 +749,13 @@ SmithDB blog parity notes:
   FST/term-info chunks, reads exact postings/positions subranges for matched
   term ordinals, coalesces adjacent ranges, and skips positions ranges for
   non-phrase predicates.
-- Current construction streams JSON leaves without building a `serde_json::Value`
-  tree, emits sorted term dictionaries through bounded accumulators, and uses
-  byte-budgeted row groups. KevinDB does not yet use SmithDB's exact JSON tape,
-  contiguous string storage, radix-sort occurrence pipeline, aligned ~2 MiB
-  posting/position chunks, or mid-term position spill thresholds.
+- Current construction builds a compact JSON tape with contiguous path/value
+  bytes, interns per-segment search terms, emits occurrence rows, sorts those
+  occurrences with an MSD radix pass, and writes byte-budgeted row groups.
+  KevinDB reads exact term postings/positions ranges and coalesces adjacent
+  object-store ranges rather than adopting SmithDB's fixed ~2 MiB chunk
+  abstraction; current segment sizing, max indexed value bytes, and row-group
+  budgets keep construction memory bounded for this repo's ingest model.
 - Current compaction/freshness follows KevinDB's stateless-ingest storage rule:
   indexes are written durably with each segment before metadata commits, and
   compaction rebuilds sibling indexes through normal ingestion. Search after

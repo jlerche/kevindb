@@ -1,9 +1,5 @@
-use std::fmt;
-
-use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
-
 use super::{
-    MAX_INDEXED_VALUE_BYTES, MAX_JSON_KEYS_PER_RUN, MutableSearchIndex, SearchIndex,
+    MAX_INDEXED_VALUE_BYTES, MAX_JSON_KEYS_PER_RUN, MutableSearchIndex, SearchIndex, json_tape,
     tokens_for_text,
 };
 use crate::otlp::SpanRecord;
@@ -34,18 +30,15 @@ impl SearchIndexBuilder {
     }
 
     fn add_json(&mut self, row: u32, attributes_json: &str) {
-        if serde_json::from_str::<IgnoredAny>(attributes_json).is_err() {
+        let Ok(tape) = json_tape::JsonTape::parse(attributes_json) else {
             return;
+        };
+        for leaf in tape.leaves().take(MAX_JSON_KEYS_PER_RUN) {
+            match leaf.value {
+                Some(value) => self.add_text(row, leaf.path, bounded_value(value)),
+                None => self.index.add_path(row, leaf.path),
+            }
         }
-        let mut key_count = 0;
-        let mut deserializer = serde_json::Deserializer::from_str(attributes_json);
-        let _ = JsonSeed {
-            builder: self,
-            row,
-            path: String::new(),
-            key_count: &mut key_count,
-        }
-        .deserialize(&mut deserializer);
     }
 
     fn add_text(&mut self, row: u32, path: &str, value: &str) {
@@ -68,206 +61,6 @@ impl SearchIndexBuilder {
 
     fn finish(self) -> anyhow::Result<SearchIndex> {
         self.index.finish()
-    }
-
-    fn add_json_path_leaf(&mut self, row: u32, path: &str, key_count: &mut usize) {
-        if !path.is_empty() && *key_count < MAX_JSON_KEYS_PER_RUN {
-            self.index.add_path(row, path);
-            *key_count += 1;
-        }
-    }
-
-    fn add_json_text_leaf(&mut self, row: u32, path: &str, value: &str, key_count: &mut usize) {
-        if !path.is_empty() && *key_count < MAX_JSON_KEYS_PER_RUN {
-            self.add_text(row, path, bounded_value(value));
-            *key_count += 1;
-        }
-    }
-}
-
-struct JsonSeed<'a> {
-    builder: &'a mut SearchIndexBuilder,
-    row: u32,
-    path: String,
-    key_count: &'a mut usize,
-}
-
-impl<'de> DeserializeSeed<'de> for JsonSeed<'_> {
-    type Value = ();
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(JsonVisitor {
-            builder: self.builder,
-            row: self.row,
-            path: self.path,
-            key_count: self.key_count,
-        })
-    }
-}
-
-struct JsonVisitor<'a> {
-    builder: &'a mut SearchIndexBuilder,
-    row: u32,
-    path: String,
-    key_count: &'a mut usize,
-}
-
-impl<'de> Visitor<'de> for JsonVisitor<'_> {
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("any JSON value")
-    }
-
-    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-    where
-        M: MapAccess<'de>,
-    {
-        let JsonVisitor {
-            builder,
-            row,
-            path,
-            key_count,
-        } = self;
-        let mut saw_value = false;
-        while let Some(key) = map.next_key::<String>()? {
-            saw_value = true;
-            let child_path = join_path(&path, &key);
-            map.next_value_seed(JsonSeed {
-                builder: &mut *builder,
-                row,
-                path: child_path,
-                key_count: &mut *key_count,
-            })?;
-            if *key_count >= MAX_JSON_KEYS_PER_RUN {
-                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-                break;
-            }
-        }
-        if !saw_value {
-            builder.add_json_path_leaf(row, &path, key_count);
-        }
-        Ok(())
-    }
-
-    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let JsonVisitor {
-            builder,
-            row,
-            path,
-            key_count,
-        } = self;
-        let mut saw_value = false;
-        while seq
-            .next_element_seed(JsonSeed {
-                builder: &mut *builder,
-                row,
-                path: path.clone(),
-                key_count: &mut *key_count,
-            })?
-            .is_some()
-        {
-            saw_value = true;
-            if *key_count >= MAX_JSON_KEYS_PER_RUN {
-                while seq.next_element::<IgnoredAny>()?.is_some() {}
-                break;
-            }
-        }
-        if !saw_value {
-            builder.add_json_path_leaf(row, &path, key_count);
-        }
-        Ok(())
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.builder
-            .add_json_text_leaf(self.row, &self.path, value, self.key_count);
-        Ok(())
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.visit_str(&value)
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.builder.add_json_text_leaf(
-            self.row,
-            &self.path,
-            if value { "true" } else { "false" },
-            self.key_count,
-        );
-        Ok(())
-    }
-
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.visit_number(value.to_string())
-    }
-
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.visit_number(value.to_string())
-    }
-
-    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.visit_number(value.to_string())
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.builder
-            .add_json_path_leaf(self.row, &self.path, self.key_count);
-        Ok(())
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.visit_unit()
-    }
-}
-
-impl JsonVisitor<'_> {
-    fn visit_number<E>(self, value: String) -> Result<(), E>
-    where
-        E: serde::de::Error,
-    {
-        self.builder
-            .add_json_text_leaf(self.row, &self.path, &value, self.key_count);
-        Ok(())
-    }
-}
-
-fn join_path(parent: &str, key: &str) -> String {
-    if parent.is_empty() {
-        key.to_owned()
-    } else {
-        format!("{parent}.{key}")
     }
 }
 

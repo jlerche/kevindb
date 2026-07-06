@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Range;
 
 use anyhow::{Context, Result};
 use fst::automaton::Str;
@@ -8,6 +9,7 @@ use crate::otlp::SpanRecord;
 
 mod codec;
 mod indexer;
+mod json_tape;
 mod predicate;
 mod selection;
 
@@ -48,8 +50,10 @@ pub struct SearchIndex {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MutableSearchIndex {
     row_count: u32,
-    term_keys: BTreeMap<Vec<u8>, TermAccumulator>,
-    term_values: BTreeMap<Vec<u8>, TermAccumulator>,
+    term_keys: TermInterner,
+    term_values: TermInterner,
+    key_occurrences: Vec<KeyOccurrence>,
+    value_occurrences: Vec<ValueOccurrence>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -91,6 +95,26 @@ struct DecodedTerm {
     positions_by_row: BTreeMap<u32, BTreeSet<u32>>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TermInterner {
+    bytes: Vec<u8>,
+    terms: Vec<Range<usize>>,
+    lookup: HashMap<Vec<u8>, u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyOccurrence {
+    term_id: u32,
+    row: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValueOccurrence {
+    term_id: u32,
+    row: u32,
+    position: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchIndexGroupBytes {
     pub group_index: usize,
@@ -110,17 +134,16 @@ impl MutableSearchIndex {
     pub(crate) fn new(row_count: usize) -> Self {
         Self {
             row_count: row_count.min(u32::MAX as usize) as u32,
-            term_keys: BTreeMap::new(),
-            term_values: BTreeMap::new(),
+            term_keys: TermInterner::default(),
+            term_values: TermInterner::default(),
+            key_occurrences: Vec::new(),
+            value_occurrences: Vec::new(),
         }
     }
 
     pub(crate) fn add_path(&mut self, row: u32, path: &str) {
-        self.term_keys
-            .entry(path.as_bytes().to_vec())
-            .or_default()
-            .rows
-            .insert(row);
+        let term_id = self.term_keys.intern(path.as_bytes());
+        self.key_occurrences.push(KeyOccurrence { term_id, row });
     }
 
     pub(crate) fn add_value_position(&mut self, row: u32, path: &str, token: &str, position: u32) {
@@ -128,21 +151,41 @@ impl MutableSearchIndex {
         key.extend_from_slice(token.as_bytes());
         key.push(KEY_VALUE_SEPARATOR);
         key.extend_from_slice(path.as_bytes());
-        let accumulator = self.term_values.entry(key).or_default();
-        accumulator.rows.insert(row);
-        accumulator
-            .positions_by_row
-            .entry(row)
-            .or_default()
-            .insert(position);
+        let term_id = self.term_values.intern(&key);
+        self.value_occurrences.push(ValueOccurrence {
+            term_id,
+            row,
+            position,
+        });
     }
 
     fn finish(self) -> Result<SearchIndex> {
+        let term_key_entries = build_key_entries(self.term_keys, self.key_occurrences);
+        let term_value_entries = build_value_entries(self.term_values, self.value_occurrences);
         Ok(SearchIndex {
             row_count: self.row_count,
-            term_key_groups: build_row_groups(self.term_keys, false)?,
-            term_value_groups: build_row_groups(self.term_values, true)?,
+            term_key_groups: build_row_groups(term_key_entries, false)?,
+            term_value_groups: build_row_groups(term_value_entries, true)?,
         })
+    }
+}
+
+impl TermInterner {
+    fn intern(&mut self, term: &[u8]) -> u32 {
+        if let Some(term_id) = self.lookup.get(term) {
+            return *term_id;
+        }
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(term);
+        let term_id = self.terms.len().min(u32::MAX as usize) as u32;
+        self.terms.push(start..self.bytes.len());
+        self.lookup.insert(term.to_vec(), term_id);
+        term_id
+    }
+
+    fn term(&self, term_id: u32) -> &[u8] {
+        let range = &self.terms[term_id as usize];
+        &self.bytes[range.clone()]
     }
 }
 
@@ -391,8 +434,131 @@ fn decode_group_chunks(
         .collect()
 }
 
+fn build_key_entries(
+    interner: TermInterner,
+    mut occurrences: Vec<KeyOccurrence>,
+) -> Vec<(Vec<u8>, TermAccumulator)> {
+    radix_sort_occurrences(&interner, &mut occurrences);
+    let mut entries = Vec::new();
+    let mut current_term_id = None;
+    let mut current = TermAccumulator::default();
+    for occurrence in occurrences {
+        if Some(occurrence.term_id) != current_term_id {
+            if let Some(term_id) = current_term_id {
+                entries.push((interner.term(term_id).to_vec(), current));
+                current = TermAccumulator::default();
+            }
+            current_term_id = Some(occurrence.term_id);
+        }
+        current.rows.insert(occurrence.row);
+    }
+    if let Some(term_id) = current_term_id {
+        entries.push((interner.term(term_id).to_vec(), current));
+    }
+    entries
+}
+
+fn build_value_entries(
+    interner: TermInterner,
+    mut occurrences: Vec<ValueOccurrence>,
+) -> Vec<(Vec<u8>, TermAccumulator)> {
+    radix_sort_occurrences(&interner, &mut occurrences);
+    let mut entries = Vec::new();
+    let mut current_term_id = None;
+    let mut current = TermAccumulator::default();
+    for occurrence in occurrences {
+        if Some(occurrence.term_id) != current_term_id {
+            if let Some(term_id) = current_term_id {
+                entries.push((interner.term(term_id).to_vec(), current));
+                current = TermAccumulator::default();
+            }
+            current_term_id = Some(occurrence.term_id);
+        }
+        current.rows.insert(occurrence.row);
+        current
+            .positions_by_row
+            .entry(occurrence.row)
+            .or_default()
+            .insert(occurrence.position);
+    }
+    if let Some(term_id) = current_term_id {
+        entries.push((interner.term(term_id).to_vec(), current));
+    }
+    entries
+}
+
+fn radix_sort_occurrences<T>(interner: &TermInterner, occurrences: &mut Vec<T>)
+where
+    T: TermOccurrence + Clone,
+{
+    *occurrences = radix_sorted_occurrences(interner, occurrences, 0);
+}
+
+fn radix_sorted_occurrences<T>(interner: &TermInterner, occurrences: &[T], depth: usize) -> Vec<T>
+where
+    T: TermOccurrence + Clone,
+{
+    const SMALL_BUCKET: usize = 32;
+    if occurrences.len() <= SMALL_BUCKET {
+        let mut sorted = occurrences.to_vec();
+        sorted.sort_by(|left, right| compare_occurrence_terms(interner, left, right));
+        return sorted;
+    }
+
+    let mut buckets = (0..257).map(|_| Vec::new()).collect::<Vec<Vec<T>>>();
+    for occurrence in occurrences {
+        let bucket = interner
+            .term(occurrence.term_id())
+            .get(depth)
+            .map(|byte| usize::from(*byte) + 1)
+            .unwrap_or(0);
+        buckets[bucket].push(occurrence.clone());
+    }
+
+    let mut sorted = Vec::with_capacity(occurrences.len());
+    for (bucket_index, bucket) in buckets.into_iter().enumerate() {
+        if bucket.is_empty() {
+            continue;
+        }
+        if bucket_index == 0 || bucket.len() <= SMALL_BUCKET {
+            let mut bucket = bucket;
+            bucket.sort_by(|left, right| compare_occurrence_terms(interner, left, right));
+            sorted.extend(bucket);
+        } else {
+            sorted.extend(radix_sorted_occurrences(interner, &bucket, depth + 1));
+        }
+    }
+    sorted
+}
+
+fn compare_occurrence_terms<T: TermOccurrence>(
+    interner: &TermInterner,
+    left: &T,
+    right: &T,
+) -> std::cmp::Ordering {
+    interner
+        .term(left.term_id())
+        .cmp(interner.term(right.term_id()))
+}
+
+trait TermOccurrence {
+    fn term_id(&self) -> u32;
+}
+
+impl TermOccurrence for KeyOccurrence {
+    fn term_id(&self) -> u32 {
+        self.term_id
+    }
+}
+
+impl TermOccurrence for ValueOccurrence {
+    fn term_id(&self) -> u32 {
+        self.term_id
+    }
+}
+
 fn build_row_groups(
-    terms: BTreeMap<Vec<u8>, TermAccumulator>,
+    terms: Vec<(Vec<u8>, TermAccumulator)>,
     include_positions: bool,
 ) -> Result<Vec<RowGroup>> {
     let entries = terms
