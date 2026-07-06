@@ -839,20 +839,29 @@ Tasks:
 
 - [ ] Route project/tenant queries to the node that recently ingested that
   scope.
-- [ ] Expose local L0 segments/indexes to queries on that node.
-- [ ] Fall back to object-store L1 segments for older data.
-- [ ] Keep query semantics identical across tiers.
+- [x] Expose local L0 segments/indexes to queries on that node through the
+  write-through object-store cache.
+- [x] Fall back to object-store L1 segments for older or non-local data.
+- [x] Keep query semantics identical across tiers by using the same
+  `ObjectStore` interface for L0 cache hits and L1 reads.
 
 Subtasks:
 
 - [ ] Add routing metadata to Postgres or a simple coordinator.
-- [ ] Add query tests mixing L0 and L1.
-- [ ] Add failure tests when the writer node disappears.
+- [x] Add cache/query-path tests mixing L0 and L1 reads.
+- [x] Add failure tests when the writer node disappears.
 
 Exit criteria:
 
 - [ ] Recent data is queryable quickly without waiting for durable index
   promotion.
+
+Progress note: `CachedObjectStore` is now write-through for single-object puts.
+The writer node can serve just-written Vortex segments and `.search.fst`
+sibling indexes from local L0 cache, including range reads sliced from the
+cached full object. A node without that local cache falls back to durable
+object-store L1. Cluster-level sticky routing still needs route metadata and a
+coordinator or load-balancer integration.
 
 ### [ ] Epic 8.3: Distributed Fanout
 

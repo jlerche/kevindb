@@ -145,8 +145,14 @@ impl ObjectStore for CachedObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult> {
+        let payload_bytes = payload_to_bytes(&payload);
         let result = self.inner.put_opts(location, payload, opts).await?;
         self.invalidate_path(location);
+        self.insert(
+            location.as_ref(),
+            cache_key(location.as_ref(), None),
+            CachedObjectRead::from_put(location, payload_bytes, &result),
+        );
         Ok(result)
     }
 
@@ -171,6 +177,13 @@ impl ObjectStore for CachedObjectStore {
         let path = location.to_string();
         let request_key = cache_key(&path, options.range.as_ref());
         if let Some(read) = self.lookup(&request_key).await {
+            return Ok(read.into_get_result(Attributes::new()));
+        }
+        if options.range.is_some()
+            && let Some(full_read) = self.lookup(&cache_key(&path, None)).await
+            && let Some(read) = full_read.slice(options.range.as_ref())
+        {
+            self.insert(&path, request_key, read.clone());
             return Ok(read.into_get_result(Attributes::new()));
         }
 
@@ -253,6 +266,20 @@ struct CachedObjectRead {
 }
 
 impl CachedObjectRead {
+    fn from_put(location: &Path, bytes: Bytes, result: &PutResult) -> Self {
+        let size = bytes.len() as u64;
+        Self {
+            bytes: bytes.to_vec(),
+            location: location.to_string(),
+            last_modified_millis: Utc::now().timestamp_millis(),
+            size,
+            e_tag: result.e_tag.clone(),
+            version: result.version.clone(),
+            range_start: 0,
+            range_end: size,
+        }
+    }
+
     async fn from_get_result(result: GetResult) -> Result<Self> {
         let meta = result.meta.clone();
         let range = result.range.clone();
@@ -290,6 +317,26 @@ impl CachedObjectRead {
     fn weight(&self) -> usize {
         self.bytes.len()
     }
+
+    fn slice(&self, requested: Option<&GetRange>) -> Option<Self> {
+        if self.range_start != 0 || self.range_end != self.size {
+            return None;
+        }
+        let range = requested_range(self.size, requested)?;
+        let start = usize::try_from(range.start).ok()?;
+        let end = usize::try_from(range.end).ok()?;
+        let bytes = self.bytes.get(start..end)?.to_vec();
+        Some(Self {
+            bytes,
+            location: self.location.clone(),
+            last_modified_millis: self.last_modified_millis,
+            size: self.size,
+            e_tag: self.e_tag.clone(),
+            version: self.version.clone(),
+            range_start: range.start,
+            range_end: range.end,
+        })
+    }
 }
 
 fn cache_key(path: &str, range: Option<&GetRange>) -> String {
@@ -301,6 +348,32 @@ fn cache_key(path: &str, range: Option<&GetRange>) -> String {
         Some(GetRange::Offset(offset)) => format!("get:{path}:offset={offset}"),
         Some(GetRange::Suffix(suffix)) => format!("get:{path}:suffix={suffix}"),
     }
+}
+
+fn requested_range(size: u64, range: Option<&GetRange>) -> Option<Range<u64>> {
+    match range {
+        None => Some(0..size),
+        Some(GetRange::Bounded(range)) if range.start <= range.end && range.end <= size => {
+            Some(range.clone())
+        }
+        Some(GetRange::Offset(offset)) if *offset <= size => Some(*offset..size),
+        Some(GetRange::Suffix(suffix)) => {
+            let start = size.saturating_sub(*suffix);
+            Some(start..size)
+        }
+        _ => None,
+    }
+}
+
+fn payload_to_bytes(payload: &PutPayload) -> Bytes {
+    if payload.as_ref().len() == 1 {
+        return payload.as_ref()[0].clone();
+    }
+    let mut bytes = Vec::with_capacity(payload.content_length());
+    for chunk in payload {
+        bytes.extend_from_slice(chunk);
+    }
+    Bytes::from(bytes)
 }
 
 #[derive(Debug)]
@@ -382,6 +455,37 @@ mod tests {
         assert_eq!(store.get_range(&path, 2..5).await?, b"234".as_slice());
         inner.delete(&path).await?;
         assert_eq!(store.get_range(&path, 2..5).await?, b"234".as_slice());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_through_l0_cache_serves_writer_local_range_reads() -> Result<()> {
+        let inner = Arc::new(InMemory::new());
+        let writer = CachedObjectStore::memory(inner.clone(), 1024);
+        let path = Path::from("segments/recent.search.fst");
+
+        writer
+            .put(&path, PutPayload::from_static(b"writer-local-l0"))
+            .await?;
+        inner.delete(&path).await?;
+
+        assert_eq!(writer.get_range(&path, 7..12).await?, b"local".as_slice());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_node_cache_falls_back_to_object_store_l1() -> Result<()> {
+        let inner = Arc::new(InMemory::new());
+        let path = Path::from("segments/durable.search.fst");
+        {
+            let writer = CachedObjectStore::memory(inner.clone(), 1024);
+            writer
+                .put(&path, PutPayload::from_static(b"durable-l1-object"))
+                .await?;
+        }
+
+        let reader = CachedObjectStore::memory(inner, 1024);
+        assert_eq!(reader.get_range(&path, 8..10).await?, b"l1".as_slice());
         Ok(())
     }
 }
