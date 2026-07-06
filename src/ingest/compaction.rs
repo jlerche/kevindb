@@ -1,6 +1,8 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use tokio::sync::watch;
+use tokio::time::sleep;
 use tokio_postgres::NoTls;
 
 use super::{CompactReceipt, Ingestor, current_time_unix_nano};
@@ -21,6 +23,28 @@ pub struct CompactionServiceReceipt {
 }
 
 impl Ingestor {
+    pub async fn run_compaction_service_loop(
+        &self,
+        config: CompactionServiceConfig,
+        interval: Duration,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
+        loop {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            self.run_compaction_service_once(config.clone()).await?;
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_ok() && *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+                () = sleep(interval) => {}
+            }
+        }
+    }
+
     pub async fn run_compaction_service_once(
         &self,
         config: CompactionServiceConfig,

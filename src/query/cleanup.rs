@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use futures_util::TryStreamExt;
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt};
 use tokio_postgres::NoTls;
@@ -21,6 +22,20 @@ pub struct ObjectCleanupReceipt {
     pub dry_run: bool,
     pub candidates: Vec<ObjectCleanupCandidate>,
     pub reclaimable_bytes: i64,
+    pub deleted_objects: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanObjectCandidate {
+    pub uri: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanObjectCleanupReceipt {
+    pub dry_run: bool,
+    pub candidates: Vec<OrphanObjectCandidate>,
+    pub reclaimable_bytes: u64,
     pub deleted_objects: usize,
 }
 
@@ -75,6 +90,91 @@ impl QueryEngine {
             reclaimable_bytes,
             deleted_objects,
         })
+    }
+
+    pub async fn cleanup_orphaned_objects(
+        &self,
+        dry_run: bool,
+    ) -> Result<OrphanObjectCleanupReceipt> {
+        let referenced = self.load_referenced_object_uris().await?;
+        let mut objects = self.object_store.list(None);
+        let mut candidates = Vec::new();
+        while let Some(meta) = objects
+            .try_next()
+            .await
+            .context("list object store for orphan cleanup")?
+        {
+            let uri = meta.location.to_string();
+            if !referenced.contains(&uri) {
+                candidates.push(OrphanObjectCandidate {
+                    uri,
+                    bytes: meta.size,
+                });
+            }
+        }
+        candidates.sort_by(|left, right| left.uri.cmp(&right.uri));
+        let reclaimable_bytes = candidates
+            .iter()
+            .map(|candidate| candidate.bytes)
+            .sum::<u64>();
+        if dry_run {
+            return Ok(OrphanObjectCleanupReceipt {
+                dry_run,
+                candidates,
+                reclaimable_bytes,
+                deleted_objects: 0,
+            });
+        }
+
+        let mut deleted_objects = 0;
+        for candidate in &candidates {
+            delete_if_exists(self.object_store.as_ref(), &candidate.uri).await?;
+            deleted_objects += 1;
+        }
+        Ok(OrphanObjectCleanupReceipt {
+            dry_run,
+            candidates,
+            reclaimable_bytes,
+            deleted_objects,
+        })
+    }
+
+    async fn load_referenced_object_uris(&self) -> Result<std::collections::HashSet<String>> {
+        let (client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
+            .await
+            .context("connect postgres for orphan object reconciliation")?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::warn!(error = %err, "postgres orphan reconciliation failed");
+            }
+        });
+
+        let segment_rows = client
+            .query(
+                "SELECT uri
+                FROM trace_segments
+                WHERE object_deleted_at_unix_nano IS NULL",
+                &[],
+            )
+            .await
+            .context("load referenced segment uris")?;
+        let search_index_rows = client
+            .query(
+                "SELECT search_index_uri
+                FROM trace_segments
+                WHERE search_index_uri IS NOT NULL
+                    AND object_deleted_at_unix_nano IS NULL",
+                &[],
+            )
+            .await
+            .context("load referenced search index uris")?;
+
+        let mut referenced = segment_rows
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect::<std::collections::HashSet<_>>();
+        referenced.extend(search_index_rows.into_iter().map(|row| row.get(0)));
+        Ok(referenced)
     }
 
     async fn load_compacted_cleanup_candidates(

@@ -34,7 +34,9 @@ pub use aggregates::{
     FeedbackScoreStats, NumericStats, RunAggregateGroup, RunAggregateMetrics, RunAggregateQuery,
     RunAggregateResult, RunAggregateRow, RunAggregateSource,
 };
-pub use cleanup::{ObjectCleanupCandidate, ObjectCleanupReceipt};
+pub use cleanup::{
+    ObjectCleanupCandidate, ObjectCleanupReceipt, OrphanObjectCandidate, OrphanObjectCleanupReceipt,
+};
 use filter::FilterExpr;
 use object_store_stats::{
     MeasuringObjectStore, ObjectStoreReadLimits, ObjectStoreReadSnapshot, datafusion_batch_query,

@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use object_store::PutPayload;
+
 use super::*;
 
 #[tokio::test]
@@ -246,6 +248,104 @@ async fn compaction_service_respects_project_leases() {
         .await
         .expect("list compacted runs");
     assert_eq!(runs.len(), 2);
+
+    mockgres.stop().await.expect("stop mockgres");
+}
+
+#[tokio::test]
+async fn compaction_service_loop_honors_shutdown_signal() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        Arc::new(InMemory::new()),
+        IngestConfig {
+            max_spans_per_segment: 64,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+    let (_sender, shutdown) = tokio::sync::watch::channel(true);
+
+    ingestor
+        .run_compaction_service_loop(
+            CompactionServiceConfig {
+                holder_id: "node-a".to_owned(),
+                lease_duration: Duration::from_secs(60),
+            },
+            Duration::from_secs(60),
+            shutdown,
+        )
+        .await
+        .expect("shutdown compaction service loop");
+
+    mockgres.stop().await.expect("stop mockgres");
+}
+
+#[tokio::test]
+async fn orphan_object_cleanup_supports_dry_run_and_preserves_referenced_objects() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let object_store = Arc::new(InMemory::new());
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 64,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+    let flush = ingestor
+        .ingest_records(vec![sample_record("1111111111111111", 10)])
+        .await
+        .expect("ingest referenced object")
+        .flush
+        .expect("referenced flush");
+    let orphan = Path::from("orphans/unreferenced.vortex");
+    object_store
+        .put(&orphan, PutPayload::from_static(b"orphaned bytes"))
+        .await
+        .expect("write orphan object");
+
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store.clone());
+    let dry_run = query_engine
+        .cleanup_orphaned_objects(true)
+        .await
+        .expect("dry-run orphan cleanup");
+    assert!(dry_run.dry_run);
+    assert_eq!(
+        dry_run
+            .candidates
+            .iter()
+            .map(|candidate| candidate.uri.as_str())
+            .collect::<Vec<_>>(),
+        vec!["orphans/unreferenced.vortex"]
+    );
+    assert_eq!(dry_run.deleted_objects, 0);
+    object_store
+        .head(&Path::from(flush.segment_uri.as_str()))
+        .await
+        .expect("referenced segment remains after dry-run");
+    object_store
+        .head(&orphan)
+        .await
+        .expect("orphan remains after dry-run");
+
+    let applied = query_engine
+        .cleanup_orphaned_objects(false)
+        .await
+        .expect("apply orphan cleanup");
+    assert!(!applied.dry_run);
+    assert_eq!(applied.deleted_objects, 1);
+    object_store
+        .head(&Path::from(flush.segment_uri.as_str()))
+        .await
+        .expect("referenced segment remains after apply");
+    assert!(object_store.head(&orphan).await.is_err());
 
     mockgres.stop().await.expect("stop mockgres");
 }

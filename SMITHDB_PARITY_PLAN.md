@@ -767,11 +767,11 @@ SmithDB blog parity notes:
 
 Goal: make immutable object storage practical over time.
 
-### [ ] Epic 7.1: Compaction Service
+### [x] Epic 7.1: Compaction Service
 
 Tasks:
 
-- [ ] Move explicit compaction into a service loop.
+- [x] Move explicit compaction into a service loop.
 - [x] Use Postgres leases for compaction work.
 - [x] Compact by project/time partition.
 - [x] Rewrite small segments into query-optimized segments.
@@ -782,11 +782,11 @@ Subtasks:
 
 - [x] Add lease migration and mockgres tests.
 - [x] Add compaction idempotency.
-- [ ] Add orphaned object reconciliation.
+- [x] Add orphaned object reconciliation.
 
 Exit criteria:
 
-- [ ] Compaction can be run concurrently without corrupting manifests.
+- [x] Compaction can be run concurrently without corrupting manifests.
 
 ### [x] Epic 7.2: Retention And Deletes
 
