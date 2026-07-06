@@ -763,7 +763,7 @@ SmithDB blog parity notes:
   object-store L1 promotion, and streaming index merges remain distributed
   runtime work tracked in Phase 8, not a Phase 6 correctness dependency.
 
-## [ ] Phase 7: Compaction, Retention, And Lifecycle
+## [x] Phase 7: Compaction, Retention, And Lifecycle
 
 Goal: make immutable object storage practical over time.
 
@@ -892,9 +892,9 @@ frontends where public contracts are available.
 
 Tasks:
 
-- [ ] Expand `/runs/query` compatibility for IDs, project/session selectors,
+- [x] Expand `/runs/query` compatibility for IDs, project/session selectors,
   trace/time/root/error/run-type/tag/metadata/feedback filters, and cursors.
-- [ ] Add public run response fields: inputs, outputs, extra, events, tags,
+- [x] Add public run response fields: inputs, outputs, extra, events, tags,
   and attachments if supported later.
 
 Subtasks:
@@ -904,16 +904,16 @@ Subtasks:
 
 Exit criteria:
 
-- [ ] Common `Client.list_runs(...)` usage works without custom client code.
+- [x] Common `Client.list_runs(...)` usage works without custom client code.
 
 ### [ ] Epic 9.2: Feedback API
 
 Tasks:
 
-- [ ] Complete feedback data format parity.
-- [ ] Support filtering feedback by project/session, run, trace, key, score,
+- [x] Complete feedback data format parity.
+- [x] Support filtering feedback by project/session, run, trace, key, score,
   value, source, and time.
-- [ ] Support feedback aggregations in Phase 5.
+- [x] Support feedback aggregations in Phase 5.
 
 Subtasks:
 
@@ -922,24 +922,24 @@ Subtasks:
 
 Exit criteria:
 
-- [ ] Feedback filters are usable in run queries and aggregate queries.
+- [x] Feedback filters are usable in run queries and aggregate queries.
 
-### [ ] Epic 9.3: Threads API
+### [x] Epic 9.3: Threads API
 
 Tasks:
 
-- [ ] Add thread list/query endpoints.
-- [ ] Add thread trace endpoint.
-- [ ] Add cursor pagination.
-- [ ] Include preview and cost/token fields.
+- [x] Add thread list/query endpoints.
+- [x] Add thread trace endpoint.
+- [x] Add cursor pagination.
+- [x] Include preview and cost/token fields.
 
 Subtasks:
 
-- [ ] Add tests using documented `/v2/threads/{thread_id}/traces` shape.
+- [x] Add tests using documented `/v2/threads/{thread_id}/traces` shape.
 
 Exit criteria:
 
-- [ ] Thread reconstruction can support a LangSmith-like thread UI.
+- [x] Thread reconstruction can support a LangSmith-like thread UI.
 
 ## [ ] Phase 10: Operations, Reliability, And Release Readiness
 

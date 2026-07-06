@@ -34,6 +34,8 @@ fn builds_langsmith_run_response_fields() {
             "langsmith.outputs": {"text": "world"},
             "langsmith.extra": {"metadata": {"key": "value"}},
             "langsmith.error": "boom",
+            "langsmith.events": [{"name": "token"}],
+            "langsmith.tags": ["demo"],
         })
         .to_string(),
     });
@@ -50,6 +52,8 @@ fn builds_langsmith_run_response_fields() {
     assert_eq!(response.inputs, json!({"messages": ["hello"]}));
     assert_eq!(response.outputs, Some(json!({"text": "world"})));
     assert_eq!(response.extra, json!({"metadata": {"key": "value"}}));
+    assert_eq!(response.events, vec![json!({"name": "token"})]);
+    assert_eq!(response.tags, vec!["demo"]);
 }
 
 #[test]
@@ -59,12 +63,16 @@ fn merges_partial_langsmith_payload_updates() {
         outputs: None,
         extra: Some(json!({"metadata": {"version": 1}})),
         error: None,
+        events: vec![json!({"name": "token"})],
+        tags: vec!["demo".to_owned()],
     }
     .merge(None, Some(json!({"answer": "world"})), None, None);
 
     assert_eq!(payload.inputs, Some(json!({"prompt": "hello"})));
     assert_eq!(payload.outputs, Some(json!({"answer": "world"})));
     assert_eq!(payload.extra, Some(json!({"metadata": {"version": 1}})));
+    assert_eq!(payload.events, vec![json!({"name": "token"})]);
+    assert_eq!(payload.tags, vec!["demo"]);
 
     let round_trip = LangSmithPayload::from_attributes_json(&payload.to_attributes_json());
     assert_eq!(round_trip, payload);

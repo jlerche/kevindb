@@ -512,6 +512,8 @@ struct LangSmithPayload {
     outputs: Option<Value>,
     extra: Option<Value>,
     error: Option<String>,
+    events: Vec<Value>,
+    tags: Vec<String>,
 }
 
 impl LangSmithPayload {
@@ -537,6 +539,8 @@ impl LangSmithPayload {
                 .get("langsmith.error")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            events: array_values(&attributes, &["langsmith.events", "events"]),
+            tags: string_values(&attributes, &["langsmith.tags", "tags"]),
         }
     }
 
@@ -552,6 +556,8 @@ impl LangSmithPayload {
             outputs: outputs.or(self.outputs),
             extra: extra.or(self.extra),
             error: error.or(self.error),
+            events: self.events,
+            tags: self.tags,
         }
     }
 
@@ -561,9 +567,28 @@ impl LangSmithPayload {
             "langsmith.outputs": self.outputs,
             "langsmith.extra": self.extra.clone().unwrap_or_else(|| json!({})),
             "langsmith.error": self.error,
+            "langsmith.events": self.events,
+            "langsmith.tags": self.tags,
         })
         .to_string()
     }
+}
+
+fn array_values(attributes: &serde_json::Map<String, Value>, keys: &[&str]) -> Vec<Value> {
+    keys.iter()
+        .find_map(|key| attributes.get(*key).and_then(Value::as_array))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn string_values(attributes: &serde_json::Map<String, Value>, keys: &[&str]) -> Vec<String> {
+    keys.iter()
+        .find_map(|key| attributes.get(*key).and_then(Value::as_array))
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -769,6 +794,8 @@ pub struct RunResponse {
     pub inputs: Value,
     pub outputs: Option<Value>,
     pub extra: Value,
+    pub events: Vec<Value>,
+    pub tags: Vec<String>,
     pub error: Option<String>,
     pub dotted_order: String,
     pub child_run_ids: Vec<String>,
@@ -812,6 +839,8 @@ impl From<RunSummary> for RunResponse {
             inputs: payload.inputs.unwrap_or_else(|| json!({})),
             outputs: payload.outputs,
             extra: payload.extra.unwrap_or_else(|| json!({})),
+            events: payload.events,
+            tags: payload.tags,
             error: payload.error.or(error),
             dotted_order,
             child_run_ids: Vec::new(),
