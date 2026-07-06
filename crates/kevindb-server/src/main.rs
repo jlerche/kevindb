@@ -27,10 +27,11 @@ async fn main() -> Result<()> {
     };
 
     let object_store = object_store_from_config(config.object_store, config.cache).await?;
-    let state = ServerState::new_with_node_id(
+    let state = ServerState::new_with_role(
         config.postgres_url,
         object_store,
         ingest_config,
+        config.service_role,
         config.node_id,
     );
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;

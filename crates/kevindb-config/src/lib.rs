@@ -12,6 +12,7 @@ pub const DEFAULT_CACHE_MODE: &str = "memory";
 pub const DEFAULT_INGEST_MAX_FLUSH_DELAY_MS: u64 = 500;
 pub const DEFAULT_INGEST_MAX_SPANS_PER_SEGMENT: usize = 1024;
 pub const DEFAULT_OBJECT_STORE: &str = "memory";
+pub const DEFAULT_SERVICE_ROLE: &str = "all";
 pub const ENV_BIND_ADDR: &str = "KEVINDB_BIND_ADDR";
 pub const ENV_CACHE_DISK_BLOCK_BYTES: &str = "KEVINDB_CACHE_DISK_BLOCK_BYTES";
 pub const ENV_CACHE_DISK_CAPACITY_BYTES: &str = "KEVINDB_CACHE_DISK_CAPACITY_BYTES";
@@ -23,12 +24,14 @@ pub const ENV_INGEST_MAX_SPANS_PER_SEGMENT: &str = "KEVINDB_INGEST_MAX_SPANS_PER
 pub const ENV_NODE_ID: &str = "KEVINDB_NODE_ID";
 pub const ENV_OBJECT_STORE: &str = "KEVINDB_OBJECT_STORE";
 pub const ENV_POSTGRES_URL: &str = "KEVINDB_POSTGRES_URL";
+pub const ENV_SERVICE_ROLE: &str = "KEVINDB_SERVICE_ROLE";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     pub postgres_url: String,
     pub bind_addr: SocketAddr,
     pub node_id: Option<String>,
+    pub service_role: ServiceRole,
     pub object_store: ObjectStoreConfig,
     pub cache: CacheConfig,
     pub ingest: IngestConfig,
@@ -68,6 +71,9 @@ impl ServerConfig {
         let object_store = ObjectStoreConfig::parse(
             &lookup(ENV_OBJECT_STORE).unwrap_or_else(|| DEFAULT_OBJECT_STORE.to_owned()),
         )?;
+        let service_role = ServiceRole::parse(
+            &lookup(ENV_SERVICE_ROLE).unwrap_or_else(|| DEFAULT_SERVICE_ROLE.to_owned()),
+        )?;
         let cache = CacheConfig::from_lookup(&mut lookup)?;
         let ingest = IngestConfig {
             max_spans_per_segment: parse_positive_usize(
@@ -86,6 +92,7 @@ impl ServerConfig {
             postgres_url,
             bind_addr,
             node_id,
+            service_role,
             object_store,
             cache,
             ingest,
@@ -97,6 +104,40 @@ impl ServerConfig {
 pub struct IngestConfig {
     pub max_spans_per_segment: usize,
     pub max_flush_delay: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceRole {
+    All,
+    Ingest,
+    Query,
+    Compaction,
+    Coordinator,
+}
+
+impl ServiceRole {
+    pub fn parse(value: &str) -> Result<Self, ConfigError> {
+        match value.to_ascii_lowercase().as_str() {
+            "all" => Ok(Self::All),
+            "ingest" | "ingestion" => Ok(Self::Ingest),
+            "query" => Ok(Self::Query),
+            "compaction" | "compactor" => Ok(Self::Compaction),
+            "coordination" | "coordinator" | "cluster-manager" => Ok(Self::Coordinator),
+            _ => Err(ConfigError::UnsupportedServiceRole {
+                value: value.to_owned(),
+            }),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Ingest => "ingest",
+            Self::Query => "query",
+            Self::Compaction => "compaction",
+            Self::Coordinator => "coordinator",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +231,7 @@ pub enum ConfigError {
     InvalidUnsignedInteger { name: &'static str, value: String },
     UnsupportedCacheMode { value: String },
     UnsupportedObjectStore { value: String },
+    UnsupportedServiceRole { value: String },
 }
 
 impl Display for ConfigError {
@@ -210,6 +252,9 @@ impl Display for ConfigError {
             }
             Self::UnsupportedObjectStore { value } => {
                 write!(f, "{ENV_OBJECT_STORE}={value} is not supported")
+            }
+            Self::UnsupportedServiceRole { value } => {
+                write!(f, "{ENV_SERVICE_ROLE}={value} is not supported")
             }
         }
     }
@@ -247,6 +292,7 @@ mod tests {
 
         assert_eq!(config.postgres_url, "postgresql://db/postgres");
         assert_eq!(config.node_id, None);
+        assert_eq!(config.service_role, ServiceRole::All);
         assert_eq!(
             config.bind_addr,
             DEFAULT_BIND_ADDR.parse::<SocketAddr>().expect("bind addr")
@@ -277,6 +323,7 @@ mod tests {
             (ENV_POSTGRES_URL, "postgresql://db/postgres"),
             (ENV_BIND_ADDR, "0.0.0.0:8080"),
             (ENV_NODE_ID, "node-a"),
+            (ENV_SERVICE_ROLE, "query"),
             (ENV_OBJECT_STORE, "MEMORY"),
             (ENV_CACHE_MODE, "hybrid"),
             (ENV_CACHE_HYBRID_DIR, "/tmp/kevindb-cache"),
@@ -290,6 +337,7 @@ mod tests {
 
         assert_eq!(config.bind_addr, "0.0.0.0:8080".parse().expect("bind addr"));
         assert_eq!(config.node_id.as_deref(), Some("node-a"));
+        assert_eq!(config.service_role, ServiceRole::Query);
         assert_eq!(config.object_store, ObjectStoreConfig::Memory);
         assert_eq!(
             config.cache,
@@ -351,6 +399,22 @@ mod tests {
             error,
             ConfigError::UnsupportedObjectStore {
                 value: "local".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_service_role() {
+        let error = ServerConfig::from_env_vars([
+            (ENV_POSTGRES_URL, "postgresql://db/postgres"),
+            (ENV_SERVICE_ROLE, "everything"),
+        ])
+        .expect_err("unsupported service role");
+
+        assert_eq!(
+            error,
+            ConfigError::UnsupportedServiceRole {
+                value: "everything".to_owned()
             }
         );
     }

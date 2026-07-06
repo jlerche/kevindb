@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use anyhow::Context;
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
 use kevindb::ingest::{FlushReceipt, IngestConfig, IngestReceipt, Ingestor};
 use kevindb::query::QueryEngine;
+use kevindb_config::ServiceRole;
 use object_store::ObjectStore;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message;
@@ -17,9 +17,10 @@ use tokio_postgres::NoTls;
 
 pub mod cache;
 mod langsmith;
+mod routes;
 mod routing;
+pub use routes::app;
 
-use langsmith::aggregates::query_run_aggregates;
 pub use langsmith::{
     FeedbackResponse, ProjectResponse, RunResponse, RunsQueryRequest, RunsResponse, StringList,
     ThreadResponse, ThreadTraceResponse, ThreadTracesResponse, ThreadsQueryRequest,
@@ -36,6 +37,7 @@ pub struct ServerState {
     postgres_url: String,
     object_store: Arc<dyn ObjectStore>,
     ingestor: Arc<Ingestor>,
+    service_role: ServiceRole,
 }
 
 impl ServerState {
@@ -53,6 +55,22 @@ impl ServerState {
         ingest_config: IngestConfig,
         node_id: Option<String>,
     ) -> Self {
+        Self::new_with_role(
+            postgres_url,
+            object_store,
+            ingest_config,
+            ServiceRole::All,
+            node_id,
+        )
+    }
+
+    pub fn new_with_role(
+        postgres_url: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        ingest_config: IngestConfig,
+        service_role: ServiceRole,
+        node_id: Option<String>,
+    ) -> Self {
         let postgres_url = postgres_url.into();
         let ingestor = Arc::new(Ingestor::with_node_id(
             postgres_url.clone(),
@@ -65,6 +83,7 @@ impl ServerState {
             postgres_url,
             object_store,
             ingestor,
+            service_role,
         }
     }
 
@@ -74,6 +93,10 @@ impl ServerState {
 
     pub async fn flush_pending_ingest(&self) -> anyhow::Result<Vec<FlushReceipt>> {
         self.ingestor.flush().await
+    }
+
+    fn service_role(&self) -> ServiceRole {
+        self.service_role
     }
 
     async fn check_ready(&self) -> anyhow::Result<()> {
@@ -94,44 +117,10 @@ impl ServerState {
     }
 }
 
-pub fn app(state: ServerState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
-        .route("/sessions", get(list_sessions))
-        .route("/v1/sessions", get(list_sessions))
-        .route("/runs", post(create_run))
-        .route("/v1/runs", post(create_run))
-        .route("/runs/{run_id}", get(read_run).patch(update_run))
-        .route("/v1/runs/{run_id}", get(read_run).patch(update_run))
-        .route("/runs/{run_id}/feedback", get(list_run_feedback))
-        .route("/v1/runs/{run_id}/feedback", get(list_run_feedback))
-        .route("/runs/query", post(query_runs))
-        .route("/v1/runs/query", post(query_runs))
-        .route("/runs/aggregate", post(query_run_aggregates))
-        .route("/v1/runs/aggregate", post(query_run_aggregates))
-        .route("/v2/threads/query", post(query_threads))
-        .route("/v2/threads/{thread_id}/traces", get(query_thread_traces))
-        .route("/feedback", get(list_feedback).post(create_feedback))
-        .route("/v1/feedback", get(list_feedback).post(create_feedback))
-        .route("/feedback/{feedback_id}", get(read_feedback))
-        .route("/v1/feedback/{feedback_id}", get(read_feedback))
-        .route("/v1/projects/{project_name}/traces", post(ingest_trace))
-        .route(
-            "/v1/projects/{project_name}/traces/{trace_id}",
-            get(read_project_trace),
-        )
-        .route(
-            "/v1/projects/{project_name}/traces/{trace_id}/runs",
-            get(list_trace_runs),
-        )
-        .route("/v1/projects/{project_name}/route", get(read_project_route))
-        .with_state(state)
-}
-
-async fn healthz() -> Json<HealthResponse> {
+async fn healthz(State(state): State<ServerState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_owned(),
+        role: state.service_role().as_str().to_owned(),
     })
 }
 
@@ -139,6 +128,7 @@ async fn readyz(State(state): State<ServerState>) -> Result<Json<HealthResponse>
     state.check_ready().await?;
     Ok(Json(HealthResponse {
         status: "ok".to_owned(),
+        role: state.service_role().as_str().to_owned(),
     }))
 }
 
@@ -170,6 +160,7 @@ async fn list_trace_runs(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
+    pub role: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

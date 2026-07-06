@@ -816,13 +816,13 @@ Goal: scale compute while preserving object-storage durability and low fanout.
 
 Tasks:
 
-- [ ] Define stateless service roles:
+- [x] Define stateless service roles:
   - ingestion
   - query
   - compaction
   - coordination/cluster manager
-- [ ] Add process-level config for each role.
-- [ ] Add health/readiness checks per role.
+- [x] Add process-level config for each role.
+- [x] Add health/readiness checks per role.
 
 Subtasks:
 
@@ -831,7 +831,7 @@ Subtasks:
 
 Exit criteria:
 
-- [ ] Local development can run services separately.
+- [x] Local development can run services separately.
 
 ### [x] Epic 8.2: Sticky Routing And L0
 
