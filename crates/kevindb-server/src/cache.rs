@@ -97,6 +97,7 @@ impl CachedObjectStore {
             .entry(path.to_owned())
             .or_default()
             .insert(key);
+        crate::metrics::record_cache_write();
     }
 
     fn invalidate_path(&self, path: &Path) {
@@ -117,6 +118,7 @@ impl CachedObjectStore {
                 }
             }
         }
+        crate::metrics::record_cache_invalidation(1);
     }
 
     fn is_cacheable_get(options: &GetOptions) -> bool {
@@ -177,6 +179,7 @@ impl ObjectStore for CachedObjectStore {
         let path = location.to_string();
         let request_key = cache_key(&path, options.range.as_ref());
         if let Some(read) = self.lookup(&request_key).await {
+            crate::metrics::record_cache_hit();
             return Ok(read.into_get_result(Attributes::new()));
         }
         if options.range.is_some()
@@ -184,10 +187,12 @@ impl ObjectStore for CachedObjectStore {
             && let Some(read) = full_read.slice(options.range.as_ref())
         {
             self.insert(&path, request_key, read.clone());
+            crate::metrics::record_cache_hit();
             return Ok(read.into_get_result(Attributes::new()));
         }
 
         let result = self.inner.get_opts(location, options).await?;
+        crate::metrics::record_cache_miss();
         let attributes = result.attributes.clone();
         let read = CachedObjectRead::from_get_result(result).await?;
         self.insert(&path, request_key, read.clone());

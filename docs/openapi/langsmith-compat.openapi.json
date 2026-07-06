@@ -26,6 +26,16 @@
         }
       }
     },
+    "/metrics": {
+      "get": {
+        "operationId": "metricsSnapshot",
+        "responses": {
+          "200": {
+            "description": "JSON server metrics snapshot."
+          }
+        }
+      }
+    },
     "/sessions": {
       "get": {
         "operationId": "listSessions",

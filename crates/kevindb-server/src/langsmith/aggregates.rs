@@ -31,6 +31,7 @@ pub(crate) async fn query_run_aggregates(
         .aggregate_runs(query)
         .await
         .map_err(query_error)?;
+    crate::metrics::record_aggregate_query(&result.diagnostics);
     Ok(Json(RunAggregateResponse::from_result(result, debug)))
 }
 

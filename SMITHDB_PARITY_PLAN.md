@@ -951,9 +951,9 @@ Tasks:
   failure boundaries.
 - [x] Add orphan object reconciliation plus backup/restore notes for the
   Postgres metastore and object storage.
-- [ ] Emit production metrics for ingest, compaction, query planning/execution,
+- [x] Emit production metrics for ingest, compaction, query planning/execution,
   object-store I/O, fanout, and cache behavior.
-- [ ] Add structured query-plan tracing and slow query logging.
+- [x] Add structured query-plan tracing and slow query logging.
 - [x] Add production config, Docker/local compose, S3 support, and
   self-hosted deployment docs.
 

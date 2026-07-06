@@ -17,6 +17,7 @@ use tokio_postgres::NoTls;
 
 pub mod cache;
 mod langsmith;
+mod metrics;
 mod routes;
 mod routing;
 pub use routes::app;
@@ -140,6 +141,7 @@ async fn ingest_trace(
     let request = ExportTraceServiceRequest::decode(body)
         .map_err(|error| ApiError::bad_request(format!("invalid OTLP protobuf: {error}")))?;
     let receipt = state.ingestor.ingest_otlp(project_name, request).await?;
+    metrics::record_ingest(&receipt);
     Ok(Json(IngestResponse::from(receipt)))
 }
 

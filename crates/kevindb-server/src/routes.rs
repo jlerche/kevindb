@@ -3,6 +3,7 @@ use axum::routing::{get, post};
 use kevindb_config::ServiceRole;
 
 use crate::langsmith::aggregates::query_run_aggregates;
+use crate::metrics::metrics_snapshot;
 use crate::{
     ServerState, create_feedback, create_run, healthz, ingest_trace, list_feedback,
     list_run_feedback, list_sessions, list_trace_runs, query_runs, query_thread_traces,
@@ -14,6 +15,7 @@ pub fn app(state: ServerState) -> Router {
     let role = state.service_role();
     let router = Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics_snapshot))
         .route("/readyz", get(readyz));
     let router = match role {
         ServiceRole::All => all_routes(router),
@@ -184,6 +186,7 @@ mod tests {
         let paths = spec["paths"].as_object().expect("openapi paths");
         for (path, method) in [
             ("/healthz", "get"),
+            ("/metrics", "get"),
             ("/readyz", "get"),
             ("/sessions", "get"),
             ("/runs", "post"),

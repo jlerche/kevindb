@@ -217,6 +217,7 @@ pub(super) async fn query_runs(
             RunProjection::Summary
         };
         let direct = direct_runs::load_direct_runs(&state, direct_run_ids, projection).await?;
+        crate::metrics::record_run_query(&direct.diagnostics);
         return Ok(Json(RunsResponse::from_runs_with_limit_and_diagnostics(
             direct.runs,
             limit,
@@ -254,24 +255,16 @@ pub(super) async fn query_runs(
             max_wall_time: Some(Duration::from_secs(30)),
         },
     };
-    let (runs, diagnostics) = if request.debug.unwrap_or(false) {
-        let result = state
-            .query_engine()
-            .list_runs_with_diagnostics(run_query)
-            .await
-            .map_err(query_error)?;
-        (result.runs, Some(result.diagnostics))
-    } else {
-        let runs = state
-            .query_engine()
-            .list_runs(run_query)
-            .await
-            .map_err(query_error)?;
-        (runs, None)
-    };
+    let result = state
+        .query_engine()
+        .list_runs_with_diagnostics(run_query)
+        .await
+        .map_err(query_error)?;
+    crate::metrics::record_run_query(&result.diagnostics);
+    let diagnostics = request.debug.unwrap_or(false).then_some(result.diagnostics);
 
     Ok(Json(RunsResponse::from_runs_with_limit_and_diagnostics(
-        runs,
+        result.runs,
         limit,
         offset,
         diagnostics,
