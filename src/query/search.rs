@@ -1,11 +1,18 @@
 use std::collections::{BTreeSet, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
+use bytes::Bytes;
+use object_store::ObjectStore;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt};
 
-use crate::search::{SEARCH_INDEX_SCHEMA_VERSION, SearchPredicate, decode_search_index};
+use crate::search::{
+    SEARCH_INDEX_HEADER_LEN, SEARCH_INDEX_SCHEMA_VERSION, SearchIndexChunks, SearchIndexDirectory,
+    SearchIndexGroupBytes, SearchIndexGroupDirectory, SearchIndexRange, SearchPredicate,
+    decode_search_index_chunks, decode_search_index_directory, decode_search_index_header,
+    select_search_index_groups,
+};
 
 use super::RunQuery;
 use super::object_store_stats::ObjectStoreReadSnapshot;
@@ -48,9 +55,12 @@ pub(crate) async fn apply_phase6_search_indexes(
         .iter()
         .map(|segment| segment.total_bytes + segment.search_index_bytes)
         .sum();
-    let estimated_object_store_requests =
-        super::planner::estimate_vortex_object_store_requests(segments.len())
-            .saturating_add(segments.len());
+    let estimated_object_store_requests = super::planner::estimate_vortex_object_store_requests(
+        segments.len(),
+    )
+    .saturating_add(
+        super::planner::estimate_search_index_object_store_requests_for_segments(segments.len()),
+    );
 
     Ok((
         RunQueryPlan {
@@ -84,17 +94,148 @@ async fn load_matching_rows(
         );
     }
 
-    stats.get_requests = stats.get_requests.saturating_add(1);
-    let bytes = object_store
-        .get(&Path::from(search_index_uri))
-        .await
-        .with_context(|| format!("read search index {search_index_uri}"))?
-        .bytes()
-        .await
-        .with_context(|| format!("buffer search index {search_index_uri}"))?;
-    stats.bytes_read = stats.bytes_read.saturating_add(bytes.len() as u64);
-    let index = decode_search_index(&bytes)?;
+    let path = Path::from(search_index_uri);
+    let directory = load_search_index_directory(object_store, &path, stats).await?;
+    let selection = select_search_index_groups(&directory, predicate);
+    let chunks = load_selected_chunks(object_store, &path, &directory, &selection, stats).await?;
+    let index = decode_search_index_chunks(&directory, chunks)?;
     Ok(index.matching_rows(predicate))
+}
+
+async fn load_search_index_directory(
+    object_store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    stats: &mut ObjectStoreReadSnapshot,
+) -> Result<SearchIndexDirectory> {
+    let header_bytes =
+        read_one_range(object_store, path, 0..SEARCH_INDEX_HEADER_LEN as u64, stats).await?;
+    let header = decode_search_index_header(&header_bytes)?;
+    let directory_start = SEARCH_INDEX_HEADER_LEN as u64;
+    let directory_end = directory_start.saturating_add(u64::from(header.directory_len));
+    let directory_bytes = if header.directory_len == 0 {
+        Bytes::new()
+    } else {
+        read_one_range(object_store, path, directory_start..directory_end, stats).await?
+    };
+    decode_search_index_directory(header, &directory_bytes)
+}
+
+async fn load_selected_chunks(
+    object_store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    directory: &SearchIndexDirectory,
+    selection: &crate::search::SearchIndexGroupSelection,
+    stats: &mut ObjectStoreReadSnapshot,
+) -> Result<SearchIndexChunks> {
+    let mut ranges = Vec::new();
+    let term_key_plans = plan_group_ranges(
+        &selection.term_key_groups,
+        &directory.term_key_groups,
+        false,
+        &mut ranges,
+    );
+    let term_value_plans = plan_group_ranges(
+        &selection.term_value_groups,
+        &directory.term_value_groups,
+        selection.include_positions,
+        &mut ranges,
+    );
+    let chunks = read_ranges(object_store, path, &ranges, stats).await?;
+    Ok(SearchIndexChunks {
+        term_key_groups: materialize_group_chunks(&chunks, term_key_plans),
+        term_value_groups: materialize_group_chunks(&chunks, term_value_plans),
+    })
+}
+
+fn plan_group_ranges(
+    group_indexes: &BTreeSet<usize>,
+    directories: &[SearchIndexGroupDirectory],
+    include_positions: bool,
+    ranges: &mut Vec<Range<u64>>,
+) -> Vec<GroupRangePlan> {
+    group_indexes
+        .iter()
+        .filter_map(|group_index| {
+            let directory = directories.get(*group_index)?;
+            Some(GroupRangePlan {
+                group_index: *group_index,
+                fst: push_range(ranges, directory.fst),
+                term_infos: push_range(ranges, directory.term_infos),
+                postings: push_range(ranges, directory.postings),
+                positions: if include_positions && !directory.positions.is_empty() {
+                    Some(push_range(ranges, directory.positions))
+                } else {
+                    None
+                },
+            })
+        })
+        .collect()
+}
+
+fn push_range(ranges: &mut Vec<Range<u64>>, range: SearchIndexRange) -> usize {
+    let index = ranges.len();
+    ranges.push(range.as_range());
+    index
+}
+
+fn materialize_group_chunks(
+    chunks: &[Bytes],
+    plans: Vec<GroupRangePlan>,
+) -> Vec<SearchIndexGroupBytes> {
+    plans
+        .into_iter()
+        .map(|plan| SearchIndexGroupBytes {
+            group_index: plan.group_index,
+            fst_bytes: chunks[plan.fst].clone(),
+            term_info_bytes: chunks[plan.term_infos].clone(),
+            postings: chunks[plan.postings].clone(),
+            positions: plan
+                .positions
+                .map(|index| chunks[index].clone())
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+async fn read_one_range(
+    object_store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    range: Range<u64>,
+    stats: &mut ObjectStoreReadSnapshot,
+) -> Result<Bytes> {
+    let mut chunks = read_ranges(object_store, path, &[range], stats).await?;
+    chunks
+        .pop()
+        .context("object store returned no bytes for requested search index range")
+}
+
+async fn read_ranges(
+    object_store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    ranges: &[Range<u64>],
+    stats: &mut ObjectStoreReadSnapshot,
+) -> Result<Vec<Bytes>> {
+    if ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    stats.get_ranges_requests = stats.get_ranges_requests.saturating_add(1);
+    let chunks = object_store
+        .get_ranges(path, ranges)
+        .await
+        .with_context(|| format!("read search index ranges from {path}"))?;
+    stats.bytes_read = stats
+        .bytes_read
+        .saturating_add(chunks.iter().map(|chunk| chunk.len() as u64).sum::<u64>());
+    Ok(chunks)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupRangePlan {
+    group_index: usize,
+    fst: usize,
+    term_infos: usize,
+    postings: usize,
+    positions: Option<usize>,
 }
 
 fn filter_candidate_rows(
@@ -125,7 +266,7 @@ mod tests {
     use super::*;
     use crate::search::{SearchField, SearchQuery, build_search_index, encode_search_index};
     use object_store::memory::InMemory;
-    use object_store::{ObjectStore, PutPayload};
+    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
     #[tokio::test]
     async fn rejects_segments_missing_search_indexes() {
@@ -163,10 +304,11 @@ mod tests {
         ];
         let index = build_search_index(&records).expect("build search index");
         let bytes = encode_search_index(&index).expect("encode");
+        let full_index_len = bytes.len() as u64;
         object_store
             .put(
                 &Path::from("projects/demo/a.search.fst"),
-                PutPayload::from_bytes(bytes),
+                PutPayload::from_bytes(bytes.clone()),
             )
             .await
             .expect("put search index");
@@ -180,6 +322,7 @@ mod tests {
             search_index_schema_version: SEARCH_INDEX_SCHEMA_VERSION,
             candidate_rows: vec![row(0), row(1)],
         };
+        let mut stats = ObjectStoreReadSnapshot::default();
         let rows = load_matching_rows(
             &object_store,
             &segment,
@@ -187,7 +330,7 @@ mod tests {
                 field: SearchField::All,
                 query: SearchQuery::parse("world"),
             },
-            &mut ObjectStoreReadSnapshot::default(),
+            &mut stats,
         )
         .await
         .expect("load rows");
@@ -196,6 +339,9 @@ mod tests {
             filter_candidate_rows(segment.candidate_rows, &rows),
             vec![row(1)]
         );
+        assert_eq!(stats.get_requests, 0);
+        assert_eq!(stats.get_ranges_requests, 3);
+        assert!(stats.bytes_read < full_index_len);
     }
 
     fn row(row_index: i64) -> SegmentCandidateRow {

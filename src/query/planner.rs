@@ -380,6 +380,13 @@ pub(crate) fn estimate_vortex_object_store_requests(candidate_segments: usize) -
     candidate_segments.saturating_mul(ESTIMATED_REQUESTS_PER_VORTEX_FILE)
 }
 
+pub(crate) fn estimate_search_index_object_store_requests_for_segments(
+    candidate_segments: usize,
+) -> usize {
+    const ESTIMATED_REQUESTS_PER_SEARCH_INDEX: usize = 3;
+    candidate_segments.saturating_mul(ESTIMATED_REQUESTS_PER_SEARCH_INDEX)
+}
+
 fn estimate_search_index_object_store_requests<'a>(
     query: &RunQuery,
     segments: impl Iterator<Item = &'a SegmentSource>,
@@ -388,9 +395,11 @@ fn estimate_search_index_object_store_requests<'a>(
         return 0;
     }
 
-    segments
-        .filter(|segment| segment.search_index_uri.is_some())
-        .count()
+    estimate_search_index_object_store_requests_for_segments(
+        segments
+            .filter(|segment| segment.search_index_uri.is_some())
+            .count(),
+    )
 }
 
 fn query_has_phase6_predicate(query: &RunQuery) -> bool {

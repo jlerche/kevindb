@@ -700,11 +700,13 @@ Goal: implement real object-store-aware search and JSON filtering.
   - `term_value` FST dictionaries keyed as `token\0path`
   - `term_info` offsets into postings and positions blobs
   - block-delta postings with VInt tails
-  - separate positions bytes decoded only for phrase checks
+  - fixed header and directory containing absolute byte ranges
+  - separate positions bytes fetched and decoded only for phrase checks
 - [x] Decode tests cover FST round trips, block-delta postings/positions, and
   bounded leaf-key cases.
-- [x] A selective term lookup has bounded object-store fanout: one index object
-  read per candidate segment before core Vortex row masks are applied.
+- [x] A selective term lookup has bounded object-store fanout: header,
+  directory, and selected row-group chunks are read before core Vortex row masks
+  are applied.
 
 ### [x] Epic 6.4: Query Integration
 
@@ -739,11 +741,15 @@ SmithDB blog parity notes:
   FSTs, `token\0path` keyed values, byte-budgeted row groups, term metadata,
   block-delta postings, separate positions, phrase adjacency checks, and row
   masks aligned to Vortex row indexes.
-- Current query execution does not yet match SmithDB's byte-range I/O profile.
-  KevinDB fetches one complete sibling `.search.fst` object per candidate
-  segment, then decodes only needed postings/positions in memory. SmithDB's
-  blog design reads row-group/term byte ranges and coalesces adjacent ranges so
-  non-phrase queries avoid opening positions bytes at the object-store layer.
+- Current query execution uses object-store byte ranges instead of fetching the
+  complete sibling `.search.fst` object. It reads the header and directory,
+  prunes row groups by min/max term bounds, fetches only selected row-group
+  FST/term-info/postings chunks, and skips positions ranges for non-phrase
+  predicates.
+- The remaining I/O delta is granularity: SmithDB reads exact postings/positions
+  subranges for selected terms and coalesces adjacent ranges. KevinDB currently
+  reads the postings chunk for each surviving row group, bounded by the same
+  byte-budgeted row-group design.
 - Current construction uses bounded `serde_json` flattening rather than the
   SmithDB JSON tape, contiguous string storage, radix sort, aligned ~2 MiB
   posting/position chunks, and mid-term position spill thresholds.

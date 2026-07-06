@@ -1,23 +1,31 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Context, Result, bail};
-use bytes::Bytes;
+use anyhow::{Context, Result};
 use fst::automaton::Str;
 use fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
 
 use crate::otlp::SpanRecord;
 
+mod codec;
 mod indexer;
 mod predicate;
 
+pub use codec::{
+    SEARCH_INDEX_HEADER_LEN, SearchIndexDirectory, SearchIndexGroupDirectory, SearchIndexHeader,
+    SearchIndexRange, decode_search_index_directory, decode_search_index_header,
+};
 pub use predicate::{SearchField, SearchPredicate, SearchQuery, tokens_for_text};
 
-pub const SEARCH_INDEX_SCHEMA_VERSION: i64 = 1;
+use codec::{
+    checked_range, checked_u32, decode_loaded_group, decode_positions, decode_u32_list,
+    encode_positions, encode_u32_list,
+};
+
+pub const SEARCH_INDEX_SCHEMA_VERSION: i64 = 2;
 pub const MIN_TOKEN_BYTES: usize = 2;
 pub const MAX_TOKEN_BYTES: usize = 64;
 pub const MAX_JSON_KEYS_PER_RUN: usize = 256;
 pub const MAX_INDEXED_VALUE_BYTES: usize = 4096;
-const MAGIC: &[u8; 8] = b"KDBFTS1\0";
 const BLOCK_LEN: usize = 128;
 const KEY_VALUE_SEPARATOR: u8 = 0;
 const ROW_GROUP_POSTINGS_BYTES: usize = 32 * 1024 * 1024;
@@ -74,6 +82,28 @@ struct DecodedTerm {
     path: String,
     rows: BTreeSet<u32>,
     positions_by_row: BTreeMap<u32, BTreeSet<u32>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchIndexGroupSelection {
+    pub term_key_groups: BTreeSet<usize>,
+    pub term_value_groups: BTreeSet<usize>,
+    pub include_positions: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchIndexGroupBytes {
+    pub group_index: usize,
+    pub fst_bytes: bytes::Bytes,
+    pub term_info_bytes: bytes::Bytes,
+    pub postings: bytes::Bytes,
+    pub positions: bytes::Bytes,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchIndexChunks {
+    pub term_key_groups: Vec<SearchIndexGroupBytes>,
+    pub term_value_groups: Vec<SearchIndexGroupBytes>,
 }
 
 impl MutableSearchIndex {
@@ -311,29 +341,12 @@ pub fn build_search_index(records: &[SpanRecord]) -> Result<SearchIndex> {
     indexer::build_search_index(records)
 }
 
-pub fn encode_search_index(index: &SearchIndex) -> Result<Bytes> {
-    let mut out = Vec::new();
-    out.extend_from_slice(MAGIC);
-    put_u32(&mut out, index.row_count);
-    encode_groups(&mut out, &index.term_key_groups)?;
-    encode_groups(&mut out, &index.term_value_groups)?;
-    Ok(Bytes::from(out))
+pub fn encode_search_index(index: &SearchIndex) -> Result<bytes::Bytes> {
+    codec::encode_search_index(index)
 }
 
 pub fn decode_search_index(bytes: &[u8]) -> Result<SearchIndex> {
-    let mut input = ByteReader::new(bytes);
-    input.expect_bytes(MAGIC)?;
-    let row_count = input.read_u32()?;
-    let term_key_groups = input.read_groups()?;
-    let term_value_groups = input.read_groups()?;
-    input.expect_done()?;
-    let index = SearchIndex {
-        row_count,
-        term_key_groups,
-        term_value_groups,
-    };
-    validate_fsts(&index)?;
-    Ok(index)
+    codec::decode_search_index(bytes)
 }
 
 pub fn search_index_uri_for_segment(segment_uri: &str) -> String {
@@ -341,6 +354,147 @@ pub fn search_index_uri_for_segment(segment_uri: &str) -> String {
         .strip_suffix(".vortex")
         .map(|prefix| format!("{prefix}.search.fst"))
         .unwrap_or_else(|| format!("{segment_uri}.search.fst"))
+}
+
+pub fn select_search_index_groups(
+    directory: &SearchIndexDirectory,
+    predicate: &SearchPredicate,
+) -> SearchIndexGroupSelection {
+    let mut selection = SearchIndexGroupSelection::default();
+    select_groups_for_predicate(directory, predicate, &mut selection);
+    selection
+}
+
+pub fn decode_search_index_chunks(
+    directory: &SearchIndexDirectory,
+    chunks: SearchIndexChunks,
+) -> Result<SearchIndex> {
+    let term_key_groups = decode_group_chunks(&directory.term_key_groups, chunks.term_key_groups)?;
+    let term_value_groups =
+        decode_group_chunks(&directory.term_value_groups, chunks.term_value_groups)?;
+    Ok(SearchIndex {
+        row_count: directory.row_count,
+        term_key_groups,
+        term_value_groups,
+    })
+}
+
+fn decode_group_chunks(
+    directories: &[SearchIndexGroupDirectory],
+    chunks: Vec<SearchIndexGroupBytes>,
+) -> Result<Vec<RowGroup>> {
+    chunks
+        .into_iter()
+        .map(|chunk| {
+            let directory = directories
+                .get(chunk.group_index)
+                .context("search index group chunk index out of bounds")?;
+            decode_loaded_group(
+                directory,
+                &chunk.fst_bytes,
+                &chunk.term_info_bytes,
+                &chunk.postings,
+                &chunk.positions,
+            )
+        })
+        .collect()
+}
+
+fn select_groups_for_predicate(
+    directory: &SearchIndexDirectory,
+    predicate: &SearchPredicate,
+    selection: &mut SearchIndexGroupSelection,
+) {
+    match predicate {
+        SearchPredicate::And(children) | SearchPredicate::Or(children) => {
+            for child in children {
+                select_groups_for_predicate(directory, child, selection);
+            }
+        }
+        SearchPredicate::Not(child) => select_groups_for_predicate(directory, child, selection),
+        SearchPredicate::Text { field, query } => {
+            select_value_groups_for_query(directory, field, query, selection);
+        }
+        SearchPredicate::JsonKey { pattern } => {
+            select_key_groups_for_pattern(directory, pattern, selection);
+        }
+    }
+}
+
+fn select_key_groups_for_pattern(
+    directory: &SearchIndexDirectory,
+    pattern: &str,
+    selection: &mut SearchIndexGroupSelection,
+) {
+    let pattern = normalize_like_pattern(pattern);
+    if !pattern.contains('*') {
+        for (index, group) in directory.term_key_groups.iter().enumerate() {
+            if min_max_may_contain_exact(&group.min_term, &group.max_term, pattern.as_bytes()) {
+                selection.term_key_groups.insert(index);
+            }
+        }
+        return;
+    }
+
+    if let Some(prefix) = simple_trailing_wildcard_prefix(&pattern) {
+        for (index, group) in directory.term_key_groups.iter().enumerate() {
+            if min_max_overlaps_prefix(&group.min_term, &group.max_term, prefix.as_bytes()) {
+                selection.term_key_groups.insert(index);
+            }
+        }
+        return;
+    }
+
+    selection
+        .term_key_groups
+        .extend(0..directory.term_key_groups.len());
+}
+
+fn select_value_groups_for_query(
+    directory: &SearchIndexDirectory,
+    field: &SearchField,
+    query: &SearchQuery,
+    selection: &mut SearchIndexGroupSelection,
+) {
+    for term in query.terms() {
+        select_value_groups_for_token(directory, field, term, false, selection);
+    }
+    for phrase in query.phrases() {
+        let needs_positions = phrase.len() > 1;
+        for term in phrase {
+            select_value_groups_for_token(directory, field, term, needs_positions, selection);
+        }
+    }
+}
+
+fn select_value_groups_for_token(
+    directory: &SearchIndexDirectory,
+    field: &SearchField,
+    token: &str,
+    include_positions: bool,
+    selection: &mut SearchIndexGroupSelection,
+) {
+    if include_positions {
+        selection.include_positions = true;
+    }
+    match field {
+        SearchField::ExactPath(path) => {
+            let key = term_value_key(token, path);
+            for (index, group) in directory.term_value_groups.iter().enumerate() {
+                if min_max_may_contain_exact(&group.min_term, &group.max_term, &key) {
+                    selection.term_value_groups.insert(index);
+                }
+            }
+        }
+        SearchField::All | SearchField::PathPrefix(_) => {
+            let prefix = term_value_prefix(token);
+            for (index, group) in directory.term_value_groups.iter().enumerate() {
+                if min_max_overlaps_prefix(&group.min_term, &group.max_term, &prefix) {
+                    selection.term_value_groups.insert(index);
+                }
+            }
+        }
+    }
 }
 
 fn build_row_groups(
@@ -549,15 +703,23 @@ fn term_path(term: &[u8]) -> String {
 }
 
 fn group_may_contain_exact(group: &RowGroup, key: &[u8]) -> bool {
-    group.min_term.as_slice() <= key && key <= group.max_term.as_slice()
+    min_max_may_contain_exact(&group.min_term, &group.max_term, key)
 }
 
 fn group_overlaps_prefix(group: &RowGroup, prefix: &[u8]) -> bool {
-    if group.max_term.as_slice() < prefix {
+    min_max_overlaps_prefix(&group.min_term, &group.max_term, prefix)
+}
+
+fn min_max_may_contain_exact(min_term: &[u8], max_term: &[u8], key: &[u8]) -> bool {
+    min_term <= key && key <= max_term
+}
+
+fn min_max_overlaps_prefix(min_term: &[u8], max_term: &[u8], prefix: &[u8]) -> bool {
+    if max_term < prefix {
         return false;
     }
     next_prefix(prefix)
-        .map(|upper| group.min_term.as_slice() < upper.as_slice())
+        .map(|upper| min_term < upper.as_slice())
         .unwrap_or(true)
 }
 
@@ -570,180 +732,6 @@ fn next_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
-}
-
-fn encode_u32_list(values: &[u32]) -> Vec<u8> {
-    let mut deltas = Vec::with_capacity(values.len());
-    let mut previous = 0;
-    for value in values {
-        deltas.push(value.saturating_sub(previous));
-        previous = *value;
-    }
-
-    let mut out = Vec::new();
-    let full_blocks = deltas.len() / BLOCK_LEN;
-    for block_index in 0..full_blocks {
-        let block = &deltas[block_index * BLOCK_LEN..(block_index + 1) * BLOCK_LEN];
-        let width = bit_width(*block.iter().max().unwrap_or(&0));
-        out.push(width);
-        pack_bits(block, width, &mut out);
-    }
-    for delta in &deltas[full_blocks * BLOCK_LEN..] {
-        put_vint(&mut out, *delta);
-    }
-    out
-}
-
-fn decode_u32_list(bytes: &[u8], count: usize) -> Result<Vec<u32>> {
-    let mut input = ByteReader::new(bytes);
-    let values = input.read_u32_list(count)?;
-    input.expect_done()?;
-    Ok(values)
-}
-
-fn encode_positions(rows: &[u32], positions_by_row: &BTreeMap<u32, Vec<u32>>) -> Vec<u8> {
-    let mut out = Vec::new();
-    for row in rows {
-        let positions = positions_by_row.get(row).map(Vec::as_slice).unwrap_or(&[]);
-        put_vint(&mut out, positions.len() as u32);
-        out.extend_from_slice(&encode_u32_list(positions));
-    }
-    out
-}
-
-fn decode_positions(bytes: &[u8], rows: &[u32]) -> Result<BTreeMap<u32, BTreeSet<u32>>> {
-    let mut input = ByteReader::new(bytes);
-    let mut positions_by_row = BTreeMap::new();
-    for row in rows {
-        let count = input.read_vint()? as usize;
-        let positions = input.read_u32_list(count)?;
-        positions_by_row.insert(*row, positions.into_iter().collect());
-    }
-    input.expect_done()?;
-    Ok(positions_by_row)
-}
-
-fn bit_width(max: u32) -> u8 {
-    if max == 0 {
-        0
-    } else {
-        (u32::BITS - max.leading_zeros()) as u8
-    }
-}
-
-fn pack_bits(values: &[u32], width: u8, out: &mut Vec<u8>) {
-    if width == 0 {
-        return;
-    }
-    let mut accumulator = 0_u64;
-    let mut bits = 0_u8;
-    for value in values {
-        accumulator |= u64::from(*value) << bits;
-        bits += width;
-        while bits >= 8 {
-            out.push(accumulator as u8);
-            accumulator >>= 8;
-            bits -= 8;
-        }
-    }
-    if bits > 0 {
-        out.push(accumulator as u8);
-    }
-}
-
-fn unpack_bits(bytes: &[u8], count: usize, width: u8) -> Result<Vec<u32>> {
-    if width > 32 {
-        bail!("invalid bit width {width}");
-    }
-    if width == 0 {
-        return Ok(vec![0; count]);
-    }
-    let mask = if width == 32 {
-        u64::from(u32::MAX)
-    } else {
-        (1_u64 << width) - 1
-    };
-    let mut values = Vec::with_capacity(count);
-    let mut accumulator = 0_u64;
-    let mut bits = 0_u8;
-    let mut offset = 0;
-    while values.len() < count {
-        while bits < width {
-            let Some(byte) = bytes.get(offset) else {
-                bail!("truncated bitpacked block");
-            };
-            accumulator |= u64::from(*byte) << bits;
-            bits += 8;
-            offset += 1;
-        }
-        values.push((accumulator & mask) as u32);
-        accumulator >>= width;
-        bits -= width;
-    }
-    Ok(values)
-}
-
-fn packed_len(count: usize, width: u8) -> usize {
-    count.saturating_mul(width as usize).div_ceil(8)
-}
-
-fn put_vint(out: &mut Vec<u8>, mut value: u32) {
-    while value >= 0x80 {
-        out.push((value as u8) | 0x80);
-        value >>= 7;
-    }
-    out.push(value as u8);
-}
-
-fn put_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn checked_u32(value: usize, label: &str) -> Result<u32> {
-    u32::try_from(value).with_context(|| format!("{label} does not fit in u32"))
-}
-
-fn checked_range(offset: u32, len: u32, bytes: &[u8]) -> Option<std::ops::Range<usize>> {
-    let start = offset as usize;
-    let end = start.checked_add(len as usize)?;
-    (end <= bytes.len()).then_some(start..end)
-}
-
-fn encode_groups(out: &mut Vec<u8>, groups: &[RowGroup]) -> Result<()> {
-    put_u32(out, checked_u32(groups.len(), "row group count")?);
-    for group in groups {
-        put_bytes(out, &group.min_term)?;
-        put_bytes(out, &group.max_term)?;
-        put_bytes(out, &group.fst_bytes)?;
-        put_u32(out, checked_u32(group.term_infos.len(), "term info count")?);
-        for info in &group.term_infos {
-            put_u32(out, info.doc_count);
-            put_u32(out, info.postings_offset);
-            put_u32(out, info.postings_len);
-            put_u32(out, info.positions_offset);
-            put_u32(out, info.positions_len);
-        }
-        put_bytes(out, &group.postings)?;
-        put_bytes(out, &group.positions)?;
-    }
-    Ok(())
-}
-
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
-    put_u32(out, checked_u32(bytes.len(), "byte slice len")?);
-    out.extend_from_slice(bytes);
-    Ok(())
-}
-
-fn validate_fsts(index: &SearchIndex) -> Result<()> {
-    for group in index
-        .term_key_groups
-        .iter()
-        .chain(index.term_value_groups.iter())
-    {
-        Map::new(group.fst_bytes.as_slice()).context("validate search FST")?;
-    }
-    Ok(())
 }
 
 fn normalize_like_pattern(pattern: &str) -> String {
@@ -785,141 +773,11 @@ fn path_matches_pattern(path: &str, pattern: &str) -> bool {
     pattern.ends_with('*') || remaining.is_empty()
 }
 
-struct ByteReader<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> ByteReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn read_groups(&mut self) -> Result<Vec<RowGroup>> {
-        let group_count = self.read_u32()? as usize;
-        (0..group_count)
-            .map(|_| {
-                let min_term = self.read_vec()?;
-                let max_term = self.read_vec()?;
-                let fst_bytes = self.read_vec()?;
-                let term_info_count = self.read_u32()? as usize;
-                let term_infos = (0..term_info_count)
-                    .map(|_| {
-                        Ok(TermInfo {
-                            doc_count: self.read_u32()?,
-                            postings_offset: self.read_u32()?,
-                            postings_len: self.read_u32()?,
-                            positions_offset: self.read_u32()?,
-                            positions_len: self.read_u32()?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let postings = self.read_vec()?;
-                let positions = self.read_vec()?;
-                Ok(RowGroup {
-                    min_term,
-                    max_term,
-                    fst_bytes,
-                    term_infos,
-                    postings,
-                    positions,
-                })
-            })
-            .collect()
-    }
-
-    fn read_vec(&mut self) -> Result<Vec<u8>> {
-        let len = self.read_u32()? as usize;
-        Ok(self.read_slice(len)?.to_vec())
-    }
-
-    fn read_slice(&mut self, len: usize) -> Result<&'a [u8]> {
-        let end = self
-            .offset
-            .checked_add(len)
-            .context("search index offset overflow")?;
-        if end > self.bytes.len() {
-            bail!("truncated search index");
-        }
-        let slice = &self.bytes[self.offset..end];
-        self.offset = end;
-        Ok(slice)
-    }
-
-    fn read_u8(&mut self) -> Result<u8> {
-        let byte = *self
-            .bytes
-            .get(self.offset)
-            .context("truncated search index byte")?;
-        self.offset += 1;
-        Ok(byte)
-    }
-
-    fn read_u32(&mut self) -> Result<u32> {
-        let bytes = self.read_slice(4)?;
-        Ok(u32::from_le_bytes(
-            bytes.try_into().expect("slice len is 4"),
-        ))
-    }
-
-    fn read_vint(&mut self) -> Result<u32> {
-        let mut value = 0_u32;
-        let mut shift = 0;
-        loop {
-            let byte = self.read_u8()?;
-            value |= u32::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(value);
-            }
-            shift += 7;
-            if shift >= 32 {
-                bail!("invalid vint in search index");
-            }
-        }
-    }
-
-    fn read_u32_list(&mut self, count: usize) -> Result<Vec<u32>> {
-        let full_blocks = count / BLOCK_LEN;
-        let mut values = Vec::with_capacity(count);
-        let mut previous = 0_u32;
-        for _ in 0..full_blocks {
-            let width = self.read_u8()?;
-            let packed_len = packed_len(BLOCK_LEN, width);
-            let packed = self.read_slice(packed_len)?;
-            for delta in unpack_bits(packed, BLOCK_LEN, width)? {
-                previous = previous.saturating_add(delta);
-                values.push(previous);
-            }
-        }
-        for _ in 0..(count % BLOCK_LEN) {
-            let delta = self.read_vint()?;
-            previous = previous.saturating_add(delta);
-            values.push(previous);
-        }
-        Ok(values)
-    }
-
-    fn expect_bytes(&mut self, expected: &[u8]) -> Result<()> {
-        let actual = self.read_slice(expected.len())?;
-        if actual != expected {
-            bail!("invalid search index magic");
-        }
-        Ok(())
-    }
-
-    fn expect_done(&self) -> Result<()> {
-        if self.offset == self.bytes.len() {
-            Ok(())
-        } else {
-            bail!("search index has trailing bytes");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::otlp::RunEventKind;
+    use crate::search::codec::MAGIC;
 
     #[test]
     fn evaluates_full_text_path_and_phrase_queries() {
