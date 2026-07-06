@@ -1,0 +1,59 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: kevindb
+      POSTGRES_PASSWORD: kevindb
+      POSTGRES_USER: kevindb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:RELEASE.2026-06-13T11-33-47Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: kevindb
+      MINIO_ROOT_PASSWORD: kevindb-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: minio/mc:RELEASE.2026-06-13T12-30-13Z
+    depends_on:
+      - minio
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until mc alias set local http://minio:9000 kevindb kevindb-secret; do sleep 1; done
+        mc mb --ignore-existing local/kevindb
+
+  kevindb:
+    build: .
+    depends_on:
+      - postgres
+      - minio-init
+    environment:
+      AWS_ACCESS_KEY_ID: kevindb
+      AWS_REGION: us-east-1
+      AWS_SECRET_ACCESS_KEY: kevindb-secret
+      KEVINDB_BIND_ADDR: 0.0.0.0:3000
+      KEVINDB_NODE_ID: local-all-1
+      KEVINDB_OBJECT_STORE: s3
+      KEVINDB_POSTGRES_URL: postgresql://kevindb:kevindb@postgres:5432/kevindb
+      KEVINDB_S3_ALLOW_HTTP: "true"
+      KEVINDB_S3_BUCKET: kevindb
+      KEVINDB_S3_ENDPOINT: http://minio:9000
+      KEVINDB_S3_PREFIX: dev
+      RUST_LOG: kevindb=info,kevindb_server=info
+    ports:
+      - "3000:3000"
+
+volumes:
+  minio-data:
+  postgres-data:

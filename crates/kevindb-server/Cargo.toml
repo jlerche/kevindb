@@ -15,7 +15,7 @@ futures-util = "0.3.31"
 kevindb = { path = "../.." }
 kevindb-config = { path = "../kevindb-config" }
 kevindb-metastore-postgres = { path = "../kevindb-metastore-postgres" }
-object_store = "0.13.2"
+object_store = { version = "0.13.2", features = ["aws"] }
 opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic-messages", "trace"] }
 prost = "0.14.1"
 serde = { version = "1.0.228", features = ["derive"] }

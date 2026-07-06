@@ -7,7 +7,9 @@ use kevindb_config::{CacheConfig, CacheMode, ObjectStoreConfig, ServerConfig};
 use kevindb_server::cache::CachedObjectStore;
 use kevindb_server::{ServerState, app};
 use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
 use object_store::memory::InMemory;
+use object_store::prefix::PrefixStore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -58,6 +60,24 @@ async fn object_store_from_config(
 ) -> Result<Arc<dyn ObjectStore>> {
     let object_store: Arc<dyn ObjectStore> = match object_store_config {
         ObjectStoreConfig::Memory => Arc::new(InMemory::new()),
+        ObjectStoreConfig::S3(config) => {
+            let mut builder = AmazonS3Builder::from_env().with_bucket_name(config.bucket);
+            if let Some(region) = config.region {
+                builder = builder.with_region(region);
+            }
+            if let Some(endpoint) = config.endpoint {
+                builder = builder.with_endpoint(endpoint);
+            }
+            if config.allow_http {
+                builder = builder.with_allow_http(true);
+            }
+            let store = builder.build()?;
+            if let Some(prefix) = config.prefix {
+                Arc::new(PrefixStore::new(store, prefix))
+            } else {
+                Arc::new(store)
+            }
+        }
     };
 
     match cache_config.mode {

@@ -24,6 +24,11 @@ pub const ENV_INGEST_MAX_SPANS_PER_SEGMENT: &str = "KEVINDB_INGEST_MAX_SPANS_PER
 pub const ENV_NODE_ID: &str = "KEVINDB_NODE_ID";
 pub const ENV_OBJECT_STORE: &str = "KEVINDB_OBJECT_STORE";
 pub const ENV_POSTGRES_URL: &str = "KEVINDB_POSTGRES_URL";
+pub const ENV_S3_ALLOW_HTTP: &str = "KEVINDB_S3_ALLOW_HTTP";
+pub const ENV_S3_BUCKET: &str = "KEVINDB_S3_BUCKET";
+pub const ENV_S3_ENDPOINT: &str = "KEVINDB_S3_ENDPOINT";
+pub const ENV_S3_PREFIX: &str = "KEVINDB_S3_PREFIX";
+pub const ENV_S3_REGION: &str = "KEVINDB_S3_REGION";
 pub const ENV_SERVICE_ROLE: &str = "KEVINDB_SERVICE_ROLE";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,9 +73,7 @@ impl ServerConfig {
             let value = value.trim();
             (!value.is_empty()).then(|| value.to_owned())
         });
-        let object_store = ObjectStoreConfig::parse(
-            &lookup(ENV_OBJECT_STORE).unwrap_or_else(|| DEFAULT_OBJECT_STORE.to_owned()),
-        )?;
+        let object_store = ObjectStoreConfig::from_lookup(&mut lookup)?;
         let service_role = ServiceRole::parse(
             &lookup(ENV_SERVICE_ROLE).unwrap_or_else(|| DEFAULT_SERVICE_ROLE.to_owned()),
         )?;
@@ -141,18 +144,56 @@ impl ServiceRole {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectStoreKind {
+    Memory,
+    S3,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3ObjectStoreConfig {
+    pub bucket: String,
+    pub region: Option<String>,
+    pub endpoint: Option<String>,
+    pub allow_http: bool,
+    pub prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectStoreConfig {
     Memory,
+    S3(S3ObjectStoreConfig),
 }
 
 impl ObjectStoreConfig {
-    pub fn parse(value: &str) -> Result<Self, ConfigError> {
-        match value.to_ascii_lowercase().as_str() {
-            "memory" => Ok(Self::Memory),
-            _ => Err(ConfigError::UnsupportedObjectStore {
-                value: value.to_owned(),
-            }),
+    fn from_lookup<F>(lookup: &mut F) -> Result<Self, ConfigError>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        match object_store_kind(
+            &lookup(ENV_OBJECT_STORE).unwrap_or_else(|| DEFAULT_OBJECT_STORE.to_owned()),
+        )? {
+            ObjectStoreKind::Memory => Ok(Self::Memory),
+            ObjectStoreKind::S3 => Ok(Self::S3(S3ObjectStoreConfig {
+                bucket: non_empty_env(ENV_S3_BUCKET, lookup(ENV_S3_BUCKET))?,
+                region: optional_non_empty(lookup(ENV_S3_REGION)),
+                endpoint: optional_non_empty(lookup(ENV_S3_ENDPOINT)),
+                allow_http: parse_bool(
+                    ENV_S3_ALLOW_HTTP,
+                    lookup(ENV_S3_ALLOW_HTTP).unwrap_or_else(|| "false".to_owned()),
+                )?,
+                prefix: optional_non_empty(lookup(ENV_S3_PREFIX)),
+            })),
         }
+    }
+}
+
+fn object_store_kind(value: &str) -> Result<ObjectStoreKind, ConfigError> {
+    match value.to_ascii_lowercase().as_str() {
+        "memory" => Ok(ObjectStoreKind::Memory),
+        "s3" | "aws" | "amazon-s3" => Ok(ObjectStoreKind::S3),
+        _ => Err(ConfigError::UnsupportedObjectStore {
+            value: value.to_owned(),
+        }),
     }
 }
 
@@ -227,6 +268,7 @@ impl CacheMode {
 pub enum ConfigError {
     MissingEnv { name: &'static str },
     InvalidBindAddr { value: String },
+    InvalidBool { name: &'static str, value: String },
     InvalidPositiveInteger { name: &'static str, value: String },
     InvalidUnsignedInteger { name: &'static str, value: String },
     UnsupportedCacheMode { value: String },
@@ -240,6 +282,9 @@ impl Display for ConfigError {
             Self::MissingEnv { name } => write!(f, "{name} must be set"),
             Self::InvalidBindAddr { value } => {
                 write!(f, "{ENV_BIND_ADDR} must be a socket address, got {value}")
+            }
+            Self::InvalidBool { name, value } => {
+                write!(f, "{name} must be true or false, got {value}")
             }
             Self::InvalidPositiveInteger { name, value } => {
                 write!(f, "{name} must be a positive integer, got {value}")
@@ -279,6 +324,25 @@ fn parse_u64(name: &'static str, value: String) -> Result<u64, ConfigError> {
     value
         .parse()
         .map_err(|_| ConfigError::InvalidUnsignedInteger { name, value })
+}
+
+fn parse_bool(name: &'static str, value: String) -> Result<bool, ConfigError> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(ConfigError::InvalidBool { name, value }),
+    }
+}
+
+fn non_empty_env(name: &'static str, value: Option<String>) -> Result<String, ConfigError> {
+    optional_non_empty(value).ok_or(ConfigError::MissingEnv { name })
+}
+
+fn optional_non_empty(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim().trim_matches('/').to_owned();
+        (!value.is_empty()).then_some(value)
+    })
 }
 
 #[cfg(test)]
@@ -359,6 +423,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_s3_object_store_values() {
+        let config = ServerConfig::from_env_vars([
+            (ENV_POSTGRES_URL, "postgresql://db/postgres"),
+            (ENV_OBJECT_STORE, "s3"),
+            (ENV_S3_BUCKET, "kevindb"),
+            (ENV_S3_REGION, "us-east-1"),
+            (ENV_S3_ENDPOINT, "http://minio:9000"),
+            (ENV_S3_ALLOW_HTTP, "true"),
+            (ENV_S3_PREFIX, "/dev/"),
+        ])
+        .expect("parse s3 config");
+
+        assert_eq!(
+            config.object_store,
+            ObjectStoreConfig::S3(S3ObjectStoreConfig {
+                bucket: "kevindb".to_owned(),
+                region: Some("us-east-1".to_owned()),
+                endpoint: Some("http://minio:9000".to_owned()),
+                allow_http: true,
+                prefix: Some("dev".to_owned()),
+            })
+        );
+    }
+
+    #[test]
     fn rejects_missing_postgres_url() {
         let error = ServerConfig::from_env_vars(Vec::<(String, String)>::new())
             .expect_err("missing postgres url");
@@ -399,6 +488,41 @@ mod tests {
             error,
             ConfigError::UnsupportedObjectStore {
                 value: "local".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_s3_without_bucket() {
+        let err = ServerConfig::from_env_vars([
+            (ENV_POSTGRES_URL, "postgresql://db/postgres"),
+            (ENV_OBJECT_STORE, "s3"),
+        ])
+        .expect_err("s3 bucket is required");
+
+        assert_eq!(
+            err,
+            ConfigError::MissingEnv {
+                name: ENV_S3_BUCKET
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_s3_allow_http() {
+        let err = ServerConfig::from_env_vars([
+            (ENV_POSTGRES_URL, "postgresql://db/postgres"),
+            (ENV_OBJECT_STORE, "s3"),
+            (ENV_S3_BUCKET, "kevindb"),
+            (ENV_S3_ALLOW_HTTP, "sometimes"),
+        ])
+        .expect_err("s3 allow_http must be boolean");
+
+        assert_eq!(
+            err,
+            ConfigError::InvalidBool {
+                name: ENV_S3_ALLOW_HTTP,
+                value: "sometimes".to_owned(),
             }
         );
     }
