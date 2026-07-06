@@ -20,6 +20,7 @@ pub const ENV_CACHE_MEMORY_CAPACITY_BYTES: &str = "KEVINDB_CACHE_MEMORY_CAPACITY
 pub const ENV_CACHE_MODE: &str = "KEVINDB_CACHE_MODE";
 pub const ENV_INGEST_MAX_FLUSH_DELAY_MS: &str = "KEVINDB_INGEST_MAX_FLUSH_DELAY_MS";
 pub const ENV_INGEST_MAX_SPANS_PER_SEGMENT: &str = "KEVINDB_INGEST_MAX_SPANS_PER_SEGMENT";
+pub const ENV_NODE_ID: &str = "KEVINDB_NODE_ID";
 pub const ENV_OBJECT_STORE: &str = "KEVINDB_OBJECT_STORE";
 pub const ENV_POSTGRES_URL: &str = "KEVINDB_POSTGRES_URL";
 
@@ -27,6 +28,7 @@ pub const ENV_POSTGRES_URL: &str = "KEVINDB_POSTGRES_URL";
 pub struct ServerConfig {
     pub postgres_url: String,
     pub bind_addr: SocketAddr,
+    pub node_id: Option<String>,
     pub object_store: ObjectStoreConfig,
     pub cache: CacheConfig,
     pub ingest: IngestConfig,
@@ -59,6 +61,10 @@ impl ServerConfig {
         })?;
         let bind_addr =
             parse_bind_addr(lookup(ENV_BIND_ADDR).unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned()))?;
+        let node_id = lookup(ENV_NODE_ID).and_then(|value| {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        });
         let object_store = ObjectStoreConfig::parse(
             &lookup(ENV_OBJECT_STORE).unwrap_or_else(|| DEFAULT_OBJECT_STORE.to_owned()),
         )?;
@@ -79,6 +85,7 @@ impl ServerConfig {
         Ok(Self {
             postgres_url,
             bind_addr,
+            node_id,
             object_store,
             cache,
             ingest,
@@ -239,6 +246,7 @@ mod tests {
             .expect("parse config");
 
         assert_eq!(config.postgres_url, "postgresql://db/postgres");
+        assert_eq!(config.node_id, None);
         assert_eq!(
             config.bind_addr,
             DEFAULT_BIND_ADDR.parse::<SocketAddr>().expect("bind addr")
@@ -268,6 +276,7 @@ mod tests {
         let config = ServerConfig::from_env_vars([
             (ENV_POSTGRES_URL, "postgresql://db/postgres"),
             (ENV_BIND_ADDR, "0.0.0.0:8080"),
+            (ENV_NODE_ID, "node-a"),
             (ENV_OBJECT_STORE, "MEMORY"),
             (ENV_CACHE_MODE, "hybrid"),
             (ENV_CACHE_HYBRID_DIR, "/tmp/kevindb-cache"),
@@ -280,6 +289,7 @@ mod tests {
         .expect("parse config");
 
         assert_eq!(config.bind_addr, "0.0.0.0:8080".parse().expect("bind addr"));
+        assert_eq!(config.node_id.as_deref(), Some("node-a"));
         assert_eq!(config.object_store, ObjectStoreConfig::Memory);
         assert_eq!(
             config.cache,

@@ -833,12 +833,12 @@ Exit criteria:
 
 - [ ] Local development can run services separately.
 
-### [ ] Epic 8.2: Sticky Routing And L0
+### [x] Epic 8.2: Sticky Routing And L0
 
 Tasks:
 
-- [ ] Route project/tenant queries to the node that recently ingested that
-  scope.
+- [x] Route project/tenant queries to the node that recently ingested that
+  scope through durable project route metadata.
 - [x] Expose local L0 segments/indexes to queries on that node through the
   write-through object-store cache.
 - [x] Fall back to object-store L1 segments for older or non-local data.
@@ -847,21 +847,21 @@ Tasks:
 
 Subtasks:
 
-- [ ] Add routing metadata to Postgres or a simple coordinator.
+- [x] Add routing metadata to Postgres or a simple coordinator.
 - [x] Add cache/query-path tests mixing L0 and L1 reads.
 - [x] Add failure tests when the writer node disappears.
 
 Exit criteria:
 
-- [ ] Recent data is queryable quickly without waiting for durable index
+- [x] Recent data is queryable quickly without waiting for durable index
   promotion.
 
 Progress note: `CachedObjectStore` is now write-through for single-object puts.
 The writer node can serve just-written Vortex segments and `.search.fst`
 sibling indexes from local L0 cache, including range reads sliced from the
-cached full object. A node without that local cache falls back to durable
-object-store L1. Cluster-level sticky routing still needs route metadata and a
-coordinator or load-balancer integration.
+cached full object. Ingest stamps `project_routes` with the most recent node
+id and segment URI so a coordinator can send fresh project queries to the warm
+node; a node without that local cache falls back to durable object-store L1.
 
 ### [ ] Epic 8.3: Distributed Fanout
 

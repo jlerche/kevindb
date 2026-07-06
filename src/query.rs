@@ -21,6 +21,7 @@ pub mod filter;
 mod object_store_stats;
 mod planner;
 mod random_access;
+mod routing;
 mod rows;
 mod search;
 mod threads;
@@ -42,6 +43,7 @@ pub(crate) use planner::{
     sql_string_literal,
 };
 pub use random_access::{RunEventSummary, RunLoadResult, RunProjection, TraceLoadResult};
+pub use routing::ProjectRoute;
 pub(crate) use rows::run_summaries_from_batches;
 pub use threads::{
     ThreadListPage, ThreadListQuery, ThreadMessageSummary, ThreadSummary, ThreadTracePage,

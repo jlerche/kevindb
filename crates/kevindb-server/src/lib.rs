@@ -17,6 +17,7 @@ use tokio_postgres::NoTls;
 
 pub mod cache;
 mod langsmith;
+mod routing;
 
 use langsmith::aggregates::query_run_aggregates;
 pub use langsmith::{
@@ -28,6 +29,7 @@ use langsmith::{
     create_feedback, create_run, list_feedback, list_run_feedback, list_sessions, query_runs,
     query_thread_traces, query_threads, read_feedback, read_project_trace, read_run, update_run,
 };
+use routing::read_project_route;
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -42,11 +44,21 @@ impl ServerState {
         object_store: Arc<dyn ObjectStore>,
         ingest_config: IngestConfig,
     ) -> Self {
+        Self::new_with_node_id(postgres_url, object_store, ingest_config, None)
+    }
+
+    pub fn new_with_node_id(
+        postgres_url: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        ingest_config: IngestConfig,
+        node_id: Option<String>,
+    ) -> Self {
         let postgres_url = postgres_url.into();
-        let ingestor = Arc::new(Ingestor::new(
+        let ingestor = Arc::new(Ingestor::with_node_id(
             postgres_url.clone(),
             Arc::clone(&object_store),
             ingest_config,
+            node_id,
         ));
 
         Self {
@@ -113,6 +125,7 @@ pub fn app(state: ServerState) -> Router {
             "/v1/projects/{project_name}/traces/{trace_id}/runs",
             get(list_trace_runs),
         )
+        .route("/v1/projects/{project_name}/route", get(read_project_route))
         .with_state(state)
 }
 

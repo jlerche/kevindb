@@ -26,10 +26,12 @@ async fn main() -> Result<()> {
         max_flush_delay: config.ingest.max_flush_delay,
     };
 
-    let state = ServerState::new(
+    let object_store = object_store_from_config(config.object_store, config.cache).await?;
+    let state = ServerState::new_with_node_id(
         config.postgres_url,
-        object_store_from_config(config.object_store, config.cache).await?,
+        object_store,
         ingest_config,
+        config.node_id,
     );
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
     tracing::info!(bind_addr = %config.bind_addr, "kevindb server listening");

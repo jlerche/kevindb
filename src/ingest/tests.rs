@@ -143,6 +143,64 @@ async fn ingest_otlp_flushes_to_object_store_and_postgres() {
 }
 
 #[tokio::test]
+async fn project_route_tracks_recent_ingest_node() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let object_store = Arc::new(InMemory::new());
+    let node_a = Ingestor::with_node_id(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 64,
+            max_flush_delay: Duration::ZERO,
+        },
+        Some("node-a".to_owned()),
+    );
+    let first_receipt = node_a
+        .ingest_records(vec![sample_record("1111111111111111", 10)])
+        .await
+        .expect("ingest on node a");
+    let first_segment = first_receipt.flush.expect("node a flush").segment_uri;
+
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store.clone());
+    let route = query_engine
+        .load_project_route("demo")
+        .await
+        .expect("load node a route")
+        .expect("route exists");
+    assert_eq!(route.node_id, "node-a");
+    assert_eq!(route.last_segment_uri, first_segment);
+
+    let node_b = Ingestor::with_node_id(
+        mockgres.postgres_url().to_owned(),
+        object_store.clone(),
+        IngestConfig {
+            max_spans_per_segment: 64,
+            max_flush_delay: Duration::ZERO,
+        },
+        Some("node-b".to_owned()),
+    );
+    let second_receipt = node_b
+        .ingest_records(vec![sample_record("2222222222222222", 20)])
+        .await
+        .expect("ingest on node b");
+    let second_segment = second_receipt.flush.expect("node b flush").segment_uri;
+
+    let route = query_engine
+        .load_project_route("demo")
+        .await
+        .expect("load node b route")
+        .expect("route exists");
+    assert_eq!(route.node_id, "node-b");
+    assert_eq!(route.last_segment_uri, second_segment);
+
+    mockgres.stop().await.expect("stop mockgres");
+}
+
+#[tokio::test]
 async fn query_diagnostics_report_segment_fanout() {
     let mockgres = Mockgres::start().await.expect("start mockgres");
     run_migrations(mockgres.postgres_url())

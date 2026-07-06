@@ -26,6 +26,7 @@ const INGEST_TIME_BUCKET_UNIX_NANOS: i64 = 60 * 60 * 1_000_000_000;
 
 mod indexes;
 mod metadata;
+mod routing;
 mod thread;
 mod tree;
 use metadata::{SegmentObjectMetadata, persist_metadata};
@@ -112,6 +113,7 @@ pub struct Ingestor {
     postgres_url: String,
     object_store: Arc<dyn ObjectStore>,
     config: IngestConfig,
+    node_id: Option<String>,
     pending: Mutex<PendingState>,
     flush_finished: Notify,
 }
@@ -122,10 +124,20 @@ impl Ingestor {
         object_store: Arc<dyn ObjectStore>,
         config: IngestConfig,
     ) -> Self {
+        Self::with_node_id(postgres_url, object_store, config, None)
+    }
+
+    pub fn with_node_id(
+        postgres_url: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        config: IngestConfig,
+        node_id: Option<String>,
+    ) -> Self {
         Self {
             postgres_url: postgres_url.into(),
             object_store,
             config,
+            node_id: node_id.and_then(normalize_node_id),
             pending: Mutex::new(PendingState::default()),
             flush_finished: Notify::new(),
         }
@@ -485,6 +497,7 @@ impl Ingestor {
                 search_index_bytes: search_index_payload.len(),
                 search_index_schema_version: SEARCH_INDEX_SCHEMA_VERSION,
             },
+            self.node_id.as_deref(),
             &records,
         )
         .await
@@ -575,6 +588,11 @@ impl Ingestor {
             .context("mark segments compacted")?;
         Ok(updated as usize)
     }
+}
+
+fn normalize_node_id(node_id: String) -> Option<String> {
+    let node_id = node_id.trim();
+    (!node_id.is_empty()).then(|| node_id.to_owned())
 }
 
 #[derive(Debug)]
