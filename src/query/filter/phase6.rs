@@ -119,8 +119,7 @@ fn phase6_atom_predicate(expr: &FilterExpr) -> Result<Option<SearchPredicate>, F
             }
         }
         FilterKind::Compare { op, field, value } if field.is_payload() => {
-            let query = SearchQuery::parse(&value.as_string(field.name())?);
-            let predicate = payload_text_predicate(*field, query);
+            let predicate = payload_exact_value_predicate(*field, &value.as_string(field.name())?);
             match op {
                 CompareOp::Eq => Ok(Some(predicate)),
                 CompareOp::Neq => Ok(Some(SearchPredicate::Not(Box::new(predicate)))),
@@ -142,9 +141,9 @@ fn phase6_atom_predicate(expr: &FilterExpr) -> Result<Option<SearchPredicate>, F
             let predicates = values
                 .iter()
                 .map(|value| {
-                    Ok(payload_text_predicate(
+                    Ok(payload_exact_value_predicate(
                         *field,
-                        SearchQuery::parse(&value.as_string(field.name())?),
+                        &value.as_string(field.name())?,
                     ))
                 })
                 .collect::<Result<Vec<_>, FilterError>>()?;
@@ -180,6 +179,25 @@ fn payload_text_predicate(field: FilterField, query: SearchQuery) -> SearchPredi
         scopes
             .into_iter()
             .map(|scope| text_predicate(scope, query.clone()))
+            .collect(),
+    )
+}
+
+fn payload_exact_value_predicate(field: FilterField, value: &str) -> SearchPredicate {
+    let scopes = payload_scopes(field);
+    if scopes.len() == 1 {
+        return SearchPredicate::ExactValue {
+            field: scopes.into_iter().next().expect("one scope"),
+            value: value.to_owned(),
+        };
+    }
+    SearchPredicate::Or(
+        scopes
+            .into_iter()
+            .map(|scope| SearchPredicate::ExactValue {
+                field: scope,
+                value: value.to_owned(),
+            })
             .collect(),
     )
 }

@@ -6,7 +6,7 @@ use fst::Map;
 
 use super::{BLOCK_LEN, RowGroup, SearchIndex, TermInfo};
 
-pub(super) const MAGIC: &[u8; 8] = b"KDBFTS2\0";
+pub(super) const MAGIC: &[u8; 8] = b"KDBFTS3\0";
 pub const SEARCH_INDEX_HEADER_LEN: usize = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -117,7 +117,7 @@ pub(crate) async fn load_run_query_plan(
     }
 
     let candidate_runs = candidate_run_keys.len();
-    let has_phase6_predicate = query_has_phase6_predicate(query);
+    let has_phase6_predicate = query_has_phase6_predicate(query)?;
     let candidate_bytes = segments_by_uri
         .values()
         .map(|segment| {
@@ -138,6 +138,11 @@ pub(crate) async fn load_run_query_plan(
         candidate_runs,
         estimated_object_store_requests,
         candidate_bytes,
+        if has_phase6_predicate {
+            None
+        } else {
+            query.limits.max_candidate_runs
+        },
     )?;
 
     let mut segments = segments_by_uri.into_values().collect::<Vec<_>>();
@@ -157,12 +162,16 @@ pub(crate) async fn load_run_query_plan(
 
 fn run_candidate_runs_sql(query: &RunQuery) -> Result<String> {
     let where_sql = run_head_where_sql(query)?;
-    let candidate_limit = query
-        .limit
-        .map(|limit| limit.saturating_add(query.offset.unwrap_or(0)))
-        .filter(|limit| *limit > 0)
-        .map(|limit| format!(" LIMIT {limit}"))
-        .unwrap_or_default();
+    let candidate_limit = if query_has_phase6_predicate(query)? {
+        String::new()
+    } else {
+        query
+            .limit
+            .map(|limit| limit.saturating_add(query.offset.unwrap_or(0)))
+            .filter(|limit| *limit > 0)
+            .map(|limit| format!(" LIMIT {limit}"))
+            .unwrap_or_default()
+    };
     let order_direction = if query.newest_first { "DESC" } else { "ASC" };
 
     Ok(format!(
@@ -340,6 +349,7 @@ fn enforce_limits(
     candidate_runs: usize,
     estimated_object_store_requests: usize,
     candidate_bytes: i64,
+    max_candidate_runs: Option<usize>,
 ) -> Result<()> {
     if let Some(limit) = query.limits.max_candidate_segments
         && candidate_segments > limit
@@ -348,7 +358,7 @@ fn enforce_limits(
             "query rejected: candidate segments {candidate_segments} exceed limit {limit}"
         ));
     }
-    if let Some(limit) = query.limits.max_candidate_runs
+    if let Some(limit) = max_candidate_runs
         && candidate_runs > limit
     {
         return Err(anyhow!(
@@ -391,7 +401,7 @@ fn estimate_search_index_object_store_requests<'a>(
     query: &RunQuery,
     segments: impl Iterator<Item = &'a SegmentSource>,
 ) -> usize {
-    if !query_has_phase6_predicate(query) {
+    if !query_has_phase6_predicate(query).unwrap_or(false) {
         return 0;
     }
 
@@ -402,13 +412,18 @@ fn estimate_search_index_object_store_requests<'a>(
     )
 }
 
-fn query_has_phase6_predicate(query: &RunQuery) -> bool {
-    query.filter.as_ref().is_some_and(|filter| {
-        filter
-            .phase6_search_predicate()
-            .map(|predicate| predicate.is_some())
-            .unwrap_or(false)
-    })
+fn query_has_phase6_predicate(query: &RunQuery) -> Result<bool> {
+    Ok(query
+        .filter
+        .as_ref()
+        .map(|filter| {
+            filter
+                .phase6_search_predicate()
+                .map(|predicate| predicate.is_some())
+                .map_err(|err| anyhow!(err))
+        })
+        .transpose()?
+        .unwrap_or(false))
 }
 
 pub(crate) async fn load_deleted_run_keys(

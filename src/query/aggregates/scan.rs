@@ -94,7 +94,7 @@ fn aggregate_datafusion_sql(
 
     format!(
         "SELECT
-            project_name, run_id, trace_id, span_id, run_type, status,
+            project_name, trace_id, span_id, run_type, status,
             start_time_unix_nano, latency_nanos,
             prompt_tokens, completion_tokens, total_tokens,
             prompt_cost, completion_cost, total_cost,
@@ -109,7 +109,6 @@ fn aggregate_datafusion_sql(
             FROM (
                 SELECT
                     project_name,
-                    NULLIF(run_id, '') AS run_id,
                     trace_id,
                     span_id,
                     run_type,
@@ -150,7 +149,7 @@ fn aggregate_segment_source_sql(segment: &SegmentSource, source_where_sql: &str)
 
     format!(
         "SELECT
-            project_name, run_id, trace_id, span_id, run_type,
+            project_name, trace_id, span_id, run_type,
             start_time_unix_nano, end_time_unix_nano, status_code,
             event_time_unix_nano, row_index,
             latency_nanos, prompt_tokens, completion_tokens, total_tokens,
@@ -165,7 +164,6 @@ fn aggregate_segment_source_sql(segment: &SegmentSource, source_where_sql: &str)
 #[derive(Debug, Clone)]
 pub(super) struct AggregateRunRow {
     pub(super) project_name: String,
-    pub(super) run_id: Option<String>,
     pub(super) trace_id: String,
     pub(super) span_id: String,
     pub(super) run_type: String,
@@ -198,7 +196,6 @@ fn aggregate_rows_from_batches(batches: &[RecordBatch]) -> Result<Vec<AggregateR
     let mut rows = Vec::new();
     for batch in batches {
         let project_name = string_column(batch, "project_name")?;
-        let run_id = string_column(batch, "run_id")?;
         let trace_id = string_column(batch, "trace_id")?;
         let span_id = string_column(batch, "span_id")?;
         let run_type = string_column(batch, "run_type")?;
@@ -219,7 +216,6 @@ fn aggregate_rows_from_batches(batches: &[RecordBatch]) -> Result<Vec<AggregateR
         for row in 0..batch.num_rows() {
             rows.push(AggregateRunRow {
                 project_name: required_string(&project_name, row, "project_name")?,
-                run_id: optional_string(&run_id, row),
                 trace_id: required_string(&trace_id, row, "trace_id")?,
                 span_id: required_string(&span_id, row, "span_id")?,
                 run_type: required_string(&run_type, row, "run_type")?,

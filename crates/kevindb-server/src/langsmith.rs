@@ -23,6 +23,7 @@ mod diagnostics;
 mod direct_runs;
 mod feedback;
 mod filter;
+mod payload;
 mod threads;
 pub use diagnostics::RunQueryDiagnosticsResponse;
 pub use feedback::FeedbackResponse;
@@ -30,6 +31,7 @@ pub(crate) use feedback::{
     create_feedback, list_feedback, list_run_feedback, read_feedback, update_feedback,
 };
 use filter::{parse_filter, parse_tree_filter};
+use payload::LangSmithPayload;
 pub use threads::{
     ThreadResponse, ThreadTraceResponse, ThreadTracesResponse, ThreadsQueryRequest,
     ThreadsQueryResponse,
@@ -38,6 +40,10 @@ pub(crate) use threads::{query_thread_traces, query_threads};
 
 const MAX_RUN_QUERY_CANDIDATE_SEGMENTS: usize = 128;
 const ESTIMATED_OBJECT_STORE_REQUESTS_PER_VORTEX_FILE: usize = 48;
+pub(crate) const ESTIMATED_OBJECT_STORE_REQUESTS_PER_SEARCH_INDEX: usize = 4;
+pub(crate) const MAX_RUN_QUERY_OBJECT_STORE_REQUESTS: usize = MAX_RUN_QUERY_CANDIDATE_SEGMENTS
+    * (ESTIMATED_OBJECT_STORE_REQUESTS_PER_VORTEX_FILE
+        + ESTIMATED_OBJECT_STORE_REQUESTS_PER_SEARCH_INDEX);
 
 impl ServerState {
     async fn list_project_names(
@@ -162,6 +168,7 @@ pub(super) async fn query_runs(
     State(state): State<ServerState>,
     Json(request): Json<RunsQueryRequest>,
 ) -> Result<Json<RunsResponse>, ApiError> {
+    request.reject_unsupported()?;
     let mut project_names = request
         .project_name
         .clone()
@@ -250,9 +257,7 @@ pub(super) async fn query_runs(
         limits: RunQueryLimits {
             max_candidate_segments: Some(MAX_RUN_QUERY_CANDIDATE_SEGMENTS),
             max_candidate_runs: Some(max_candidate_runs),
-            max_estimated_object_store_requests: Some(
-                MAX_RUN_QUERY_CANDIDATE_SEGMENTS * ESTIMATED_OBJECT_STORE_REQUESTS_PER_VORTEX_FILE,
-            ),
+            max_estimated_object_store_requests: Some(MAX_RUN_QUERY_OBJECT_STORE_REQUESTS),
             max_candidate_bytes: Some(128 * 1024 * 1024),
             max_wall_time: Some(Duration::from_secs(30)),
         },
@@ -315,14 +320,41 @@ pub struct RunWriteRequest {
     inputs: Option<Value>,
     outputs: Option<Value>,
     extra: Option<Value>,
+    events: Option<Vec<Value>>,
+    tags: Option<Vec<String>>,
+    attachments: Option<Value>,
+    reference_example_id: Option<String>,
 }
 
 impl RunWriteRequest {
+    fn reject_unsupported(&self) -> Result<(), ApiError> {
+        if self
+            .attachments
+            .as_ref()
+            .is_some_and(|attachments| !attachments.is_null())
+        {
+            return Err(ApiError::bad_request(
+                "attachments are not supported".to_owned(),
+            ));
+        }
+        if self
+            .reference_example_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
+        {
+            return Err(ApiError::bad_request(
+                "reference examples are not supported".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn into_span_record(
         self,
         state: &ServerState,
         path_run_id: Option<String>,
     ) -> Result<SpanRecord, ApiError> {
+        self.reject_unsupported()?;
         let run_id = canonical_uuid(
             self.id
                 .as_deref()
@@ -382,7 +414,14 @@ impl RunWriteRequest {
         let end_time_unix_nano = parse_time_nanos(self.end_time.as_deref())?
             .or_else(|| existing.as_ref().map(|run| run.end_time_unix_nano))
             .unwrap_or(0);
-        let payload = existing_payload.merge(self.inputs, self.outputs, self.extra, self.error);
+        let payload = existing_payload.merge(
+            self.inputs,
+            self.outputs,
+            self.extra,
+            self.error,
+            self.events,
+            self.tags,
+        );
         let status_code = if payload.error.is_some() {
             2
         } else if end_time_unix_nano == 0 {
@@ -501,91 +540,6 @@ impl ServerState {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
-struct LangSmithPayload {
-    inputs: Option<Value>,
-    outputs: Option<Value>,
-    extra: Option<Value>,
-    error: Option<String>,
-    events: Vec<Value>,
-    tags: Vec<String>,
-}
-
-impl LangSmithPayload {
-    fn from_attributes_json(attributes_json: &str) -> Self {
-        let Ok(Value::Object(attributes)) = serde_json::from_str(attributes_json) else {
-            return Self::default();
-        };
-
-        Self {
-            inputs: attributes
-                .get("langsmith.inputs")
-                .filter(|value| !value.is_null())
-                .cloned(),
-            outputs: attributes
-                .get("langsmith.outputs")
-                .filter(|value| !value.is_null())
-                .cloned(),
-            extra: attributes
-                .get("langsmith.extra")
-                .filter(|value| !value.is_null())
-                .cloned(),
-            error: attributes
-                .get("langsmith.error")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            events: array_values(&attributes, &["langsmith.events", "events"]),
-            tags: string_values(&attributes, &["langsmith.tags", "tags"]),
-        }
-    }
-
-    fn merge(
-        self,
-        inputs: Option<Value>,
-        outputs: Option<Value>,
-        extra: Option<Value>,
-        error: Option<String>,
-    ) -> Self {
-        Self {
-            inputs: inputs.or(self.inputs),
-            outputs: outputs.or(self.outputs),
-            extra: extra.or(self.extra),
-            error: error.or(self.error),
-            events: self.events,
-            tags: self.tags,
-        }
-    }
-
-    fn to_attributes_json(&self) -> String {
-        json!({
-            "langsmith.inputs": self.inputs.clone().unwrap_or_else(|| json!({})),
-            "langsmith.outputs": self.outputs,
-            "langsmith.extra": self.extra.clone().unwrap_or_else(|| json!({})),
-            "langsmith.error": self.error,
-            "langsmith.events": self.events,
-            "langsmith.tags": self.tags,
-        })
-        .to_string()
-    }
-}
-
-fn array_values(attributes: &serde_json::Map<String, Value>, keys: &[&str]) -> Vec<Value> {
-    keys.iter()
-        .find_map(|key| attributes.get(*key).and_then(Value::as_array))
-        .cloned()
-        .unwrap_or_default()
-}
-
-fn string_values(attributes: &serde_json::Map<String, Value>, keys: &[&str]) -> Vec<String> {
-    keys.iter()
-        .find_map(|key| attributes.get(*key).and_then(Value::as_array))
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect()
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectResponse {
     pub id: String,
@@ -617,6 +571,10 @@ pub struct RunsQueryRequest {
     pub project_name: Option<StringList>,
     #[serde(default)]
     pub session: Option<StringList>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default, alias = "reference_example")]
+    pub reference_example_id: Option<StringList>,
     #[serde(default, alias = "trace")]
     pub trace_id: Option<String>,
     #[serde(default, alias = "parent_run")]
@@ -660,6 +618,31 @@ pub struct RunsQueryRequest {
 }
 
 impl RunsQueryRequest {
+    fn reject_unsupported(&self) -> Result<(), ApiError> {
+        if self
+            .query
+            .as_deref()
+            .is_some_and(|query| !query.trim().is_empty())
+        {
+            return Err(ApiError::bad_request(
+                "query is not supported; use filter/search predicates instead".to_owned(),
+            ));
+        }
+        if self
+            .reference_example_id
+            .clone()
+            .map(StringList::into_vec)
+            .unwrap_or_default()
+            .into_iter()
+            .any(|value| !value.trim().is_empty())
+        {
+            return Err(ApiError::bad_request(
+                "reference_example filters are not supported".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn cursor_offset(&self) -> Option<usize> {
         self.cursor
             .as_deref()
@@ -863,7 +846,10 @@ fn runs_with_children(mut runs: Vec<RunResponse>) -> Vec<RunResponse> {
 
 fn query_error(error: anyhow::Error) -> ApiError {
     let message = error.to_string();
-    if message.contains("query rejected") || message.contains("unsupported filter") {
+    if message.contains("query rejected")
+        || message.contains("unsupported filter")
+        || message.contains("invalid filter")
+    {
         ApiError::bad_request(message)
     } else {
         ApiError::from(error)

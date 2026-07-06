@@ -57,6 +57,38 @@ fn builds_langsmith_run_response_fields() {
 }
 
 #[test]
+fn run_query_rejects_unsupported_public_fields() {
+    let query_request = RunsQueryRequest {
+        query: Some("invoice".to_owned()),
+        ..empty_runs_query_request()
+    };
+    assert!(query_request.reject_unsupported().is_err());
+
+    let reference_example_request = RunsQueryRequest {
+        reference_example_id: Some(StringList::One(
+            "11111111-1111-4111-8111-111111111111".to_owned(),
+        )),
+        ..empty_runs_query_request()
+    };
+    assert!(reference_example_request.reject_unsupported().is_err());
+}
+
+#[test]
+fn run_write_rejects_unsupported_public_fields() {
+    let attachment_request: RunWriteRequest = serde_json::from_value(json!({
+        "attachments": {"log": {"mime_type": "text/plain"}}
+    }))
+    .expect("deserialize attachment request");
+    assert!(attachment_request.reject_unsupported().is_err());
+
+    let reference_example_request: RunWriteRequest = serde_json::from_value(json!({
+        "reference_example_id": "11111111-1111-4111-8111-111111111111"
+    }))
+    .expect("deserialize reference example request");
+    assert!(reference_example_request.reject_unsupported().is_err());
+}
+
+#[test]
 fn merges_partial_langsmith_payload_updates() {
     let payload = LangSmithPayload {
         inputs: Some(json!({"prompt": "hello"})),
@@ -66,7 +98,14 @@ fn merges_partial_langsmith_payload_updates() {
         events: vec![json!({"name": "token"})],
         tags: vec!["demo".to_owned()],
     }
-    .merge(None, Some(json!({"answer": "world"})), None, None);
+    .merge(
+        None,
+        Some(json!({"answer": "world"})),
+        None,
+        None,
+        None,
+        None,
+    );
 
     assert_eq!(payload.inputs, Some(json!({"prompt": "hello"})));
     assert_eq!(payload.outputs, Some(json!({"answer": "world"})));
@@ -76,6 +115,36 @@ fn merges_partial_langsmith_payload_updates() {
 
     let round_trip = LangSmithPayload::from_attributes_json(&payload.to_attributes_json());
     assert_eq!(round_trip, payload);
+}
+
+fn empty_runs_query_request() -> RunsQueryRequest {
+    RunsQueryRequest {
+        run_ids: None,
+        project_name: None,
+        session: None,
+        query: None,
+        reference_example_id: None,
+        trace_id: None,
+        parent_run_id: None,
+        parent_span_id: None,
+        run_type: None,
+        is_root: None,
+        error: None,
+        start_time: None,
+        end_time: None,
+        start_time_gte: None,
+        start_time_lte: None,
+        start_time_min: None,
+        start_time_max: None,
+        limit: None,
+        offset: None,
+        cursor: None,
+        filter: None,
+        trace_filter: None,
+        tree_filter: None,
+        select: None,
+        debug: None,
+    }
 }
 
 #[test]
@@ -150,5 +219,81 @@ fn structured_filters_parse_json_key_search() {
         filter.compile_run_head_filter("run_heads"),
         Err(kevindb::query::filter::FilterError::Unsupported(message))
             if message.contains("payload JSON")
+    ));
+}
+
+#[test]
+fn structured_phase6_filters_preserve_payload_scope() {
+    let search = parse_filter(
+        Some(&json!({"operator": "search", "field": "inputs", "query": "invoice"})),
+        "filter",
+    )
+    .expect("scoped search should parse")
+    .expect("filter should exist");
+    assert!(format!("{search:?}").contains("field: Some(Inputs)"));
+
+    let key = parse_filter(
+        Some(&json!({"operator": "json_key", "field": "outputs", "path": "answer"})),
+        "filter",
+    )
+    .expect("scoped json_key should parse")
+    .expect("filter should exist");
+    assert!(format!("{key:?}").contains("field: Some(Outputs)"));
+
+    let key_search = parse_filter(
+        Some(&json!({
+            "operator": "json_key_search",
+            "scope": "extra",
+            "path": "metadata.thread_id",
+            "query": "thread-a"
+        })),
+        "filter",
+    )
+    .expect("scoped json_key_search should parse")
+    .expect("filter should exist");
+    assert!(format!("{key_search:?}").contains("field: Some(Extra)"));
+}
+
+#[test]
+fn structured_json_key_keeps_field_as_path_without_separate_scope() {
+    let filter = parse_filter(
+        Some(&json!({"operator": "json_key", "field": "metadata"})),
+        "filter",
+    )
+    .expect("json_key path should parse")
+    .expect("filter should exist");
+
+    let debug = format!("{filter:?}");
+    assert!(debug.contains("field: None"));
+    assert!(debug.contains("pattern: \"metadata\""));
+}
+
+#[test]
+fn structured_phase6_scope_rejects_invalid_field_instead_of_widening() {
+    let error = parse_filter(
+        Some(&json!({
+            "operator": "search",
+            "field": "inputs.prompt",
+            "query": "invoice"
+        })),
+        "filter",
+    )
+    .expect_err("invalid Phase 6 field scope should fail");
+
+    assert!(matches!(
+        error,
+        ApiError::BadRequest(message) if message.contains("inputs.prompt")
+    ));
+}
+
+#[test]
+fn query_error_maps_invalid_filters_to_bad_request() {
+    let error = query_error(anyhow::anyhow!(
+        "invalid filter: in() requires a non-empty list"
+    ));
+
+    assert!(matches!(
+        error,
+        ApiError::BadRequest(message) if message.contains("invalid filter")
     ));
 }

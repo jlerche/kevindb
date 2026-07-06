@@ -14,7 +14,7 @@ use crate::{ApiError, ServerState};
 
 use super::filter::{parse_filter, parse_tree_filter};
 use super::{
-    ESTIMATED_OBJECT_STORE_REQUESTS_PER_VORTEX_FILE, MAX_RUN_QUERY_CANDIDATE_SEGMENTS,
+    MAX_RUN_QUERY_CANDIDATE_SEGMENTS, MAX_RUN_QUERY_OBJECT_STORE_REQUESTS,
     RunQueryDiagnosticsResponse, StringList, parse_time_nanos, query_error,
 };
 
@@ -126,10 +126,7 @@ impl RunAggregateRequest {
             limits: RunQueryLimits {
                 max_candidate_segments: Some(MAX_RUN_QUERY_CANDIDATE_SEGMENTS),
                 max_candidate_runs: Some(100_000),
-                max_estimated_object_store_requests: Some(
-                    MAX_RUN_QUERY_CANDIDATE_SEGMENTS
-                        * ESTIMATED_OBJECT_STORE_REQUESTS_PER_VORTEX_FILE,
-                ),
+                max_estimated_object_store_requests: Some(MAX_RUN_QUERY_OBJECT_STORE_REQUESTS),
                 max_candidate_bytes: Some(256 * 1024 * 1024),
                 max_wall_time: Some(Duration::from_secs(30)),
             },

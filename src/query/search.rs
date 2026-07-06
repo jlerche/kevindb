@@ -53,6 +53,11 @@ pub(crate) async fn apply_phase6_search_indexes(
     }
 
     let candidate_runs = candidate_run_keys.len();
+    if let Some(limit) = query.limits.max_candidate_runs
+        && candidate_runs > limit
+    {
+        bail!("query rejected: candidate runs {candidate_runs} exceed limit {limit}");
+    }
     let candidate_bytes = segments
         .iter()
         .map(|segment| segment.total_bytes + segment.search_index_bytes)

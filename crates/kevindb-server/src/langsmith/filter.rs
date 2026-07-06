@@ -58,7 +58,14 @@ fn structured_filter_to_text(value: &Value) -> Result<String, String> {
                 return compile_structured_logical("or", children);
             }
             if let Some(query) = object.get("search") {
-                return Ok(format!("search({})", structured_filter_literal(query)?));
+                return if let Some(field) = structured_phase6_scope(object)? {
+                    Ok(format!(
+                        "search({field}, {})",
+                        structured_filter_literal(query)?
+                    ))
+                } else {
+                    Ok(format!("search({})", structured_filter_literal(query)?))
+                };
             }
 
             let operator = object
@@ -87,24 +94,54 @@ fn structured_filter_to_text(value: &Value) -> Result<String, String> {
                     .or_else(|| object.get("value"))
                     .or_else(|| object.get("search"))
                     .ok_or_else(|| "search filter requires query or value".to_owned())?;
-                return Ok(format!("search({})", structured_filter_literal(query)?));
+                return if let Some(field) = structured_phase6_scope(object)? {
+                    Ok(format!(
+                        "search({field}, {})",
+                        structured_filter_literal(query)?
+                    ))
+                } else {
+                    Ok(format!("search({})", structured_filter_literal(query)?))
+                };
             }
             if operator == "json_key" {
+                let has_path_argument = object
+                    .get("path")
+                    .or_else(|| object.get("key"))
+                    .or_else(|| object.get("value"))
+                    .is_some();
+                let field = if has_path_argument {
+                    structured_phase6_scope(object)?
+                } else {
+                    structured_explicit_phase6_scope(object)?
+                };
                 let path = object
                     .get("path")
                     .or_else(|| object.get("key"))
-                    .or_else(|| object.get("field"))
                     .or_else(|| object.get("value"))
+                    .or_else(|| field.is_none().then(|| object.get("field")).flatten())
                     .ok_or_else(|| {
                         "json_key filter requires path, key, field, or value".to_owned()
                     })?;
-                return Ok(format!("json_key({})", structured_filter_literal(path)?));
+                return if let Some(field) = field {
+                    Ok(format!(
+                        "json_key({field}, {})",
+                        structured_filter_literal(path)?
+                    ))
+                } else {
+                    Ok(format!("json_key({})", structured_filter_literal(path)?))
+                };
             }
             if operator == "json_key_search" {
+                let has_path_argument = object.get("path").or_else(|| object.get("key")).is_some();
+                let field = if has_path_argument {
+                    structured_phase6_scope(object)?
+                } else {
+                    structured_explicit_phase6_scope(object)?
+                };
                 let path = object
                     .get("path")
                     .or_else(|| object.get("key"))
-                    .or_else(|| object.get("field"))
+                    .or_else(|| field.is_none().then(|| object.get("field")).flatten())
                     .ok_or_else(|| {
                         "json_key_search filter requires path, key, or field".to_owned()
                     })?;
@@ -112,11 +149,19 @@ fn structured_filter_to_text(value: &Value) -> Result<String, String> {
                     .get("query")
                     .or_else(|| object.get("value"))
                     .ok_or_else(|| "json_key_search filter requires query or value".to_owned())?;
-                return Ok(format!(
-                    "json_key_search({}, {})",
-                    structured_filter_literal(path)?,
-                    structured_filter_literal(query)?
-                ));
+                return if let Some(field) = field {
+                    Ok(format!(
+                        "json_key_search({field}, {}, {})",
+                        structured_filter_literal(path)?,
+                        structured_filter_literal(query)?
+                    ))
+                } else {
+                    Ok(format!(
+                        "json_key_search({}, {})",
+                        structured_filter_literal(path)?,
+                        structured_filter_literal(query)?
+                    ))
+                };
             }
 
             let field = object
@@ -192,6 +237,33 @@ fn structured_filter_identifier(field: &str) -> Result<String, String> {
         return Err(format!("field {field} is not a valid filter identifier"));
     }
     Ok(field.to_owned())
+}
+
+fn structured_phase6_scope(
+    object: &serde_json::Map<String, Value>,
+) -> Result<Option<String>, String> {
+    if let Some(scope) = structured_explicit_phase6_scope(object)? {
+        return Ok(Some(scope));
+    }
+    let Some(value) = object.get("field").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    structured_filter_identifier(value).map(Some)
+}
+
+fn structured_explicit_phase6_scope(
+    object: &serde_json::Map<String, Value>,
+) -> Result<Option<String>, String> {
+    for key in ["scope", "payload_field"] {
+        let Some(value) = object.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        if let Ok(identifier) = structured_filter_identifier(value) {
+            return Ok(Some(identifier));
+        }
+        return Err(format!("{key} {value} is not a valid filter identifier"));
+    }
+    Ok(None)
 }
 
 fn structured_filter_literal(value: &Value) -> Result<String, String> {

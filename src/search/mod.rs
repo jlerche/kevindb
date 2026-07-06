@@ -30,7 +30,7 @@ use codec::{
     encode_positions, encode_u32_list,
 };
 
-pub const SEARCH_INDEX_SCHEMA_VERSION: i64 = 2;
+pub const SEARCH_INDEX_SCHEMA_VERSION: i64 = 3;
 pub const MIN_TOKEN_BYTES: usize = 2;
 pub const MAX_TOKEN_BYTES: usize = 64;
 pub const MAX_JSON_KEYS_PER_RUN: usize = 256;
@@ -219,6 +219,7 @@ impl SearchIndex {
                 self.all_rows().difference(&child_rows).copied().collect()
             }
             SearchPredicate::Text { field, query } => self.rows_for_query(field, query),
+            SearchPredicate::ExactValue { field, value } => self.rows_for_exact_value(field, value),
             SearchPredicate::JsonKey { pattern } => self.rows_for_path_pattern(pattern),
         }
     }
@@ -350,6 +351,13 @@ impl SearchIndex {
             }
         }
         rows
+    }
+
+    fn rows_for_exact_value(&self, field: &SearchField, value: &str) -> BTreeSet<u32> {
+        self.value_terms_for_token(field, &exact_value_token(value), false)
+            .into_iter()
+            .flat_map(|term| term.rows)
+            .collect()
     }
 
     fn value_terms_for_token(
@@ -751,6 +759,10 @@ pub(super) fn term_value_prefix(token: &str) -> Vec<u8> {
     prefix.extend_from_slice(token.as_bytes());
     prefix.push(KEY_VALUE_SEPARATOR);
     prefix
+}
+
+pub(super) fn exact_value_token(value: &str) -> String {
+    format!("={}", hex::encode(value.as_bytes()))
 }
 
 pub(super) fn term_path(term: &[u8]) -> String {

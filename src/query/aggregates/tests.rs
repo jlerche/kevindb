@@ -98,7 +98,6 @@ async fn aggregates_typed_vortex_columns_without_payload_json() {
 fn ungrouped_feedback_aggregates_keep_all_requested_keys_without_recounting_runs() {
     let row = AggregateRunRow {
         project_name: "demo".to_owned(),
-        run_id: Some("run-a".to_owned()),
         trace_id: TRACE_ID.to_owned(),
         span_id: "span-a".to_owned(),
         run_type: "llm".to_owned(),
@@ -121,7 +120,7 @@ fn ungrouped_feedback_aggregates_keep_all_requested_keys_without_recounting_runs
         ..RunAggregateQuery::new("demo")
     };
     let feedback_scores = HashMap::from([(
-        "run-a".to_owned(),
+        row.run_key(),
         vec![
             FeedbackScore {
                 key: "quality".to_owned(),
@@ -140,6 +139,51 @@ fn ungrouped_feedback_aggregates_keep_all_requested_keys_without_recounting_runs
     assert_eq!(rows[0].metrics.count, 1);
     assert_eq!(rows[0].metrics.feedback_scores["quality"].count, 1);
     assert_eq!(rows[0].metrics.feedback_scores["cost"].count, 1);
+}
+
+#[test]
+fn grouped_feedback_aggregates_keep_requested_score_metrics() {
+    let row = AggregateRunRow {
+        project_name: "demo".to_owned(),
+        trace_id: TRACE_ID.to_owned(),
+        span_id: "span-a".to_owned(),
+        run_type: "llm".to_owned(),
+        status: "success".to_owned(),
+        start_time_unix_nano: 10,
+        latency_nanos: 20,
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
+        prompt_cost: None,
+        completion_cost: None,
+        total_cost: None,
+        first_token_latency_nanos: None,
+        evaluator_score: None,
+        model_name: None,
+        provider_name: None,
+    };
+    let query = RunAggregateQuery {
+        group_by: vec![RunAggregateGroup::RunType],
+        feedback_keys: vec!["quality".to_owned()],
+        ..RunAggregateQuery::new("demo")
+    };
+    let feedback_scores = HashMap::from([(
+        row.run_key(),
+        vec![FeedbackScore {
+            key: "quality".to_owned(),
+            score: 0.8,
+        }],
+    )]);
+
+    let rows = aggregate_rows(vec![row], &query, &HashMap::new(), &feedback_scores);
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].group.get("run_type").map(String::as_str),
+        Some("llm")
+    );
+    assert_eq!(rows[0].metrics.count, 1);
+    assert_eq!(rows[0].metrics.feedback_scores["quality"].count, 1);
 }
 
 struct TestSpan<'a> {

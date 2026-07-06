@@ -59,13 +59,15 @@
         }
       }
     },
+    "/v1/sessions": {"$ref": "#/paths/~1sessions"},
     "/runs": {
       "post": {
         "operationId": "createRun",
         "requestBody": {"$ref": "#/components/requestBodies/JsonObject"},
-        "responses": {"200": {"description": "Run accepted."}}
+        "responses": {"202": {"description": "Run accepted."}}
       }
     },
+    "/v1/runs": {"$ref": "#/paths/~1runs"},
     "/runs/{run_id}": {
       "get": {
         "operationId": "readRun",
@@ -85,6 +87,7 @@
         "responses": {"200": {"description": "Run update accepted."}}
       }
     },
+    "/v1/runs/{run_id}": {"$ref": "#/paths/~1runs~1{run_id}"},
     "/runs/{run_id}/feedback": {
       "get": {
         "operationId": "listRunFeedback",
@@ -104,6 +107,7 @@
         }
       }
     },
+    "/v1/runs/{run_id}/feedback": {"$ref": "#/paths/~1runs~1{run_id}~1feedback"},
     "/runs/query": {
       "post": {
         "operationId": "queryRuns",
@@ -116,6 +120,7 @@
         }
       }
     },
+    "/v1/runs/query": {"$ref": "#/paths/~1runs~1query"},
     "/runs/aggregate": {
       "post": {
         "operationId": "queryRunAggregates",
@@ -128,6 +133,7 @@
         }
       }
     },
+    "/v1/runs/aggregate": {"$ref": "#/paths/~1runs~1aggregate"},
     "/feedback": {
       "get": {
         "operationId": "listFeedback",
@@ -149,13 +155,11 @@
         "operationId": "createFeedback",
         "requestBody": {"$ref": "#/components/requestBodies/JsonObject"},
         "responses": {
-          "200": {
-            "description": "Created feedback.",
-            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/FeedbackResponse"}}}
-          }
+          "202": {"description": "Feedback accepted."}
         }
       }
     },
+    "/v1/feedback": {"$ref": "#/paths/~1feedback"},
     "/feedback/{feedback_id}": {
       "get": {
         "operationId": "readFeedback",
@@ -178,6 +182,7 @@
         }
       }
     },
+    "/v1/feedback/{feedback_id}": {"$ref": "#/paths/~1feedback~1{feedback_id}"},
     "/v1/projects/{project_name}/traces": {
       "post": {
         "operationId": "ingestTrace",

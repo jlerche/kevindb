@@ -11,6 +11,10 @@ pub enum SearchPredicate {
         field: SearchField,
         query: SearchQuery,
     },
+    ExactValue {
+        field: SearchField,
+        value: String,
+    },
     JsonKey {
         pattern: String,
     },

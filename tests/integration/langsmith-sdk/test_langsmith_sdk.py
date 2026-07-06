@@ -104,7 +104,20 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
             trace_id=sdk_root_id,
             name="sdk.agent",
             run_type="chain",
-            inputs={"prompt": "hello"},
+            inputs={"prompt": "hello root"},
+            events=[{"name": "root-start"}],
+            extra={
+                "metadata": {
+                    "thread_id": "thread-sdk",
+                    "prompt_tokens": 2,
+                    "completion_tokens": 1,
+                    "total_tokens": 3,
+                    "total_cost": 0.01,
+                    "ls_model_name": "gpt-sdk",
+                    "ls_provider": "test-provider",
+                }
+            },
+            tags=["thread-sdk", "root"],
             start_time=sdk_start,
         )
         client.create_run(
@@ -114,21 +127,39 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
             parent_run_id=sdk_root_id,
             name="sdk.llm",
             run_type="llm",
-            inputs={"messages": ["hello"]},
+            inputs={
+                "messages": [
+                    {"role": "user", "content": "invoice alpha request"}
+                ]
+            },
+            tags=["thread-sdk", "llm"],
             start_time=sdk_start + timedelta(milliseconds=100),
         )
         client.update_run(
             sdk_child_id,
             trace_id=sdk_root_id,
             parent_run_id=sdk_root_id,
-            outputs={"text": "world"},
-            extra={"metadata": {"tier": "gold"}},
+            outputs={"text": "invoice alpha approved"},
+            events=[{"name": "token", "text": "invoice"}],
+            extra={
+                "metadata": {
+                    "tier": "gold",
+                    "thread_id": "thread-sdk",
+                    "prompt_tokens": 7,
+                    "completion_tokens": 5,
+                    "total_tokens": 12,
+                    "total_cost": 0.04,
+                    "first_token_latency_nanos": 25_000_000,
+                    "ls_model_name": "gpt-sdk",
+                    "ls_provider": "test-provider",
+                }
+            },
             end_time=sdk_start + timedelta(milliseconds=900),
         )
         client.update_run(
             sdk_root_id,
             trace_id=sdk_root_id,
-            outputs={"answer": "world"},
+            outputs={"answer": "root answer world"},
             end_time=sdk_start + timedelta(seconds=1),
         )
 
@@ -142,14 +173,20 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
         assert sdk_runs_by_id[sdk_child_id].end_time is not None
 
         read_child = client.read_run(sdk_child_id)
-        assert read_child.inputs == {"messages": ["hello"]}
-        assert read_child.outputs == {"text": "world"}
+        assert read_child.inputs == {
+            "messages": [{"role": "user", "content": "invoice alpha request"}]
+        }
+        assert read_child.outputs == {"text": "invoice alpha approved"}
         assert read_child.parent_run_id == sdk_root_id
         assert str(read_child.trace_id) == str(sdk_root_id)
+        assert read_child.events == [{"name": "token", "text": "invoice"}]
+        assert read_child.tags == ["thread-sdk", "llm"]
 
         read_root = client.read_run(sdk_root_id)
-        assert read_root.inputs == {"prompt": "hello"}
-        assert read_root.outputs == {"answer": "world"}
+        assert read_root.inputs == {"prompt": "hello root"}
+        assert read_root.outputs == {"answer": "root answer world"}
+        assert read_root.events == [{"name": "root-start"}]
+        assert read_root.tags == ["thread-sdk", "root"]
 
         feedback = client.create_feedback(
             sdk_child_id,
@@ -196,6 +233,27 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
         )
         run_feedback_response.raise_for_status()
         assert [item["key"] for item in run_feedback_response.json()] == ["quality"]
+        otlp_feedback = client.create_feedback(
+            otlp_child_id,
+            key="otlp_quality",
+            score=0.75,
+            comment="generated id feedback",
+        )
+        assert otlp_feedback.run_id == otlp_child_id
+        indexed_feedback_response = requests.get(
+            f"{server_url}/feedback",
+            params={
+                "project_name": PROJECT_NAME,
+                "trace_id": str(sdk_root_id),
+                "score_min": "0.5",
+                "score_max": "0.5",
+                "value": "edited",
+            },
+            timeout=5,
+        )
+        indexed_feedback_response.raise_for_status()
+        indexed_feedback = indexed_feedback_response.json()
+        assert [item["id"] for item in indexed_feedback] == [str(feedback.id)]
 
         failed_run_id = uuid4()
         client.create_run(
@@ -230,6 +288,189 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
         )
         assert [run.name for run in feedback_filtered_runs] == ["sdk.llm"]
 
+        unsupported_query_response = requests.post(
+            f"{server_url}/runs/query",
+            json={"project_name": PROJECT_NAME, "query": "invoice"},
+            timeout=5,
+        )
+        assert unsupported_query_response.status_code == 400
+        assert "query is not supported" in unsupported_query_response.text
+        unsupported_attachment_response = requests.post(
+            f"{server_url}/runs",
+            json={
+                "id": str(uuid4()),
+                "project_name": PROJECT_NAME,
+                "name": "sdk.attachment",
+                "run_type": "chain",
+                "inputs": {},
+                "attachments": {"log": {"mime_type": "text/plain", "data": "abc"}},
+            },
+            timeout=5,
+        )
+        assert unsupported_attachment_response.status_code == 400
+        assert "attachments are not supported" in unsupported_attachment_response.text
+
+        scoped_search_response = requests.post(
+            f"{server_url}/runs/query",
+            json={
+                "project_name": PROJECT_NAME,
+                "filter": {
+                    "operator": "search",
+                    "field": "inputs",
+                    "query": "invoice",
+                },
+                "select": ["id", "name"],
+                "limit": 1,
+                "debug": True,
+            },
+            timeout=5,
+        )
+        scoped_search_response.raise_for_status()
+        scoped_search_body = scoped_search_response.json()
+        assert [run["name"] for run in scoped_search_body["runs"]] == ["sdk.llm"]
+        scoped_search_diagnostics = scoped_search_body["diagnostics"]
+        assert scoped_search_diagnostics["candidate_runs"] == 1
+        assert scoped_search_diagnostics["actual_object_store_requests"] > 0
+
+        exact_payload_response = requests.post(
+            f"{server_url}/runs/query",
+            json={
+                "project_name": PROJECT_NAME,
+                "filter": {
+                    "operator": "eq",
+                    "field": "outputs",
+                    "value": "invoice alpha approved",
+                },
+                "select": ["id", "name"],
+            },
+            timeout=5,
+        )
+        exact_payload_response.raise_for_status()
+        assert [run["name"] for run in exact_payload_response.json()["runs"]] == [
+            "sdk.llm"
+        ]
+        token_only_exact_response = requests.post(
+            f"{server_url}/runs/query",
+            json={
+                "project_name": PROJECT_NAME,
+                "filter": {
+                    "operator": "eq",
+                    "field": "outputs",
+                    "value": "invoice",
+                },
+                "select": ["id", "name"],
+            },
+            timeout=5,
+        )
+        token_only_exact_response.raise_for_status()
+        assert token_only_exact_response.json()["runs"] == []
+
+        in_payload_response = requests.post(
+            f"{server_url}/runs/query",
+            json={
+                "project_name": PROJECT_NAME,
+                "filter": {
+                    "operator": "in",
+                    "field": "outputs",
+                    "values": ["missing", "invoice alpha approved"],
+                },
+                "select": ["id", "name"],
+            },
+            timeout=5,
+        )
+        in_payload_response.raise_for_status()
+        assert [run["name"] for run in in_payload_response.json()["runs"]] == [
+            "sdk.llm"
+        ]
+
+        json_key_response = requests.post(
+            f"{server_url}/runs/query",
+            json={
+                "project_name": PROJECT_NAME,
+                "filter": {
+                    "operator": "json_key",
+                    "field": "outputs",
+                    "path": "text",
+                },
+                "select": ["id", "name"],
+            },
+            timeout=5,
+        )
+        json_key_response.raise_for_status()
+        assert [run["name"] for run in json_key_response.json()["runs"]] == [
+            "sdk.llm"
+        ]
+
+        scoped_json_key_search_response = requests.post(
+            f"{server_url}/runs/query",
+            json={
+                "project_name": PROJECT_NAME,
+                "filter": {
+                    "operator": "json_key_search",
+                    "scope": "extra",
+                    "path": "metadata.thread_id",
+                    "query": "thread-sdk",
+                },
+                "select": ["id", "name"],
+            },
+            timeout=5,
+        )
+        scoped_json_key_search_response.raise_for_status()
+        assert {
+            run["name"] for run in scoped_json_key_search_response.json()["runs"]
+        } == {"sdk.agent", "sdk.llm"}
+
+        phase6_aggregate_response = requests.post(
+            f"{server_url}/runs/aggregate",
+            json={
+                "project_name": PROJECT_NAME,
+                "group_by": ["run_type"],
+                "filter": {
+                    "operator": "search",
+                    "field": "inputs",
+                    "query": "invoice",
+                },
+                "feedback_key": ["quality"],
+                "debug": True,
+            },
+            timeout=5,
+        )
+        phase6_aggregate_response.raise_for_status()
+        phase6_aggregate = phase6_aggregate_response.json()
+        assert phase6_aggregate["source"] == "vortex"
+        assert len(phase6_aggregate["rows"]) == 1
+        llm_aggregate = phase6_aggregate["rows"][0]
+        assert llm_aggregate["group"] == {"run_type": "llm"}
+        assert llm_aggregate["metrics"]["count"] == 1
+        quality_stats = llm_aggregate["metrics"]["feedback_scores"]["quality"]
+        assert quality_stats["count"] == 1
+        assert quality_stats["avg"] == 0.5
+        assert phase6_aggregate["diagnostics"]["candidate_runs"] == 1
+        assert phase6_aggregate["diagnostics"]["actual_object_store_requests"] > 0
+
+        generated_feedback_aggregate_response = requests.post(
+            f"{server_url}/v1/runs/aggregate",
+            json={
+                "project_name": PROJECT_NAME,
+                "group_by": ["feedback_key"],
+                "feedback_key": ["otlp_quality"],
+                "debug": True,
+            },
+            timeout=5,
+        )
+        generated_feedback_aggregate_response.raise_for_status()
+        generated_feedback_aggregate = generated_feedback_aggregate_response.json()
+        assert generated_feedback_aggregate["source"] == "vortex"
+        assert len(generated_feedback_aggregate["rows"]) == 1
+        generated_feedback_row = generated_feedback_aggregate["rows"][0]
+        assert generated_feedback_row["group"] == {"feedback_key": "otlp_quality"}
+        assert generated_feedback_row["metrics"]["count"] == 1
+        otlp_quality_stats = generated_feedback_row["metrics"]["feedback_scores"][
+            "otlp_quality"
+        ]
+        assert otlp_quality_stats["count"] == 1
+        assert otlp_quality_stats["avg"] == 0.75
+
         query_response = requests.post(
             f"{server_url}/runs/query",
             json={"project_name": PROJECT_NAME, "trace": str(sdk_root_id), "limit": 10},
@@ -240,10 +481,16 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
         assert query_body["cursors"] == {"next": None}
         query_runs_by_id = {run["id"]: run for run in query_body["runs"]}
         assert set(query_runs_by_id) == {str(sdk_root_id), str(sdk_child_id)}
-        assert query_runs_by_id[str(sdk_root_id)]["inputs"] == {"prompt": "hello"}
-        assert query_runs_by_id[str(sdk_root_id)]["outputs"] == {"answer": "world"}
-        assert query_runs_by_id[str(sdk_child_id)]["inputs"] == {"messages": ["hello"]}
-        assert query_runs_by_id[str(sdk_child_id)]["outputs"] == {"text": "world"}
+        assert query_runs_by_id[str(sdk_root_id)]["inputs"] == {"prompt": "hello root"}
+        assert query_runs_by_id[str(sdk_root_id)]["outputs"] == {
+            "answer": "root answer world"
+        }
+        assert query_runs_by_id[str(sdk_child_id)]["inputs"] == {
+            "messages": [{"role": "user", "content": "invoice alpha request"}]
+        }
+        assert query_runs_by_id[str(sdk_child_id)]["outputs"] == {
+            "text": "invoice alpha approved"
+        }
         assert query_runs_by_id[str(sdk_root_id)]["child_run_ids"] == [str(sdk_child_id)]
 
         trace_response = requests.get(
@@ -254,6 +501,77 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
         trace_body = trace_response.json()
         assert trace_body["root_run_ids"] == [str(sdk_root_id)]
         assert [run["name"] for run in trace_body["runs"]] == ["sdk.agent", "sdk.llm"]
+
+        tree_filter_response = requests.post(
+            f"{server_url}/runs/query",
+            json={
+                "project_name": PROJECT_NAME,
+                "trace": str(sdk_root_id),
+                "tree_filter": {
+                    "field": "run_type",
+                    "operator": "eq",
+                    "value": "llm",
+                },
+                "select": ["id", "name"],
+            },
+            timeout=5,
+        )
+        tree_filter_response.raise_for_status()
+        assert {run["name"] for run in tree_filter_response.json()["runs"]} == {
+            "sdk.agent",
+            "sdk.llm",
+        }
+
+        sessions_response = requests.get(
+            f"{server_url}/sessions",
+            params={"name": PROJECT_NAME},
+            timeout=5,
+        )
+        sessions_response.raise_for_status()
+        sessions = sessions_response.json()
+        assert [session["name"] for session in sessions] == [PROJECT_NAME]
+        project_id = sessions[0]["id"]
+
+        threads_response = requests.post(
+            f"{server_url}/v2/threads/query",
+            json={"project_id": project_id, "page_size": 10},
+            timeout=5,
+        )
+        threads_response.raise_for_status()
+        threads = threads_response.json()
+        sdk_threads = [
+            thread for thread in threads["items"] if thread["thread_id"] == "thread-sdk"
+        ]
+        assert len(sdk_threads) == 1
+        sdk_thread = sdk_threads[0]
+        assert sdk_thread["count"] == 1
+        assert sdk_thread["total_tokens"] == 15
+        assert sdk_thread["first_inputs"] == "hello root"
+        assert sdk_thread["last_outputs"] == "invoice alpha approved"
+
+        thread_traces_response = requests.get(
+            f"{server_url}/v2/threads/thread-sdk/traces",
+            params=[
+                ("project_id", project_id),
+                ("page_size", "1"),
+                ("selects", "TRACE_ID"),
+                ("selects", "THREAD_ID"),
+                ("selects", "INPUTS_PREVIEW"),
+                ("selects", "OUTPUTS_PREVIEW"),
+                ("selects", "TOTAL_TOKENS"),
+            ],
+            timeout=5,
+        )
+        thread_traces_response.raise_for_status()
+        thread_traces = thread_traces_response.json()
+        assert thread_traces.get("next_cursor") is None
+        assert len(thread_traces["items"]) == 1
+        thread_trace = thread_traces["items"][0]
+        assert thread_trace["trace_id"] == str(sdk_root_id)
+        assert thread_trace["thread_id"] == "thread-sdk"
+        assert thread_trace["inputs_preview"] == "hello root"
+        assert thread_trace["outputs_preview"] == "invoice alpha approved"
+        assert thread_trace["total_tokens"] == 15
 
         filtered_response = requests.post(
             f"{server_url}/runs/query",

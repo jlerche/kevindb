@@ -1,5 +1,5 @@
 use super::*;
-use crate::query::filter::FilterExpr;
+use crate::query::{RunAggregateQuery, filter::FilterExpr};
 use serde_json::json;
 
 #[tokio::test]
@@ -79,10 +79,46 @@ async fn phase6_search_and_json_filters_use_sibling_indexes() {
     .await;
     assert_filter_matches(
         &query_engine,
+        r#"eq(inputs, "find invoice alpha")"#,
+        &["1111111111111111"],
+    )
+    .await;
+    assert_filter_matches(&query_engine, r#"eq(inputs, "invoice")"#, &[]).await;
+    assert_filter_matches(
+        &query_engine,
         r#"does_not_contain(inputs, "invoice")"#,
         &["2222222222222222"],
     )
     .await;
+
+    let mut limited_search = RunQuery::new("demo");
+    limited_search.filter = Some(FilterExpr::parse(r#"search("ordinary")"#).unwrap());
+    limited_search.include_payload = false;
+    limited_search.limit = Some(1);
+    limited_search.limits.max_candidate_runs = Some(1);
+    let limited_runs = query_engine
+        .list_runs(limited_search)
+        .await
+        .expect("limited phase 6 search query");
+    assert_eq!(
+        limited_runs
+            .iter()
+            .map(|run| run.span_id.as_str())
+            .collect::<Vec<_>>(),
+        ["2222222222222222"]
+    );
+
+    let aggregate = query_engine
+        .aggregate_runs(RunAggregateQuery {
+            filter: Some(FilterExpr::parse(r#"search("invoice")"#).unwrap()),
+            ..RunAggregateQuery::new("demo")
+        })
+        .await
+        .expect("phase 6 filtered aggregate");
+    assert_eq!(aggregate.rows.len(), 1);
+    assert_eq!(aggregate.rows[0].metrics.count, 1);
+    assert_eq!(aggregate.diagnostics.candidate_runs, 1);
+    assert!(aggregate.diagnostics.actual_object_store_requests >= 1);
 
     let mut diagnostics_query = RunQuery::new("demo");
     diagnostics_query.filter = Some(FilterExpr::parse(r#"contains(inputs, "invoice")"#).unwrap());

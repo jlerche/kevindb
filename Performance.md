@@ -55,16 +55,17 @@ Results:
 | feedback filtering | 0.9 ms | 1.2 ms | 0 | 0 | 0 | 0 |
 | root tree predicate | 86.9 ms | 89.1 ms | 12 | 12 | 360 | 1,890,160 |
 | child tree predicate | 87.5 ms | 91.1 ms | 12 | 12 | 360 | 1,890,160 |
-| thread trace listing rejection | 0.00002 ms | 0.00005 ms | 0 | 0 | 0 | 0 |
-| aggregate scan rejection | 0.00002 ms | 0.00008 ms | 0 | 0 | 0 | 0 |
+| thread trace listing rejection (historical) | 0.00002 ms | 0.00005 ms | 0 | 0 | 0 | 0 |
+| aggregate scan rejection (historical) | 0.00002 ms | 0.00008 ms | 0 | 0 | 0 | 0 |
 
 Thread trace listing and aggregate scans were benchmarked as measured rejection
-paths before their storage models existed:
+paths before their storage models existed. Later phase snapshots supersede
+these historical rows with implemented thread and aggregate query paths:
 
 | Workload | Reason |
 | --- | --- |
-| thread trace listing | Thread materialization is not implemented; no payload metadata scan fallback. |
-| aggregate scans | Historical pre-Phase 5 rejection path. |
+| thread trace listing | Implemented in Phase 4 using Postgres thread metadata; no object-store reads for listing. |
+| aggregate scans | Implemented in Phase 5 using typed Vortex metric columns and Postgres rollups. |
 
 ## Phase 2 Filtering Snapshot
 
@@ -100,8 +101,8 @@ Results:
 | feedback filtering | 0.8 ms | 1.4 ms | 0 | 0 | 0 | 0 |
 | root tree predicate | 90.1 ms | 93.7 ms | 12 | 12 | 360 | 1,890,160 |
 | child tree predicate | 92.9 ms | 95.2 ms | 12 | 12 | 420 | 1,912,720 |
-| thread trace listing rejection | 0.00002 ms | 0.00014 ms | 0 | 0 | 0 | 0 |
-| aggregate scan rejection | 0.00002 ms | 0.00002 ms | 0 | 0 | 0 | 0 |
+| thread trace listing rejection (historical) | 0.00002 ms | 0.00014 ms | 0 | 0 | 0 | 0 |
+| aggregate scan rejection (historical) | 0.00002 ms | 0.00002 ms | 0 | 0 | 0 | 0 |
 
 The selective scalar filter uses indexed metadata and projects payload fields
 out of the Vortex scan. The nonselective scalar filter uses an indexed tag that
@@ -142,8 +143,8 @@ Results:
 | feedback filtering | 0.9 ms | 1.8 ms | 0 | 0 | 0 | 0 |
 | root tree predicate | 276.8 ms | 283.1 ms | 1 | 1 | 35 | 158,300 |
 | child tree predicate | 274.6 ms | 284.2 ms | 1 | 1 | 40 | 160,180 |
-| thread trace listing rejection | 0.00002 ms | 0.00013 ms | 0 | 0 | 0 | 0 |
-| aggregate scan rejection | 0.00002 ms | 0.00002 ms | 0 | 0 | 0 | 0 |
+| thread trace listing rejection (historical) | 0.00002 ms | 0.00013 ms | 0 | 0 | 0 | 0 |
+| aggregate scan rejection (historical) | 0.00002 ms | 0.00002 ms | 0 | 0 | 0 | 0 |
 
 Trace tree reconstruction now reads `run_tree_nodes` and current `run_heads`
 from Postgres and does not open Vortex or object storage. Root and child tree
@@ -185,7 +186,7 @@ Results:
 | root tree predicate | 284.1 ms | 288.9 ms | 1 | 1 | 35 | 158,300 |
 | child tree predicate | 279.8 ms | 285.3 ms | 1 | 1 | 40 | 160,180 |
 | thread trace listing | 0.62 ms | 1.12 ms | 0 | 0 | 0 | 0 |
-| aggregate scan rejection | 0.00002 ms | 0.00005 ms | 0 | 0 | 0 | 0 |
+| aggregate scan rejection (historical) | 0.00002 ms | 0.00005 ms | 0 | 0 | 0 | 0 |
 
 Thread trace listing now reads `threads`/`thread_traces` from Postgres using
 cursor pagination. It does not open Vortex files or read object storage; full
@@ -289,6 +290,9 @@ Current query fanout assertions live in library tests:
 - `ingest::tests::phase2::filters_use_scalar_indexes_feedback_and_projection`
 - `ingest::tests::phase2::planner_rejects_queries_that_exceed_fanout_limits`
 - `ingest::tests::phase3::tree_metadata_repairs_late_parents_and_indexes_nested_sets`
+- `ingest::tests::phase4::thread_metadata_materializes_multi_trace_threads`
+- `ingest::tests::phase5::aggregates_use_rollups_and_typed_vortex_columns`
+- `ingest::tests::phase6::phase6_search_and_json_filters_use_sibling_indexes`
 - `query::tests::datafusion_sql_pushes_projection_and_source_predicates`
 - `query::tests::datafusion_sql_omits_candidate_key_pushdown_when_row_locators_exist`
 

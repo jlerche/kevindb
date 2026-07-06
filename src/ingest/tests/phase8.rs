@@ -3,6 +3,7 @@ use std::time::Duration;
 use super::*;
 use crate::query::{
     DistributedQueryCancellation, DistributedQueryConfig, RunAggregateGroup, RunAggregateQuery,
+    filter::FilterExpr,
 };
 
 fn phase8_record(span_id: &str, start_time_unix_nano: i64) -> SpanRecord {
@@ -219,6 +220,7 @@ async fn distributed_aggregates_merge_partition_rows_deterministically() {
     first.run_type = "chain".to_owned();
     let mut second = phase8_record("2222222222222222", 20);
     second.run_type = "llm".to_owned();
+    second.attributes_json = r#"{"note":"distributed phase8 target"}"#.to_owned();
     let mut third = phase8_record("3333333333333333", 30);
     third.run_type = "llm".to_owned();
     ingestor
@@ -231,7 +233,8 @@ async fn distributed_aggregates_merge_partition_rows_deterministically() {
     query.limits.max_candidate_segments = Some(3);
     query.limits.max_estimated_object_store_requests = Some(3 * 48);
 
-    let result = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store)
+    let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store.clone());
+    let result = query_engine
         .aggregate_runs_distributed(
             query,
             DistributedQueryConfig {
@@ -261,6 +264,29 @@ async fn distributed_aggregates_merge_partition_rows_deterministically() {
     assert_eq!(result.diagnostics.candidate_segments, 3);
     assert_eq!(result.distributed.partitions_planned, 3);
     assert_eq!(result.distributed.partitions_executed, 3);
+
+    let mut filtered_query = RunAggregateQuery::new("demo");
+    filtered_query.group_by = vec![RunAggregateGroup::RunType];
+    filtered_query.filter = Some(FilterExpr::parse(r#"search("target")"#).expect("search filter"));
+    filtered_query.limits.max_candidate_segments = Some(3);
+    filtered_query.limits.max_estimated_object_store_requests = Some(3 * 52);
+    let filtered = query_engine
+        .aggregate_runs_distributed(
+            filtered_query,
+            DistributedQueryConfig {
+                worker_count: 2,
+                max_segments_per_partition: 1,
+                max_in_flight_partitions: 2,
+                ..DistributedQueryConfig::default()
+            },
+        )
+        .await
+        .expect("run distributed filtered aggregate query");
+    assert_eq!(filtered.rows.len(), 1);
+    assert_eq!(filtered.rows[0].group["run_type"], "llm");
+    assert_eq!(filtered.rows[0].metrics.count, 1);
+    assert_eq!(filtered.diagnostics.candidate_runs, 1);
+    assert!(filtered.diagnostics.actual_object_store_requests >= 1);
 
     mockgres.stop().await.expect("stop mockgres");
 }

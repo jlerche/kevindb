@@ -177,6 +177,47 @@ async fn aggregates_use_rollups_and_typed_vortex_columns() {
         Some(7.0)
     );
 
+    let generated_run_id = generated_run_id(
+        "demo",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "3333333333333333",
+    );
+    client
+        .execute(
+            "INSERT INTO feedback(
+                id, run_id, trace_id, project_name, key,
+                score_json, score_number, value_json, value_text,
+                created_at_unix_nano, modified_at_unix_nano
+            )
+            VALUES (
+                'generated-feedback', $1, 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+                'demo', 'quality', '0.75', 0.75, '\"pass\"', 'pass', 1, 1
+            )",
+            &[&generated_run_id],
+        )
+        .await
+        .expect("insert generated-id feedback");
+    let feedback = query_engine
+        .aggregate_runs(RunAggregateQuery {
+            project_names: vec!["demo".to_owned()],
+            group_by: vec![RunAggregateGroup::FeedbackKey],
+            feedback_keys: vec!["quality".to_owned()],
+            ..RunAggregateQuery::new("demo")
+        })
+        .await
+        .expect("aggregate generated-id feedback");
+    let quality = feedback
+        .rows
+        .iter()
+        .find(|row| {
+            row.group
+                .get("feedback_key")
+                .is_some_and(|value| value == "quality")
+        })
+        .expect("quality feedback aggregate row");
+    assert_eq!(quality.metrics.count, 1);
+    assert_eq!(quality.metrics.feedback_scores["quality"].count, 1);
+
     mockgres.stop().await.expect("stop mockgres");
 }
 

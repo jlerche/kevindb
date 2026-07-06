@@ -158,6 +158,12 @@ impl QueryEngine {
         let postgres_started = Instant::now();
         let plan = load_run_query_plan(&self.postgres_url, &run_query).await?;
         let postgres_query_time = postgres_started.elapsed();
+        let (plan, search_index_reads) = super::search::apply_phase6_search_indexes(
+            Arc::clone(&self.object_store),
+            plan,
+            &run_query,
+        )
+        .await?;
         reject_old_metric_segments(&plan.segments)?;
 
         let candidate_segments = plan.segments.len();
@@ -197,8 +203,12 @@ impl QueryEngine {
                 candidate_runs,
                 candidate_bytes,
                 estimated_object_store_requests,
-                actual_object_store_requests: object_store_reads.request_count(),
-                actual_object_store_bytes_read: object_store_reads.bytes_read,
+                actual_object_store_requests: object_store_reads
+                    .request_count()
+                    .saturating_add(search_index_reads.request_count()),
+                actual_object_store_bytes_read: object_store_reads
+                    .bytes_read
+                    .saturating_add(search_index_reads.bytes_read),
                 vortex_files_opened: candidate_segments,
                 rows_returned: aggregate_rows.len(),
                 postgres_query_time,
@@ -273,7 +283,7 @@ fn aggregate_rows(
     rows: Vec<AggregateRunRow>,
     query: &RunAggregateQuery,
     tags: &HashMap<RunKey, Vec<String>>,
-    feedback_scores: &HashMap<String, Vec<FeedbackScore>>,
+    feedback_scores: &HashMap<RunKey, Vec<FeedbackScore>>,
 ) -> Vec<RunAggregateRow> {
     let mut groups = BTreeMap::<BTreeMap<String, String>, AggregateAccumulator>::new();
     for row in rows {
@@ -304,7 +314,7 @@ fn group_variants(
     row: &AggregateRunRow,
     query: &RunAggregateQuery,
     tags: &HashMap<RunKey, Vec<String>>,
-    feedback_scores: &HashMap<String, Vec<FeedbackScore>>,
+    feedback_scores: &HashMap<RunKey, Vec<FeedbackScore>>,
 ) -> Vec<GroupVariant> {
     let mut variants = vec![GroupVariant {
         group: BTreeMap::new(),
@@ -316,10 +326,10 @@ fn group_variants(
             return variants;
         }
     }
-    if query.group_by.is_empty() {
-        attach_feedback_metrics(variants, row, query, feedback_scores)
-    } else {
+    if query.group_by.contains(&RunAggregateGroup::FeedbackKey) {
         variants
+    } else {
+        attach_feedback_metrics(variants, row, query, feedback_scores)
     }
 }
 
@@ -329,7 +339,7 @@ fn expand_group_variants(
     row: &AggregateRunRow,
     query: &RunAggregateQuery,
     tags: &HashMap<RunKey, Vec<String>>,
-    feedback_scores: &HashMap<String, Vec<FeedbackScore>>,
+    feedback_scores: &HashMap<RunKey, Vec<FeedbackScore>>,
 ) -> Vec<GroupVariant> {
     match group {
         RunAggregateGroup::Project => {
@@ -392,13 +402,11 @@ fn expand_feedback_group(
     variants: Vec<GroupVariant>,
     row: &AggregateRunRow,
     query: &RunAggregateQuery,
-    feedback_scores: &HashMap<String, Vec<FeedbackScore>>,
+    feedback_scores: &HashMap<RunKey, Vec<FeedbackScore>>,
 ) -> Vec<GroupVariant> {
-    let Some(run_id) = row.run_id.as_deref() else {
-        return Vec::new();
-    };
+    let run_key = row.run_key();
     let scores = feedback_scores
-        .get(run_id)
+        .get(&run_key)
         .into_iter()
         .flatten()
         .filter(|score| query.feedback_keys.is_empty() || query.feedback_keys.contains(&score.key))
@@ -426,16 +434,14 @@ fn attach_feedback_metrics(
     mut variants: Vec<GroupVariant>,
     row: &AggregateRunRow,
     query: &RunAggregateQuery,
-    feedback_scores: &HashMap<String, Vec<FeedbackScore>>,
+    feedback_scores: &HashMap<RunKey, Vec<FeedbackScore>>,
 ) -> Vec<GroupVariant> {
     if query.feedback_keys.is_empty() {
         return variants;
     }
-    let Some(run_id) = row.run_id.as_deref() else {
-        return variants;
-    };
+    let run_key = row.run_key();
     let scores = feedback_scores
-        .get(run_id)
+        .get(&run_key)
         .into_iter()
         .flatten()
         .filter(|score| query.feedback_keys.contains(&score.key))
@@ -508,14 +514,12 @@ async fn load_feedback_scores(
     postgres_url: &str,
     query: &RunAggregateQuery,
     rows: &[AggregateRunRow],
-) -> Result<HashMap<String, Vec<FeedbackScore>>> {
-    let run_ids = rows
+) -> Result<HashMap<RunKey, Vec<FeedbackScore>>> {
+    let run_keys = rows
         .iter()
-        .filter_map(|row| row.run_id.as_ref())
-        .filter(|run_id| !run_id.is_empty())
-        .cloned()
+        .map(AggregateRunRow::run_key)
         .collect::<HashSet<_>>();
-    if run_ids.is_empty() {
+    if run_keys.is_empty() {
         return Ok(HashMap::new());
     }
 
@@ -529,12 +533,13 @@ async fn load_feedback_scores(
     });
 
     let mut predicates = vec![
-        format!("run_id IN ({})", sql_string_set(&run_ids)),
-        "score_number IS NOT NULL".to_owned(),
+        run_key_predicates("heads", &run_keys),
+        "feedback.score_number IS NOT NULL".to_owned(),
+        "(feedback.project_name IS NULL OR feedback.project_name = heads.project_name)".to_owned(),
     ];
     if !query.project_names.is_empty() {
         predicates.push(format!(
-            "project_name IN ({})",
+            "heads.project_name IN ({})",
             query
                 .project_names
                 .iter()
@@ -545,7 +550,7 @@ async fn load_feedback_scores(
     }
     if !query.feedback_keys.is_empty() {
         predicates.push(format!(
-            "key IN ({})",
+            "feedback.key IN ({})",
             query
                 .feedback_keys
                 .iter()
@@ -558,10 +563,18 @@ async fn load_feedback_scores(
     let rows = client
         .query(
             format!(
-                "SELECT run_id, key, score_number
-                FROM feedback
+                "SELECT heads.project_name, heads.trace_id, heads.span_id,
+                    feedback.key, feedback.score_number
+                FROM run_heads heads
+                INNER JOIN feedback feedback
+                    ON feedback.run_id IS NOT NULL
+                    AND (
+                        (heads.run_id <> '' AND feedback.run_id = heads.run_id)
+                        OR feedback.run_id = heads.generated_run_id
+                    )
                 WHERE {}
-                ORDER BY run_id, key, created_at_unix_nano",
+                ORDER BY heads.project_name, heads.trace_id, heads.span_id,
+                    feedback.key, feedback.created_at_unix_nano",
                 predicates.join(" AND ")
             )
             .as_str(),
@@ -570,12 +583,19 @@ async fn load_feedback_scores(
         .await
         .context("load aggregate feedback scores")?;
 
-    let mut scores = HashMap::<String, Vec<FeedbackScore>>::new();
+    let mut scores = HashMap::<RunKey, Vec<FeedbackScore>>::new();
     for row in rows {
-        scores.entry(row.get(0)).or_default().push(FeedbackScore {
-            key: row.get(1),
-            score: row.get(2),
-        });
+        scores
+            .entry(RunKey {
+                project_name: row.get(0),
+                trace_id: row.get(1),
+                span_id: row.get(2),
+            })
+            .or_default()
+            .push(FeedbackScore {
+                key: row.get(3),
+                score: row.get(4),
+            });
     }
     Ok(scores)
 }
@@ -606,16 +626,6 @@ fn run_key_predicates(alias: &str, keys: &HashSet<RunKey>) -> String {
         })
         .collect::<Vec<_>>()
         .join(" OR ")
-}
-
-fn sql_string_set(values: &HashSet<String>) -> String {
-    let mut values = values.iter().collect::<Vec<_>>();
-    values.sort_unstable();
-    values
-        .into_iter()
-        .map(|value| sql_string_literal(value))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 #[derive(Debug, Default)]

@@ -203,16 +203,27 @@ mod tests {
             ("/metrics", "get"),
             ("/readyz", "get"),
             ("/sessions", "get"),
+            ("/v1/sessions", "get"),
             ("/runs", "post"),
+            ("/v1/runs", "post"),
             ("/runs/{run_id}", "get"),
             ("/runs/{run_id}", "patch"),
+            ("/v1/runs/{run_id}", "get"),
+            ("/v1/runs/{run_id}", "patch"),
             ("/runs/{run_id}/feedback", "get"),
+            ("/v1/runs/{run_id}/feedback", "get"),
             ("/runs/query", "post"),
+            ("/v1/runs/query", "post"),
             ("/runs/aggregate", "post"),
+            ("/v1/runs/aggregate", "post"),
             ("/feedback", "get"),
             ("/feedback", "post"),
+            ("/v1/feedback", "get"),
+            ("/v1/feedback", "post"),
             ("/feedback/{feedback_id}", "get"),
             ("/feedback/{feedback_id}", "patch"),
+            ("/v1/feedback/{feedback_id}", "get"),
+            ("/v1/feedback/{feedback_id}", "patch"),
             ("/v1/projects/{project_name}/traces", "post"),
             ("/v1/projects/{project_name}/traces/{trace_id}", "get"),
             ("/v1/projects/{project_name}/traces/{trace_id}/runs", "get"),
@@ -221,9 +232,25 @@ mod tests {
             ("/v2/threads/{thread_id}/traces", "get"),
         ] {
             assert!(
-                paths.get(path).and_then(|path| path.get(method)).is_some(),
+                openapi_path_item(paths, path)
+                    .and_then(|path| path.get(method))
+                    .is_some(),
                 "missing {method} {path} from OpenAPI snapshot"
             );
         }
+    }
+
+    fn openapi_path_item<'a>(
+        paths: &'a serde_json::Map<String, Value>,
+        path: &str,
+    ) -> Option<&'a Value> {
+        let item = paths.get(path)?;
+        let Some(reference) = item.get("$ref").and_then(Value::as_str) else {
+            return Some(item);
+        };
+        let path = reference
+            .strip_prefix("#/paths/")
+            .map(|path| path.replace("~1", "/").replace("~0", "~"))?;
+        paths.get(&path)
     }
 }

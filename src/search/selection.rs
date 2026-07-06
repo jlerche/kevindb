@@ -7,9 +7,9 @@ use fst::{Automaton, IntoStreamer, Map, Streamer};
 
 use super::{
     SearchField, SearchIndexDirectory, SearchIndexTermInfo, SearchPredicate,
-    decode_search_term_infos, min_max_may_contain_exact, min_max_overlaps_prefix,
-    normalize_like_pattern, path_matches_pattern, simple_trailing_wildcard_prefix, term_path,
-    term_value_key, term_value_prefix,
+    decode_search_term_infos, exact_value_token, min_max_may_contain_exact,
+    min_max_overlaps_prefix, normalize_like_pattern, path_matches_pattern,
+    simple_trailing_wildcard_prefix, term_path, term_value_key, term_value_prefix,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -105,6 +105,15 @@ fn select_groups_for_predicate(
         SearchPredicate::Text { field, query } => {
             select_value_groups_for_query(directory, field, query, selection);
         }
+        SearchPredicate::ExactValue { field, value } => {
+            select_value_groups_for_token(
+                directory,
+                field,
+                &exact_value_token(value),
+                false,
+                selection,
+            );
+        }
         SearchPredicate::JsonKey { pattern } => {
             select_key_groups_for_pattern(directory, pattern, selection);
         }
@@ -139,6 +148,15 @@ fn select_terms_for_predicate(
         ),
         SearchPredicate::Text { field, query } => {
             select_value_terms_for_query(term_value_groups, field, query, value_terms);
+        }
+        SearchPredicate::ExactValue { field, value } => {
+            select_value_terms_for_token(
+                term_value_groups,
+                field,
+                &exact_value_token(value),
+                false,
+                value_terms,
+            );
         }
         SearchPredicate::JsonKey { pattern } => {
             select_key_terms_for_pattern(term_key_groups, pattern, key_terms);

@@ -694,10 +694,11 @@ Goal: implement real object-store-aware search and JSON filtering.
 
 - [x] Write one durable sibling index object for each Vortex segment before
   metadata commit; persist URI/bytes/schema in `trace_segments`.
-- [x] Use a SmithDB-style v2 sibling layout:
+- [x] Use a SmithDB-style sibling layout:
   - byte-budgeted row groups
   - `term_key` FST dictionaries for JSON paths
-  - `term_value` FST dictionaries keyed as `token\0path`
+  - `term_value` FST dictionaries keyed as `token\0path`, plus exact scalar
+    value terms for payload `eq`, `neq`, and `in`
   - `term_info` offsets into postings and positions blobs
   - block-delta postings with VInt tails
   - fixed header and directory containing absolute byte ranges
@@ -737,10 +738,11 @@ SmithDB blog parity notes:
 
 - The two SmithDB full-text search blog posts are included in the source
   baseline above.
-- This phase matches the logical v2 index shape: `term_key` and `term_value`
-  FSTs, `token\0path` keyed values, byte-budgeted row groups, term metadata,
-  block-delta postings, separate positions, phrase adjacency checks, and row
-  masks aligned to Vortex row indexes.
+- This phase matches the logical sibling-index shape: `term_key` and
+  `term_value` FSTs, `token\0path` keyed values, exact scalar value terms,
+  byte-budgeted row groups, term metadata, block-delta postings, separate
+  positions, phrase adjacency checks, and row masks aligned to Vortex row
+  indexes.
 - Current query execution uses object-store byte ranges instead of fetching the
   complete sibling `.search.fst` object. It reads the header and directory,
   prunes row groups by min/max term bounds, fetches selected row-group

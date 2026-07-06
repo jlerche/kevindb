@@ -114,6 +114,12 @@ impl QueryEngine {
         let postgres_started = Instant::now();
         let plan = load_run_query_plan(&self.postgres_url, &run_query).await?;
         let postgres_query_time = postgres_started.elapsed();
+        let (plan, search_index_reads) = super::super::search::apply_phase6_search_indexes(
+            Arc::clone(&self.object_store),
+            plan,
+            &run_query,
+        )
+        .await?;
         reject_old_metric_segments(&plan.segments)?;
 
         let candidate_segments = plan.segments.len();
@@ -162,7 +168,8 @@ impl QueryEngine {
             partition_diagnostics.push(result.diagnostics);
         }
 
-        enforce_runtime_object_store_limits(&run_query, object_store_reads)?;
+        let total_reads = add_snapshots(object_store_reads, search_index_reads);
+        enforce_runtime_object_store_limits(&run_query, total_reads)?;
         let rows = rows
             .into_iter()
             .filter(|row| candidate_run_keys.contains(&row.run_key()))
@@ -189,8 +196,8 @@ impl QueryEngine {
                 candidate_runs,
                 candidate_bytes,
                 estimated_object_store_requests,
-                actual_object_store_requests: object_store_reads.request_count(),
-                actual_object_store_bytes_read: object_store_reads.bytes_read,
+                actual_object_store_requests: total_reads.request_count(),
+                actual_object_store_bytes_read: total_reads.bytes_read,
                 vortex_files_opened: candidate_segments,
                 rows_returned: aggregate_rows.len(),
                 postgres_query_time,

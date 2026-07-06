@@ -1,6 +1,6 @@
 use super::{
-    MAX_INDEXED_VALUE_BYTES, MAX_JSON_KEYS_PER_RUN, MutableSearchIndex, SearchIndex, json_tape,
-    tokens_for_text,
+    MAX_INDEXED_VALUE_BYTES, MAX_JSON_KEYS_PER_RUN, MutableSearchIndex, SearchIndex,
+    exact_value_token, json_tape, tokens_for_text,
 };
 use crate::otlp::SpanRecord;
 
@@ -35,10 +35,19 @@ impl SearchIndexBuilder {
         };
         for leaf in tape.leaves().take(MAX_JSON_KEYS_PER_RUN) {
             match leaf.value {
-                Some(value) => self.add_text(row, leaf.path, bounded_value(value)),
+                Some(value) => self.add_json_value(row, leaf.path, value),
                 None => self.index.add_path(row, leaf.path),
             }
         }
+    }
+
+    fn add_json_value(&mut self, row: u32, path: &str, value: &str) {
+        if value.len() <= MAX_INDEXED_VALUE_BYTES {
+            self.index
+                .add_value_position(row, path, &exact_value_token(value), 0);
+        }
+        self.add_text(row, path, bounded_value(value));
+        self.add_leaf_position_gap(row, path);
     }
 
     fn add_text(&mut self, row: u32, path: &str, value: &str) {
@@ -57,6 +66,14 @@ impl SearchIndexBuilder {
         let current = *position;
         *position = position.saturating_add(1);
         current
+    }
+
+    fn add_leaf_position_gap(&mut self, row: u32, path: &str) {
+        let position = self
+            .next_positions
+            .entry((row, path.to_owned()))
+            .or_default();
+        *position = position.saturating_add(1);
     }
 
     fn finish(self) -> anyhow::Result<SearchIndex> {
@@ -104,6 +121,20 @@ mod tests {
             query: SearchQuery::parse("hello world"),
         };
         assert_eq!(index.matching_rows(&predicate), [0].into_iter().collect());
+    }
+
+    #[test]
+    fn phrase_queries_do_not_cross_collapsed_array_elements() {
+        let index = build_search_index(&[record(
+            r#"{"messages":[{"content":"hello"},{"content":"world"}]}"#,
+        )])
+        .expect("build index");
+
+        let phrase = SearchPredicate::Text {
+            field: SearchField::ExactPath("messages.content".to_owned()),
+            query: SearchQuery::parse("\"hello world\""),
+        };
+        assert!(index.matching_rows(&phrase).is_empty());
     }
 
     #[test]
@@ -167,6 +198,38 @@ mod tests {
                     query: SearchQuery::parse("invoice"),
                 })
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn indexes_exact_json_scalar_values_separately_from_tokens() {
+        let index = build_search_index(&[
+            record(r#"{"inputs":{"prompt":"invoice alpha"}}"#),
+            record(r#"{"inputs":{"prompt":"invoice beta"}}"#),
+        ])
+        .expect("build index");
+
+        assert_eq!(
+            index.matching_rows(&SearchPredicate::ExactValue {
+                field: SearchField::PathPrefix("inputs".to_owned()),
+                value: "invoice alpha".to_owned(),
+            }),
+            [0].into_iter().collect()
+        );
+        assert!(
+            index
+                .matching_rows(&SearchPredicate::ExactValue {
+                    field: SearchField::PathPrefix("inputs".to_owned()),
+                    value: "invoice".to_owned(),
+                })
+                .is_empty()
+        );
+        assert_eq!(
+            index.matching_rows(&SearchPredicate::Text {
+                field: SearchField::PathPrefix("inputs".to_owned()),
+                query: SearchQuery::parse("invoice"),
+            }),
+            [0, 1].into_iter().collect()
         );
     }
 
