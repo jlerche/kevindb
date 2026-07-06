@@ -20,6 +20,7 @@ mod phase3;
 mod phase4;
 mod phase5;
 mod phase6;
+mod phase7;
 
 #[tokio::test]
 async fn ingest_otlp_flushes_to_object_store_and_postgres() {

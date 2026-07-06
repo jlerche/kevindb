@@ -9,11 +9,10 @@ use tokio_postgres::{NoTls, Row};
 
 use super::object_store_stats::{MeasuringObjectStore, ObjectStoreReadSnapshot};
 use super::{
-    DataFusionQueryTiming, QueryEngine, RunKey, RunQuery, RunQueryDiagnostics, RunQueryResult,
-    RunSummary, SegmentCandidateRow, SegmentSource, attributes_json_sql,
-    estimate_vortex_object_store_requests, load_deleted_run_keys,
-    query_segment_sources_with_datafusion_timed, run_matches_retention_filter,
-    run_summaries_from_batches, sql_object_store_path, sql_string_literal, vortex_session_context,
+    DataFusionQueryTiming, QueryEngine, RunQuery, RunQueryDiagnostics, RunQueryResult, RunSummary,
+    SegmentCandidateRow, SegmentSource, attributes_json_sql, estimate_vortex_object_store_requests,
+    query_segment_sources_with_datafusion_timed, run_summaries_from_batches, sql_object_store_path,
+    sql_string_literal, vortex_session_context,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,7 +217,6 @@ impl QueryEngine {
         let segments = load_trace_segment_sources(&self.postgres_url, project_name, trace_id)
             .await
             .context("load trace locator segment uris")?;
-        let deleted_runs = load_deleted_run_keys(&self.postgres_url, &query).await?;
         let candidate_segments = segments.len();
         let candidate_bytes = segments
             .iter()
@@ -240,11 +238,6 @@ impl QueryEngine {
                 None,
             )
             .await?;
-        let runs = runs
-            .into_iter()
-            .filter(|run| !deleted_runs.contains(&RunKey::from(run)))
-            .filter(|run| run_matches_retention_filter(run, &query))
-            .collect::<Vec<_>>();
 
         Ok(TraceLoadResult {
             diagnostics: RunQueryDiagnostics {

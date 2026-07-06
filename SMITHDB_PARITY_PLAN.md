@@ -792,20 +792,20 @@ Exit criteria:
 
 Tasks:
 
-- [ ] Enforce project retention policies.
+- [x] Enforce project retention policies.
 - [x] Materialize delete vectors per segment.
-- [ ] Apply delete masks in query planning and DataFusion scans.
+- [x] Apply delete masks in query planning and DataFusion scans.
 - [ ] Reclaim compacted/deleted objects after a grace period.
 
 Subtasks:
 
-- [ ] Add retention service tests.
-- [ ] Add delete-vector pushdown tests.
+- [x] Add retention service tests.
+- [x] Add delete-vector pushdown tests.
 - [ ] Add object cleanup dry-run mode.
 
 Exit criteria:
 
-- [ ] Deletes and retention do not require rewriting every affected object
+- [x] Deletes and retention do not require rewriting every affected object
   immediately.
 
 ## [ ] Phase 8: Distributed Query And Cluster Manager
