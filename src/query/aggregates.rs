@@ -10,6 +10,7 @@ use super::{
     TreeFilterExpr, load_run_query_plan, sql_string_literal,
 };
 
+mod distributed;
 mod rollups;
 mod scan;
 #[cfg(test)]

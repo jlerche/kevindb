@@ -863,24 +863,24 @@ cached full object. Ingest stamps `project_routes` with the most recent node
 id and segment URI so a coordinator can send fresh project queries to the warm
 node; a node without that local cache falls back to durable object-store L1.
 
-### [ ] Epic 8.3: Distributed Fanout
+### [x] Epic 8.3: Distributed Fanout
 
 Tasks:
 
-- [ ] Add distributed query execution for high-cardinality scans.
-- [ ] Split work by project/time/segment partitions.
-- [ ] Merge pages and aggregates deterministically.
-- [ ] Bound per-node and total object-store requests.
+- [x] Add distributed query execution for high-cardinality scans.
+- [x] Split work by project/time/segment partitions.
+- [x] Merge pages and aggregates deterministically.
+- [x] Bound per-node and total object-store requests.
 
 Subtasks:
 
-- [ ] Add coordinator-side cancellation.
-- [ ] Add per-query budget enforcement.
-- [ ] Add load-shedding behavior.
+- [x] Add coordinator-side cancellation.
+- [x] Add per-query budget enforcement.
+- [x] Add load-shedding behavior.
 
 Exit criteria:
 
-- [ ] Large project queries scale by adding query workers, not by broadening a
+- [x] Large project queries scale by adding query workers, not by broadening a
   single worker's object-store fanout.
 
 ## [ ] Phase 9: API Parity And Compatibility

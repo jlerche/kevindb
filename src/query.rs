@@ -18,6 +18,7 @@ const MAX_DATAFUSION_SEGMENTS_PER_BATCH: usize = 8;
 
 mod aggregates;
 mod cleanup;
+mod distributed;
 pub mod filter;
 mod object_store_stats;
 mod planner;
@@ -36,6 +37,10 @@ pub use aggregates::{
 };
 pub use cleanup::{
     ObjectCleanupCandidate, ObjectCleanupReceipt, OrphanObjectCandidate, OrphanObjectCleanupReceipt,
+};
+pub use distributed::{
+    DistributedQueryCancellation, DistributedQueryConfig, DistributedQueryDiagnostics,
+    DistributedQueryPartitionDiagnostics, DistributedRunAggregateResult, DistributedRunQueryResult,
 };
 use filter::FilterExpr;
 use object_store_stats::{
