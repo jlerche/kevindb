@@ -29,7 +29,8 @@ pub use langsmith::{
 };
 use langsmith::{
     create_feedback, create_run, list_feedback, list_run_feedback, list_sessions, query_runs,
-    query_thread_traces, query_threads, read_feedback, read_project_trace, read_run, update_run,
+    query_thread_traces, query_threads, read_feedback, read_project_trace, read_run,
+    update_feedback, update_run,
 };
 use routing::read_project_route;
 
@@ -140,7 +141,8 @@ async fn ingest_trace(
 ) -> Result<Json<IngestResponse>, ApiError> {
     let request = ExportTraceServiceRequest::decode(body)
         .map_err(|error| ApiError::bad_request(format!("invalid OTLP protobuf: {error}")))?;
-    let receipt = state.ingestor.ingest_otlp(project_name, request).await?;
+    let records = kevindb_otlp::span_records_from_export(project_name, request)?;
+    let receipt = state.ingestor.ingest_records(records).await?;
     metrics::record_ingest(&receipt);
     Ok(Json(IngestResponse::from(receipt)))
 }

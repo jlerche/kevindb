@@ -81,10 +81,8 @@ Implemented or in progress:
   `thread_messages`, including bounded previews, cursor pagination, and
   LangSmith-compatible thread query endpoints.
 
-Important gap: no production full-text/JSON object-store index. Full-text and
-JSON filtering are intentionally deferred until we implement an
-object-store-aware inverted index design. Large payload scans are not an
-acceptable fallback.
+Phase 6 now includes an object-store-aware FST sibling index for full-text and
+path-aware JSON predicates. Large payload scans remain an unacceptable fallback.
 
 ## Design Principles
 
@@ -808,11 +806,11 @@ Exit criteria:
 - [x] Deletes and retention do not require rewriting every affected object
   immediately.
 
-## [ ] Phase 8: Distributed Query And Cluster Manager
+## [x] Phase 8: Distributed Query And Cluster Manager
 
 Goal: scale compute while preserving object-storage durability and low fanout.
 
-### [ ] Epic 8.1: Service Roles
+### [x] Epic 8.1: Service Roles
 
 Tasks:
 
@@ -826,8 +824,8 @@ Tasks:
 
 Subtasks:
 
-- [ ] Split heavy crates further to keep compile times controlled.
-- [ ] Add local multi-process integration tests.
+- [x] Split heavy crates further to keep compile times controlled.
+- [x] Add local multi-process integration tests.
 
 Exit criteria:
 
@@ -883,12 +881,12 @@ Exit criteria:
 - [x] Large project queries scale by adding query workers, not by broadening a
   single worker's object-store fanout.
 
-## [ ] Phase 9: API Parity And Compatibility
+## [x] Phase 9: API Parity And Compatibility
 
 Goal: make KevinDB usable by existing LangSmith SDK clients and compatible
 frontends where public contracts are available.
 
-### [ ] Epic 9.1: Runs And Traces API
+### [x] Epic 9.1: Runs And Traces API
 
 Tasks:
 
@@ -899,14 +897,14 @@ Tasks:
 
 Subtasks:
 
-- [ ] Add Python SDK compatibility tests for each query family.
+- [x] Add Python SDK compatibility tests for each query family.
 - [x] Add OpenAPI snapshots.
 
 Exit criteria:
 
 - [x] Common `Client.list_runs(...)` usage works without custom client code.
 
-### [ ] Epic 9.2: Feedback API
+### [x] Epic 9.2: Feedback API
 
 Tasks:
 
@@ -917,7 +915,7 @@ Tasks:
 
 Subtasks:
 
-- [ ] Add SDK tests for create/list/read/update feedback if public SDK supports
+- [x] Add SDK tests for create/list/read/update feedback if public SDK supports
   it.
 
 Exit criteria:

@@ -7,14 +7,13 @@ use anyhow::{Context, Result, anyhow};
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
 use tokio::time::{Duration, sleep};
 use tokio_postgres::NoTls;
 
-use crate::otlp::{RunEventKind, SpanRecord, span_records_from_export};
+use crate::otlp::{RunEventKind, SpanRecord};
 use crate::query::{QueryEngine, RunQuery, RunSummary};
 use crate::search::{
     SEARCH_INDEX_SCHEMA_VERSION, build_search_index, encode_search_index,
@@ -151,15 +150,6 @@ impl Ingestor {
             Arc::new(InMemory::new()),
             IngestConfig::default(),
         )
-    }
-
-    pub async fn ingest_otlp(
-        &self,
-        project_name: impl Into<String>,
-        request: ExportTraceServiceRequest,
-    ) -> Result<IngestReceipt> {
-        let records = span_records_from_export(project_name, request)?;
-        self.ingest_records(records).await
     }
 
     pub async fn ingest_records(&self, records: Vec<SpanRecord>) -> Result<IngestReceipt> {

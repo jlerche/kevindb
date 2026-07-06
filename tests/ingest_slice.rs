@@ -35,7 +35,8 @@ async fn ingests_otlp_spans_to_vortex_segment_and_postgres_indexes() -> Result<(
         },
     );
 
-    let receipt = ingestor.ingest_otlp("demo", sample_export()).await?;
+    let records = kevindb_otlp::span_records_from_export("demo", sample_export())?;
+    let receipt = ingestor.ingest_records(records).await?;
     assert_eq!(receipt.accepted_spans, 2);
     assert_eq!(receipt.flushed_segments, 1);
     assert_eq!(receipt.flushes.len(), 1);

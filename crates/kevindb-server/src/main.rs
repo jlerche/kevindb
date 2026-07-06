@@ -22,7 +22,9 @@ async fn main() -> Result<()> {
 
     let config = ServerConfig::from_env()?;
 
-    run_migrations(&config.postgres_url).await?;
+    if config.run_migrations {
+        run_migrations(&config.postgres_url).await?;
+    }
     let ingest_config = RuntimeIngestConfig {
         max_spans_per_segment: config.ingest.max_spans_per_segment,
         max_flush_delay: config.ingest.max_flush_delay,

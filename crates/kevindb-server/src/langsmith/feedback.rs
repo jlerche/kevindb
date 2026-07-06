@@ -62,6 +62,22 @@ pub(crate) async fn read_feedback(
     Ok(Json(feedback))
 }
 
+pub(crate) async fn update_feedback(
+    State(state): State<ServerState>,
+    Path(feedback_id): Path<String>,
+    Json(request): Json<FeedbackUpdateRequest>,
+) -> Result<StatusCode, ApiError> {
+    let feedback_id = canonical_uuid(&feedback_id, "feedback_id")?;
+    let store = metastore(&state);
+    let mut record = store
+        .load_feedback(&feedback_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("feedback not found".to_owned()))?;
+    request.apply(&mut record);
+    store.insert_feedback(&record).await?;
+    Ok(StatusCode::OK)
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct FeedbackWriteRequest {
     id: Option<String>,
@@ -127,6 +143,32 @@ impl FeedbackWriteRequest {
             feedback_source: self.feedback_source,
             extra: self.extra,
         })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct FeedbackUpdateRequest {
+    score: Option<Value>,
+    value: Option<Value>,
+    correction: Option<Value>,
+    comment: Option<String>,
+}
+
+impl FeedbackUpdateRequest {
+    fn apply(self, record: &mut FeedbackRecord) {
+        if let Some(score) = self.score {
+            record.score = Some(score);
+        }
+        if let Some(value) = self.value {
+            record.value = Some(value);
+        }
+        if let Some(correction) = self.correction {
+            record.correction = Some(correction);
+        }
+        if let Some(comment) = self.comment {
+            record.comment = Some(comment);
+        }
+        record.modified_at_unix_nano = current_time_nanos();
     }
 }
 

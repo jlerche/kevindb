@@ -167,6 +167,15 @@
           },
           "404": {"description": "Feedback not found."}
         }
+      },
+      "patch": {
+        "operationId": "updateFeedback",
+        "parameters": [{"$ref": "#/components/parameters/FeedbackId"}],
+        "requestBody": {"$ref": "#/components/requestBodies/JsonObject"},
+        "responses": {
+          "200": {"description": "Feedback update accepted."},
+          "404": {"description": "Feedback not found."}
+        }
       }
     },
     "/v1/projects/{project_name}/traces": {

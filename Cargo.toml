@@ -10,6 +10,7 @@ members = [
     "crates/kevindb-bench",
     "crates/kevindb-config",
     "crates/kevindb-metastore-postgres",
+    "crates/kevindb-otlp",
     "crates/kevindb-server",
 ]
 resolver = "3"
@@ -26,7 +27,6 @@ futures-util = "0.3.31"
 fst = "0.4.7"
 hex = "0.4.3"
 object_store = "0.13.2"
-opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic-messages", "trace"] }
 prost = "0.14.1"
 refinery = { version = "0.9.0", features = ["tokio-postgres"] }
 serde = "1.0.228"
@@ -40,4 +40,6 @@ vortex = { version = "0.76.0", features = ["object_store", "tokio"] }
 vortex-datafusion = "0.76.0"
 
 [dev-dependencies]
+kevindb-otlp = { path = "crates/kevindb-otlp" }
+opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic-messages", "trace"] }
 portpicker = "0.1.1"

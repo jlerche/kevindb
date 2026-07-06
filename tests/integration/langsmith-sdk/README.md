@@ -47,8 +47,9 @@ can reach `/readyz`.
   responses and generated OTLP run IDs
 - trace lookup through `GET /v1/projects/{project_name}/traces/{trace_id}`
 - parent and time-window run query filters
+- SDK run query filters for indexed metadata and feedback predicates
 - LangSmith error filtering
-- LangSmith feedback creation, listing, lookup, and run-scoped lookup
+- LangSmith feedback creation, listing, lookup, update, and run-scoped lookup
 - `/v1` run create, update, read, and query aliases
 - LangSmith SDK model parsing of KevinDB's project and run responses
 

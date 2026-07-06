@@ -8,7 +8,7 @@ use crate::{
     ServerState, create_feedback, create_run, healthz, ingest_trace, list_feedback,
     list_run_feedback, list_sessions, list_trace_runs, query_runs, query_thread_traces,
     query_threads, read_feedback, read_project_route, read_project_trace, read_run, readyz,
-    update_run,
+    update_feedback, update_run,
 };
 
 pub fn app(state: ServerState) -> Router {
@@ -45,8 +45,14 @@ fn all_routes(router: Router<ServerState>) -> Router<ServerState> {
         .route("/v2/threads/{thread_id}/traces", get(query_thread_traces))
         .route("/feedback", get(list_feedback).post(create_feedback))
         .route("/v1/feedback", get(list_feedback).post(create_feedback))
-        .route("/feedback/{feedback_id}", get(read_feedback))
-        .route("/v1/feedback/{feedback_id}", get(read_feedback))
+        .route(
+            "/feedback/{feedback_id}",
+            get(read_feedback).patch(update_feedback),
+        )
+        .route(
+            "/v1/feedback/{feedback_id}",
+            get(read_feedback).patch(update_feedback),
+        )
         .route("/v1/projects/{project_name}/traces", post(ingest_trace))
         .route(
             "/v1/projects/{project_name}/traces/{trace_id}",
@@ -67,6 +73,14 @@ fn ingest_routes(router: Router<ServerState>) -> Router<ServerState> {
         .route("/v1/runs/{run_id}", axum::routing::patch(update_run))
         .route("/feedback", post(create_feedback))
         .route("/v1/feedback", post(create_feedback))
+        .route(
+            "/feedback/{feedback_id}",
+            axum::routing::patch(update_feedback),
+        )
+        .route(
+            "/v1/feedback/{feedback_id}",
+            axum::routing::patch(update_feedback),
+        )
         .route("/v1/projects/{project_name}/traces", post(ingest_trace))
 }
 
@@ -198,6 +212,7 @@ mod tests {
             ("/feedback", "get"),
             ("/feedback", "post"),
             ("/feedback/{feedback_id}", "get"),
+            ("/feedback/{feedback_id}", "patch"),
             ("/v1/projects/{project_name}/traces", "post"),
             ("/v1/projects/{project_name}/traces/{trace_id}", "get"),
             ("/v1/projects/{project_name}/traces/{trace_id}/runs", "get"),

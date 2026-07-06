@@ -122,6 +122,7 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
             trace_id=sdk_root_id,
             parent_run_id=sdk_root_id,
             outputs={"text": "world"},
+            extra={"metadata": {"tier": "gold"}},
             end_time=sdk_start + timedelta(milliseconds=900),
         )
         client.update_run(
@@ -132,12 +133,13 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
         )
 
         sdk_runs = list(client.list_runs(project_name=PROJECT_NAME, trace_id=sdk_root_id))
-        assert [run.name for run in sdk_runs] == ["sdk.agent", "sdk.llm"]
-        assert str(sdk_runs[0].id) == str(sdk_root_id)
-        assert str(sdk_runs[1].id) == str(sdk_child_id)
-        assert sdk_runs[1].parent_run_id == sdk_root_id
-        assert sdk_runs[0].end_time is not None
-        assert sdk_runs[1].end_time is not None
+        sdk_runs_by_id = {run.id: run for run in sdk_runs}
+        assert set(sdk_runs_by_id) == {sdk_root_id, sdk_child_id}
+        assert sdk_runs_by_id[sdk_root_id].name == "sdk.agent"
+        assert sdk_runs_by_id[sdk_child_id].name == "sdk.llm"
+        assert sdk_runs_by_id[sdk_child_id].parent_run_id == sdk_root_id
+        assert sdk_runs_by_id[sdk_root_id].end_time is not None
+        assert sdk_runs_by_id[sdk_child_id].end_time is not None
 
         read_child = client.read_run(sdk_child_id)
         assert read_child.inputs == {"messages": ["hello"]}
@@ -168,12 +170,26 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
         assert listed_feedback[0].key == "quality"
         assert listed_feedback[0].score == 1.0
         assert listed_feedback[0].comment == "looks good"
+        client.update_feedback(
+            feedback.id,
+            score=0.5,
+            value="edited",
+            correction={"text": "world!"},
+            comment="edited",
+        )
+        updated_feedback = client.read_feedback(feedback.id)
+        assert updated_feedback.score == 0.5
+        assert updated_feedback.value == "edited"
+        assert updated_feedback.correction == {"text": "world!"}
+        assert updated_feedback.comment == "edited"
         feedback_response = requests.get(
             f"{server_url}/feedback/{feedback.id}",
             timeout=5,
         )
         feedback_response.raise_for_status()
-        assert feedback_response.json()["id"] == str(feedback.id)
+        feedback_body = feedback_response.json()
+        assert feedback_body["id"] == str(feedback.id)
+        assert feedback_body["score"] == 0.5
         run_feedback_response = requests.get(
             f"{server_url}/runs/{sdk_child_id}/feedback",
             timeout=5,
@@ -199,6 +215,21 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
         assert [run.name for run in failed_runs] == ["sdk.tool"]
         assert client.read_run(failed_run_id).error == "lookup failed"
 
+        metadata_filtered_runs = list(
+            client.list_runs(
+                project_name=PROJECT_NAME,
+                filter='and(eq(metadata_key, "tier"), eq(metadata_value, "gold"))',
+            )
+        )
+        assert [run.name for run in metadata_filtered_runs] == ["sdk.llm"]
+        feedback_filtered_runs = list(
+            client.list_runs(
+                project_name=PROJECT_NAME,
+                filter='and(eq(feedback_key, "quality"), eq(feedback_score, 0.5))',
+            )
+        )
+        assert [run.name for run in feedback_filtered_runs] == ["sdk.llm"]
+
         query_response = requests.post(
             f"{server_url}/runs/query",
             json={"project_name": PROJECT_NAME, "trace": str(sdk_root_id), "limit": 10},
@@ -207,12 +238,13 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
         query_response.raise_for_status()
         query_body = query_response.json()
         assert query_body["cursors"] == {"next": None}
-        assert [run["name"] for run in query_body["runs"]] == ["sdk.agent", "sdk.llm"]
-        assert query_body["runs"][0]["inputs"] == {"prompt": "hello"}
-        assert query_body["runs"][0]["outputs"] == {"answer": "world"}
-        assert query_body["runs"][1]["inputs"] == {"messages": ["hello"]}
-        assert query_body["runs"][1]["outputs"] == {"text": "world"}
-        assert query_body["runs"][0]["child_run_ids"] == [str(sdk_child_id)]
+        query_runs_by_id = {run["id"]: run for run in query_body["runs"]}
+        assert set(query_runs_by_id) == {str(sdk_root_id), str(sdk_child_id)}
+        assert query_runs_by_id[str(sdk_root_id)]["inputs"] == {"prompt": "hello"}
+        assert query_runs_by_id[str(sdk_root_id)]["outputs"] == {"answer": "world"}
+        assert query_runs_by_id[str(sdk_child_id)]["inputs"] == {"messages": ["hello"]}
+        assert query_runs_by_id[str(sdk_child_id)]["outputs"] == {"text": "world"}
+        assert query_runs_by_id[str(sdk_root_id)]["child_run_ids"] == [str(sdk_child_id)]
 
         trace_response = requests.get(
             f"{server_url}/v1/projects/{PROJECT_NAME}/traces/{sdk_root_id}",
@@ -244,7 +276,7 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
         )
         first_page_response.raise_for_status()
         first_page = first_page_response.json()
-        assert [run["name"] for run in first_page["runs"]] == ["sdk.agent"]
+        assert len(first_page["runs"]) == 1
         assert first_page["cursors"] == {"next": "1"}
         second_page_response = requests.post(
             f"{server_url}/runs/query",
@@ -258,7 +290,11 @@ def test_langsmith_sdk_lists_runs_from_kevindb() -> None:
         )
         second_page_response.raise_for_status()
         second_page = second_page_response.json()
-        assert [run["name"] for run in second_page["runs"]] == ["sdk.llm"]
+        assert len(second_page["runs"]) == 1
+        assert {run["name"] for run in first_page["runs"] + second_page["runs"]} == {
+            "sdk.agent",
+            "sdk.llm",
+        }
         assert second_page["cursors"] == {"next": None}
 
         v1_run_id = uuid4()

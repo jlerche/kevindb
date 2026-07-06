@@ -12,6 +12,7 @@ pub const DEFAULT_CACHE_MODE: &str = "memory";
 pub const DEFAULT_INGEST_MAX_FLUSH_DELAY_MS: u64 = 500;
 pub const DEFAULT_INGEST_MAX_SPANS_PER_SEGMENT: usize = 1024;
 pub const DEFAULT_OBJECT_STORE: &str = "memory";
+pub const DEFAULT_RUN_MIGRATIONS: bool = true;
 pub const DEFAULT_SERVICE_ROLE: &str = "all";
 pub const ENV_BIND_ADDR: &str = "KEVINDB_BIND_ADDR";
 pub const ENV_CACHE_DISK_BLOCK_BYTES: &str = "KEVINDB_CACHE_DISK_BLOCK_BYTES";
@@ -24,6 +25,7 @@ pub const ENV_INGEST_MAX_SPANS_PER_SEGMENT: &str = "KEVINDB_INGEST_MAX_SPANS_PER
 pub const ENV_NODE_ID: &str = "KEVINDB_NODE_ID";
 pub const ENV_OBJECT_STORE: &str = "KEVINDB_OBJECT_STORE";
 pub const ENV_POSTGRES_URL: &str = "KEVINDB_POSTGRES_URL";
+pub const ENV_RUN_MIGRATIONS: &str = "KEVINDB_RUN_MIGRATIONS";
 pub const ENV_S3_ALLOW_HTTP: &str = "KEVINDB_S3_ALLOW_HTTP";
 pub const ENV_S3_BUCKET: &str = "KEVINDB_S3_BUCKET";
 pub const ENV_S3_ENDPOINT: &str = "KEVINDB_S3_ENDPOINT";
@@ -35,6 +37,7 @@ pub const ENV_SERVICE_ROLE: &str = "KEVINDB_SERVICE_ROLE";
 pub struct ServerConfig {
     pub postgres_url: String,
     pub bind_addr: SocketAddr,
+    pub run_migrations: bool,
     pub node_id: Option<String>,
     pub service_role: ServiceRole,
     pub object_store: ObjectStoreConfig,
@@ -69,6 +72,10 @@ impl ServerConfig {
         })?;
         let bind_addr =
             parse_bind_addr(lookup(ENV_BIND_ADDR).unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned()))?;
+        let run_migrations = parse_bool(
+            ENV_RUN_MIGRATIONS,
+            lookup(ENV_RUN_MIGRATIONS).unwrap_or_else(|| DEFAULT_RUN_MIGRATIONS.to_string()),
+        )?;
         let node_id = lookup(ENV_NODE_ID).and_then(|value| {
             let value = value.trim();
             (!value.is_empty()).then(|| value.to_owned())
@@ -94,6 +101,7 @@ impl ServerConfig {
         Ok(Self {
             postgres_url,
             bind_addr,
+            run_migrations,
             node_id,
             service_role,
             object_store,
@@ -356,6 +364,7 @@ mod tests {
 
         assert_eq!(config.postgres_url, "postgresql://db/postgres");
         assert_eq!(config.node_id, None);
+        assert!(config.run_migrations);
         assert_eq!(config.service_role, ServiceRole::All);
         assert_eq!(
             config.bind_addr,
@@ -387,6 +396,7 @@ mod tests {
             (ENV_POSTGRES_URL, "postgresql://db/postgres"),
             (ENV_BIND_ADDR, "0.0.0.0:8080"),
             (ENV_NODE_ID, "node-a"),
+            (ENV_RUN_MIGRATIONS, "false"),
             (ENV_SERVICE_ROLE, "query"),
             (ENV_OBJECT_STORE, "MEMORY"),
             (ENV_CACHE_MODE, "hybrid"),
@@ -401,6 +411,7 @@ mod tests {
 
         assert_eq!(config.bind_addr, "0.0.0.0:8080".parse().expect("bind addr"));
         assert_eq!(config.node_id.as_deref(), Some("node-a"));
+        assert!(!config.run_migrations);
         assert_eq!(config.service_role, ServiceRole::Query);
         assert_eq!(config.object_store, ObjectStoreConfig::Memory);
         assert_eq!(
@@ -522,6 +533,23 @@ mod tests {
             err,
             ConfigError::InvalidBool {
                 name: ENV_S3_ALLOW_HTTP,
+                value: "sometimes".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_run_migrations_bool() {
+        let err = ServerConfig::from_env_vars([
+            (ENV_POSTGRES_URL, "postgresql://db/postgres"),
+            (ENV_RUN_MIGRATIONS, "sometimes"),
+        ])
+        .expect_err("run migrations flag must be boolean");
+
+        assert_eq!(
+            err,
+            ConfigError::InvalidBool {
+                name: ENV_RUN_MIGRATIONS,
                 value: "sometimes".to_owned(),
             }
         );

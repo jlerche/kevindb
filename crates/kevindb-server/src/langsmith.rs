@@ -26,7 +26,9 @@ mod filter;
 mod threads;
 pub use diagnostics::RunQueryDiagnosticsResponse;
 pub use feedback::FeedbackResponse;
-pub(crate) use feedback::{create_feedback, list_feedback, list_run_feedback, read_feedback};
+pub(crate) use feedback::{
+    create_feedback, list_feedback, list_run_feedback, read_feedback, update_feedback,
+};
 use filter::{parse_filter, parse_tree_filter};
 pub use threads::{
     ThreadResponse, ThreadTraceResponse, ThreadTracesResponse, ThreadsQueryRequest,

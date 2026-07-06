@@ -12,6 +12,10 @@ The compose stack uses Postgres for metadata and MinIO through the S3 object
 store for durable Vortex segments and search indexes. The server listens on
 `http://127.0.0.1:3000`.
 
+For multi-process deployments, run migrations from one process or release job.
+Secondary roles can start with `KEVINDB_RUN_MIGRATIONS=false` after the schema
+has been initialized.
+
 ## Object Storage
 
 Use `KEVINDB_OBJECT_STORE=s3` for S3-compatible storage.

@@ -3,10 +3,6 @@ use std::process::Stdio;
 use std::time::{Duration as StdDuration, Instant};
 
 use object_store::ObjectStoreExt;
-use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
-use opentelemetry_proto::tonic::resource::v1::Resource;
-use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, status};
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
 
@@ -25,7 +21,7 @@ mod phase7;
 mod phase8;
 
 #[tokio::test]
-async fn ingest_otlp_flushes_to_object_store_and_postgres() {
+async fn ingest_records_flushes_to_object_store_and_postgres() {
     let mockgres = Mockgres::start().await.expect("start mockgres");
     run_migrations(mockgres.postgres_url())
         .await
@@ -42,9 +38,9 @@ async fn ingest_otlp_flushes_to_object_store_and_postgres() {
     );
 
     let receipt = ingestor
-        .ingest_otlp("demo", sample_export())
+        .ingest_records(sample_records())
         .await
-        .expect("ingest otlp");
+        .expect("ingest records");
     assert_eq!(receipt.accepted_spans, 2);
     let flush = receipt.flush.expect("ingest should flush");
     assert_eq!(receipt.flushes, vec![flush.clone()]);
@@ -220,9 +216,9 @@ async fn query_diagnostics_report_segment_fanout() {
         },
     );
     ingestor
-        .ingest_otlp("demo", sample_export())
+        .ingest_records(sample_records())
         .await
-        .expect("ingest otlp");
+        .expect("ingest records");
 
     let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store);
     let result = query_engine
@@ -357,7 +353,7 @@ async fn empty_ingest_does_not_flush() {
     let ingestor = Ingestor::in_memory("postgresql://127.0.0.1:1/postgres");
 
     let receipt = ingestor
-        .ingest_otlp("demo", ExportTraceServiceRequest::default())
+        .ingest_records(Vec::new())
         .await
         .expect("empty ingest should not connect to postgres");
 
@@ -390,9 +386,9 @@ async fn splits_flushes_by_max_spans_per_segment() {
     );
 
     let receipt = ingestor
-        .ingest_otlp("demo", sample_export())
+        .ingest_records(sample_records())
         .await
-        .expect("ingest otlp");
+        .expect("ingest records");
     assert_eq!(receipt.accepted_spans, 2);
     assert_eq!(receipt.flushed_segments, 2);
     assert_eq!(receipt.flushes.len(), 2);
@@ -518,7 +514,7 @@ async fn failed_flush_restores_pending_records() {
     );
 
     let error = ingestor
-        .ingest_otlp("demo", sample_export())
+        .ingest_records(sample_records())
         .await
         .expect_err("postgres connection should fail");
     assert!(
@@ -822,64 +818,43 @@ fn sample_record(span_id: &str, start_time_unix_nano: i64) -> SpanRecord {
     }
 }
 
-fn sample_export() -> ExportTraceServiceRequest {
-    ExportTraceServiceRequest {
-        resource_spans: vec![ResourceSpans {
-            resource: Some(Resource {
-                attributes: vec![string_attr("service.name", "agent-api")],
-                dropped_attributes_count: 0,
-                entity_refs: vec![],
-            }),
-            scope_spans: vec![ScopeSpans {
-                scope: None,
-                spans: vec![
-                    Span {
-                        trace_id: repeated_bytes(0xAA, 16),
-                        span_id: repeated_bytes(0x11, 8),
-                        parent_span_id: vec![],
-                        name: "agent.run".to_owned(),
-                        start_time_unix_nano: 1,
-                        end_time_unix_nano: 10,
-                        status: Some(Status {
-                            message: String::new(),
-                            code: status::StatusCode::Ok as i32,
-                        }),
-                        ..Default::default()
-                    },
-                    Span {
-                        trace_id: repeated_bytes(0xAA, 16),
-                        span_id: repeated_bytes(0x22, 8),
-                        parent_span_id: repeated_bytes(0x11, 8),
-                        name: "llm.call".to_owned(),
-                        start_time_unix_nano: 2,
-                        end_time_unix_nano: 9,
-                        attributes: vec![string_attr("gen_ai.request.model", "gpt-test")],
-                        status: Some(Status {
-                            message: String::new(),
-                            code: status::StatusCode::Ok as i32,
-                        }),
-                        ..Default::default()
-                    },
-                ],
-                schema_url: String::new(),
-            }],
-            schema_url: String::new(),
-        }],
-    }
-}
-
-fn string_attr(key: &str, value: &str) -> KeyValue {
-    KeyValue {
-        key: key.to_owned(),
-        key_strindex: 0,
-        value: Some(AnyValue {
-            value: Some(any_value::Value::StringValue(value.to_owned())),
-        }),
-    }
-}
-
-fn repeated_bytes(byte: u8, len: usize) -> Vec<u8> {
-    vec![byte; len]
+fn sample_records() -> Vec<SpanRecord> {
+    vec![
+        SpanRecord {
+            project_name: "demo".to_owned(),
+            run_id: String::new(),
+            trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            span_id: "1111111111111111".to_owned(),
+            parent_run_id: None,
+            parent_span_id: None,
+            name: "agent.run".to_owned(),
+            run_type: "span".to_owned(),
+            start_time_unix_nano: 1,
+            end_time_unix_nano: 10,
+            status_code: 1,
+            event_kind: RunEventKind::End,
+            attributes_json: r#"{"resource.service.name":"agent-api"}"#.to_owned(),
+            idempotency_key: None,
+        },
+        SpanRecord {
+            project_name: "demo".to_owned(),
+            run_id: String::new(),
+            trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            span_id: "2222222222222222".to_owned(),
+            parent_run_id: None,
+            parent_span_id: Some("1111111111111111".to_owned()),
+            name: "llm.call".to_owned(),
+            run_type: "llm".to_owned(),
+            start_time_unix_nano: 2,
+            end_time_unix_nano: 9,
+            status_code: 1,
+            event_kind: RunEventKind::End,
+            attributes_json:
+                r#"{"gen_ai.request.model":"gpt-test","resource.service.name":"agent-api"}"#
+                    .to_owned(),
+            idempotency_key: None,
+        },
+    ]
 }
 
 struct Mockgres {
