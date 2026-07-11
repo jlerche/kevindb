@@ -33,8 +33,7 @@ WHERE run_heads.project_name = latest_events.project_name
     AND run_heads.last_run_event_id IS NULL;
 
 CREATE INDEX IF NOT EXISTS ix_run_heads_run_locator
-    ON run_heads(run_id, last_trace_segment_id, last_row_index)
-    WHERE run_id <> '';
+    ON run_heads(run_id, last_trace_segment_id, last_row_index);
 
 CREATE INDEX IF NOT EXISTS ix_run_heads_trace_locator
     ON run_heads(project_name, trace_id, last_trace_segment_id, last_row_index);

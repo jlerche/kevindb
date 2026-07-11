@@ -49,8 +49,7 @@ impl RunProjection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunEventSummary {
     pub project_name: String,
-    pub run_id: Option<String>,
-    pub generated_run_id: String,
+    pub run_id: String,
     pub trace_id: String,
     pub span_id: String,
     pub event_type: String,
@@ -63,8 +62,7 @@ pub struct RunEventSummary {
 struct RunLocator {
     segment_uri: String,
     project_name: String,
-    stored_run_id: String,
-    generated_run_id: String,
+    run_id: String,
     trace_id: String,
     span_id: String,
     row_index: i64,
@@ -288,7 +286,6 @@ async fn load_run_locator(
                     trace_segments.uri,
                     run_locators.project_name,
                     run_locators.run_id,
-                    run_locators.generated_run_id,
                     run_locators.trace_id,
                     run_locators.span_id,
                     run_locators.row_index,
@@ -304,7 +301,7 @@ async fn load_run_locator(
                     ON run_deletions.project_name = run_locators.project_name
                     AND run_deletions.trace_id = run_locators.trace_id
                     AND run_deletions.span_id = run_locators.span_id
-                WHERE (run_locators.run_id = $1 OR run_locators.generated_run_id = $1)
+                WHERE run_locators.run_id = $1
                     AND trace_segments.compacted_at IS NULL
                     {deletion_sql}
                 ORDER BY
@@ -325,12 +322,11 @@ fn run_locator_from_row(row: Row) -> RunLocator {
     RunLocator {
         segment_uri: row.get(0),
         project_name: row.get(1),
-        stored_run_id: row.get(2),
-        generated_run_id: row.get(3),
-        trace_id: row.get(4),
-        span_id: row.get(5),
-        row_index: row.get(6),
-        total_bytes: row.get(7),
+        run_id: row.get(2),
+        trace_id: row.get(3),
+        span_id: row.get(4),
+        row_index: row.get(5),
+        total_bytes: row.get(6),
     }
 }
 
@@ -396,14 +392,7 @@ async fn collect_run_locator_query(
 
 fn run_locator_datafusion_sql(locator: &RunLocator, include_payload: bool) -> String {
     let row_index_predicate = format!(" AND row_index = {}", locator.row_index);
-    let run_predicate = if locator.stored_run_id.is_empty() {
-        format!(
-            "run_id = '' AND span_id = {}",
-            sql_string_literal(&locator.span_id)
-        )
-    } else {
-        format!("run_id = {}", sql_string_literal(&locator.stored_run_id))
-    };
+    let run_predicate = format!("run_id = {}", sql_string_literal(&locator.run_id));
     let source_sql = format!(
         "SELECT
                 project_name,
@@ -441,7 +430,7 @@ fn run_locator_datafusion_sql(locator: &RunLocator, include_payload: bool) -> St
             FROM (
                 SELECT
                     project_name,
-                    NULLIF(run_id, '') AS run_id,
+                    run_id,
                     trace_id,
                     span_id,
                     parent_run_id,
@@ -563,7 +552,6 @@ async fn load_run_events(postgres_url: &str, locator: &RunLocator) -> Result<Vec
             "SELECT
                 run_events.project_name,
                 run_events.run_id,
-                run_locators.generated_run_id,
                 run_events.trace_id,
                 run_events.span_id,
                 run_events.event_type,
@@ -588,19 +576,15 @@ async fn load_run_events(postgres_url: &str, locator: &RunLocator) -> Result<Vec
 
     Ok(rows
         .into_iter()
-        .map(|row| {
-            let run_id = row.get::<_, String>(1);
-            RunEventSummary {
-                project_name: row.get(0),
-                run_id: (!run_id.is_empty()).then_some(run_id),
-                generated_run_id: row.get(2),
-                trace_id: row.get(3),
-                span_id: row.get(4),
-                event_type: row.get(5),
-                event_time_unix_nano: row.get(6),
-                segment_uri: row.get(7),
-                row_index: row.get(8),
-            }
+        .map(|row| RunEventSummary {
+            project_name: row.get(0),
+            run_id: row.get(1),
+            trace_id: row.get(2),
+            span_id: row.get(3),
+            event_type: row.get(4),
+            event_time_unix_nano: row.get(5),
+            segment_uri: row.get(6),
+            row_index: row.get(7),
         })
         .collect())
 }
@@ -624,7 +608,6 @@ async fn load_trace_events(
             "SELECT
                 run_events.project_name,
                 run_events.run_id,
-                run_locators.generated_run_id,
                 run_events.trace_id,
                 run_events.span_id,
                 run_events.event_type,
@@ -652,17 +635,15 @@ async fn load_trace_events(
 }
 
 fn run_event_summary_from_row(row: Row) -> RunEventSummary {
-    let run_id = row.get::<_, String>(1);
     RunEventSummary {
         project_name: row.get(0),
-        run_id: (!run_id.is_empty()).then_some(run_id),
-        generated_run_id: row.get(2),
-        trace_id: row.get(3),
-        span_id: row.get(4),
-        event_type: row.get(5),
-        event_time_unix_nano: row.get(6),
-        segment_uri: row.get(7),
-        row_index: row.get(8),
+        run_id: row.get(1),
+        trace_id: row.get(2),
+        span_id: row.get(3),
+        event_type: row.get(4),
+        event_time_unix_nano: row.get(5),
+        segment_uri: row.get(6),
+        row_index: row.get(7),
     }
 }
 
@@ -685,7 +666,6 @@ async fn replay_event_locator(
                 trace_segments.uri,
                 run_locators.project_name,
                 run_locators.run_id,
-                run_locators.generated_run_id,
                 run_locators.trace_id,
                 run_locators.span_id,
                 run_events.row_index,
@@ -709,7 +689,7 @@ async fn replay_event_locator(
 
     let mut replayed = None;
     for row in rows {
-        let event_type: String = row.get(8);
+        let event_type: String = row.get(7);
         if event_type == "tombstone" {
             replayed = None;
             continue;
@@ -718,12 +698,11 @@ async fn replay_event_locator(
         replayed = Some(RunLocator {
             segment_uri: row.get(0),
             project_name: row.get(1),
-            stored_run_id: row.get(2),
-            generated_run_id: row.get(3),
-            trace_id: row.get(4),
-            span_id: row.get(5),
-            row_index: row.get(6),
-            total_bytes: row.get(7),
+            run_id: row.get(2),
+            trace_id: row.get(3),
+            span_id: row.get(4),
+            row_index: row.get(5),
+            total_bytes: row.get(6),
         });
     }
 
@@ -740,8 +719,7 @@ mod tests {
             &RunLocator {
                 segment_uri: "projects/demo/trace-segments/test.vortex".to_owned(),
                 project_name: "demo".to_owned(),
-                stored_run_id: "1111111111111111".to_owned(),
-                generated_run_id: "generated".to_owned(),
+                run_id: "1111111111111111".to_owned(),
                 trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
                 span_id: "1111111111111111".to_owned(),
                 row_index: 7,
@@ -755,13 +733,12 @@ mod tests {
     }
 
     #[test]
-    fn generated_run_locator_sql_filters_by_empty_run_id_and_span_id() {
+    fn run_locator_sql_uses_canonical_run_id() {
         let sql = run_locator_datafusion_sql(
             &RunLocator {
                 segment_uri: "projects/demo/trace-segments/test.vortex".to_owned(),
                 project_name: "demo".to_owned(),
-                stored_run_id: String::new(),
-                generated_run_id: "generated".to_owned(),
+                run_id: "generated".to_owned(),
                 trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
                 span_id: "1111111111111111".to_owned(),
                 row_index: 7,
@@ -770,6 +747,6 @@ mod tests {
             true,
         );
 
-        assert!(sql.contains("run_id = '' AND span_id = '1111111111111111'"));
+        assert!(sql.contains("run_id = 'generated'"));
     }
 }

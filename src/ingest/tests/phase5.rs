@@ -1,5 +1,6 @@
 use super::*;
 use crate::query::{RunAggregateGroup, RunAggregateQuery, RunAggregateSource};
+use kevindb_metastore_postgres::{FeedbackRecord, PostgresMetastore};
 
 use serde_json::json;
 
@@ -177,24 +178,22 @@ async fn aggregates_use_rollups_and_typed_vortex_columns() {
         Some(7.0)
     );
 
-    let generated_run_id = generated_run_id(
-        "demo",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "3333333333333333",
-    );
-    client
-        .execute(
-            "INSERT INTO feedback(
-                id, run_id, trace_id, project_name, key,
-                score_json, score_number, value_json, value_text,
-                created_at_unix_nano, modified_at_unix_nano
-            )
-            VALUES (
-                'generated-feedback', $1, 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
-                'demo', 'quality', '0.75', 0.75, '\"pass\"', 'pass', 1, 1
-            )",
-            &[&generated_run_id],
-        )
+    PostgresMetastore::new(mockgres.postgres_url())
+        .insert_feedback(&FeedbackRecord {
+            id: "generated-feedback".to_owned(),
+            run_id: Some("3333333333333333".to_owned()),
+            trace_id: Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_owned()),
+            project_name: Some("demo".to_owned()),
+            key: "quality".to_owned(),
+            score: Some(json!(0.75)),
+            value: Some(json!("pass")),
+            correction: None,
+            comment: None,
+            feedback_source: None,
+            extra: None,
+            created_at_unix_nano: 1,
+            modified_at_unix_nano: 1,
+        })
         .await
         .expect("insert generated-id feedback");
     let feedback = query_engine

@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::otlp::SpanRecord;
+use crate::record::SpanRecord;
 
 const MAX_PREVIEW_BYTES: usize = 512;
 const MAX_THREAD_ID_BYTES: usize = 256;
@@ -21,7 +21,6 @@ struct RunPreview {
 struct ThreadRunRow {
     span_id: String,
     run_id: String,
-    generated_run_id: String,
     root_run_id: String,
     root_span_id: String,
     name: String,
@@ -193,7 +192,6 @@ async fn load_trace_thread_runs(
             "SELECT
                 heads.span_id,
                 heads.run_id,
-                heads.generated_run_id,
                 heads.root_run_id,
                 heads.root_span_id,
                 heads.name,
@@ -248,8 +246,8 @@ async fn load_trace_thread_runs(
         .into_iter()
         .map(|row| {
             let span_id: String = row.get(0);
-            let metadata_thread_id = clean_thread_id(row.get::<_, Option<String>>(18));
-            let metadata_session_id = clean_thread_id(row.get::<_, Option<String>>(19));
+            let metadata_thread_id = clean_thread_id(row.get::<_, Option<String>>(17));
+            let metadata_session_id = clean_thread_id(row.get::<_, Option<String>>(18));
             let tag_thread_id = tags_by_span
                 .get(&span_id)
                 .and_then(|tags| thread_id_from_tags(tags));
@@ -259,27 +257,26 @@ async fn load_trace_thread_runs(
             ThreadRunRow {
                 span_id,
                 run_id: row.get(1),
-                generated_run_id: row.get(2),
-                root_run_id: row.get(3),
-                root_span_id: row.get(4),
-                name: row.get(5),
-                status: row.get(6),
-                is_root: row.get(7),
-                start_time_unix_nano: row.get(8),
-                end_time_unix_nano: row.get(9),
-                prompt_tokens: row.get(10),
-                completion_tokens: row.get(11),
-                total_tokens: row.get(12),
-                prompt_cost: row.get(13),
-                completion_cost: row.get(14),
-                total_cost: row.get(15),
-                trace_segment_id: row.get(16),
-                row_index: row.get(17),
+                root_run_id: row.get(2),
+                root_span_id: row.get(3),
+                name: row.get(4),
+                status: row.get(5),
+                is_root: row.get(6),
+                start_time_unix_nano: row.get(7),
+                end_time_unix_nano: row.get(8),
+                prompt_tokens: row.get(9),
+                completion_tokens: row.get(10),
+                total_tokens: row.get(11),
+                prompt_cost: row.get(12),
+                completion_cost: row.get(13),
+                total_cost: row.get(14),
+                trace_segment_id: row.get(15),
+                row_index: row.get(16),
                 thread_id,
-                inputs_preview: row.get(20),
-                outputs_preview: row.get(21),
-                error_preview: row.get(22),
-                first_token_time_unix_nano: row.get(23),
+                inputs_preview: row.get(19),
+                outputs_preview: row.get(20),
+                error_preview: row.get(21),
+                first_token_time_unix_nano: row.get(22),
             }
         })
         .collect())
@@ -815,14 +812,9 @@ fn clean_thread_id(value: Option<String>) -> Option<String> {
 }
 
 fn stable_run_id(run: &ThreadRunRow) -> String {
-    first_nonempty(&[
-        &run.run_id,
-        &run.generated_run_id,
-        &run.root_run_id,
-        &run.span_id,
-    ])
-    .unwrap_or(&run.span_id)
-    .to_owned()
+    first_nonempty(&[&run.run_id, &run.root_run_id, &run.span_id])
+        .unwrap_or(&run.span_id)
+        .to_owned()
 }
 
 fn first_nonempty<'a>(values: &[&'a str]) -> Option<&'a str> {

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::otlp::SpanRecord;
+use crate::record::SpanRecord;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TypedRunMetrics {
@@ -324,7 +324,7 @@ const PROVIDER_PATHS: &[&[&str]] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::otlp::RunEventKind;
+    use crate::record::RunEventKind;
     use serde_json::json;
 
     #[test]

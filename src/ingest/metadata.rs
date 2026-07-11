@@ -2,13 +2,12 @@ use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::otlp::SpanRecord;
-use crate::query::generated_run_id;
+use crate::record::SpanRecord;
 use crate::segment::SPAN_SEGMENT_SCHEMA_VERSION;
 
 use super::indexes::{
-    ScalarIndexes, refresh_project_aggregate_rollups, refresh_project_filter_stats,
-    replace_run_scalar_indexes, root_locator_for_record,
+    ScalarIndexes, refresh_project_aggregate_rollups, replace_run_scalar_indexes,
+    rollup_time_bucket, root_locator_for_record,
 };
 use super::routing::record_project_route;
 use super::thread::{refresh_trace_thread_metadata, replace_run_preview};
@@ -81,9 +80,19 @@ pub(super) async fn persist_metadata(
         .context("insert trace segment")?;
     let segment_id: i64 = row.get(0);
 
-    let mut updated_projects = BTreeSet::new();
+    let mut updated_rollup_buckets = BTreeSet::new();
     let mut updated_traces = BTreeSet::new();
     for (row_index, record) in records.iter().enumerate() {
+        let previous_start_time = tx
+            .query_opt(
+                "SELECT start_time_unix_nano
+                FROM run_heads
+                WHERE project_name = $1 AND trace_id = $2 AND span_id = $3",
+                &[&record.project_name, &record.trace_id, &record.span_id],
+            )
+            .await
+            .context("load previous run head bucket")?
+            .map(|row| row.get::<_, i64>(0));
         let event_row = tx
             .query_opt(
                 "INSERT INTO run_events(
@@ -111,10 +120,8 @@ pub(super) async fn persist_metadata(
             return Ok(false);
         };
         let run_event_id: i64 = event_row.get(0);
-        let generated_id =
-            generated_run_id(&record.project_name, &record.trace_id, &record.span_id);
-        let root = root_locator_for_record(tx, record, &generated_id).await?;
-        let scalar_indexes = ScalarIndexes::from_record(record, root);
+        let root = root_locator_for_record(tx, record).await?;
+        let scalar_indexes = ScalarIndexes::from_record(record, root)?;
 
         tx.execute(
             "INSERT INTO trace_segment_spans(
@@ -150,7 +157,7 @@ pub(super) async fn persist_metadata(
         let run_head_updated = tx
             .execute(
                 "INSERT INTO run_heads(
-                project_name, run_id, generated_run_id,
+                project_name, run_id,
                 trace_id, span_id, parent_run_id, parent_span_id,
                 name, run_type,
                 start_time_unix_nano, end_time_unix_nano, status_code, status, is_root,
@@ -165,12 +172,11 @@ pub(super) async fn persist_metadata(
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                 $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25,
-                $26, $27, $28, $29, $30, $31, $32, CURRENT_TIMESTAMP
+                $26, $27, $28, $29, $30, $31, CURRENT_TIMESTAMP
             )
             ON CONFLICT (project_name, trace_id, span_id)
             DO UPDATE SET
                 run_id = EXCLUDED.run_id,
-                generated_run_id = EXCLUDED.generated_run_id,
                 parent_run_id = EXCLUDED.parent_run_id,
                 parent_span_id = EXCLUDED.parent_span_id,
                 name = EXCLUDED.name,
@@ -209,7 +215,6 @@ pub(super) async fn persist_metadata(
                 &[
                     &record.project_name,
                     &record.run_id,
-                    &generated_id,
                     &record.trace_id,
                     &record.span_id,
                     &record.parent_run_id,
@@ -248,20 +253,28 @@ pub(super) async fn persist_metadata(
         if run_head_updated {
             replace_run_scalar_indexes(tx, record, &scalar_indexes).await?;
             replace_run_preview(tx, record).await?;
-            updated_projects.insert(record.project_name.clone());
+            updated_rollup_buckets.insert((
+                record.project_name.clone(),
+                rollup_time_bucket(record.start_time_unix_nano),
+            ));
+            if let Some(previous_start_time) = previous_start_time {
+                updated_rollup_buckets.insert((
+                    record.project_name.clone(),
+                    rollup_time_bucket(previous_start_time),
+                ));
+            }
             updated_traces.insert((record.project_name.clone(), record.trace_id.clone()));
         }
 
         tx.execute(
             "INSERT INTO run_locators(
-                project_name, run_id, generated_run_id, trace_id, span_id,
+                project_name, run_id, trace_id, span_id,
                 trace_segment_id, row_index, event_type, event_time_unix_nano, run_event_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             ON CONFLICT (project_name, trace_id, span_id)
             DO UPDATE SET
                 run_id = EXCLUDED.run_id,
-                generated_run_id = EXCLUDED.generated_run_id,
                 trace_segment_id = EXCLUDED.trace_segment_id,
                 row_index = EXCLUDED.row_index,
                 event_type = EXCLUDED.event_type,
@@ -276,7 +289,6 @@ pub(super) async fn persist_metadata(
             &[
                 &record.project_name,
                 &record.run_id,
-                &generated_id,
                 &record.trace_id,
                 &record.span_id,
                 &segment_id,
@@ -327,9 +339,8 @@ pub(super) async fn persist_metadata(
         refresh_trace_tree_metadata(tx, &project_name, &trace_id).await?;
         refresh_trace_thread_metadata(tx, &project_name, &trace_id).await?;
     }
-    for project_name in updated_projects {
-        refresh_project_filter_stats(tx, &project_name).await?;
-        refresh_project_aggregate_rollups(tx, &project_name).await?;
+    for (project_name, time_bucket_start_unix_nano) in updated_rollup_buckets {
+        refresh_project_aggregate_rollups(tx, &project_name, time_bucket_start_unix_nano).await?;
     }
     if let Some(node_id) = node_id {
         record_project_route(

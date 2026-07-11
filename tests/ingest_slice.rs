@@ -14,9 +14,9 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Sta
 use tokio_postgres::NoTls;
 
 use kevindb::ingest::{IngestConfig, Ingestor};
-use kevindb::otlp::{RunEventKind, SpanRecord};
-use kevindb::query::{QueryEngine, RunQuery, generated_run_id};
+use kevindb::query::{QueryEngine, RunQuery};
 use kevindb::segment::read_span_count;
+use kevindb::{RunEventKind, SpanRecord, generated_run_id};
 use mockgres_support::start_mockgres_with_migrations;
 use tokio::time::Duration;
 
@@ -141,15 +141,14 @@ async fn ingests_otlp_spans_to_vortex_segment_and_postgres_indexes() -> Result<(
     assert_eq!(child.diagnostics.candidate_segments, 1);
     assert_eq!(child.diagnostics.vortex_files_opened, 1);
     let child = child.run.expect("generated child run should exist");
-    assert_eq!(child.run_id, None);
+    assert_eq!(child.run_id, generated_child_id);
     assert_eq!(child.name, "llm.call");
 
     let child_events = query_engine
         .load_run_events_by_id(&generated_child_id)
         .await?;
     assert_eq!(child_events.len(), 1);
-    assert_eq!(child_events[0].generated_run_id, generated_child_id);
-    assert_eq!(child_events[0].run_id, None);
+    assert_eq!(child_events[0].run_id, generated_child_id);
     assert_eq!(child_events[0].row_index, 1);
 
     let trace = query_engine
@@ -290,7 +289,7 @@ async fn compaction_deletes_and_retention_work_together() -> Result<()> {
     let compacted = ingestor.compact_project("demo").await?;
     assert_eq!(compacted.compacted_runs, 2);
     assert_eq!(compacted.compacted_segments, 2);
-    assert_eq!(compacted.written_segments, 2);
+    assert_eq!(compacted.written_segments, 1);
 
     assert!(
         query_engine

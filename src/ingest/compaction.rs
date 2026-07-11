@@ -7,6 +7,15 @@ use tokio_postgres::NoTls;
 
 use super::{CompactReceipt, Ingestor, current_time_unix_nano};
 
+const MAX_COMPACTION_CANDIDATES_PER_PASS: i64 = 64;
+pub(super) const MAX_SEGMENTS_PER_COMPACTION: i64 = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CompactionCandidate {
+    pub project_name: String,
+    pub time_bucket_start_unix_nano: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionServiceConfig {
     pub holder_id: String,
@@ -51,34 +60,42 @@ impl Ingestor {
     ) -> Result<CompactionServiceReceipt> {
         let holder_id = normalize_holder_id(config.holder_id)?;
         let lease_duration_nanos = duration_nanos(config.lease_duration)?;
-        let projects = self.list_compaction_projects().await?;
+        let candidates = self.list_compaction_candidates().await?;
         let mut receipt = CompactionServiceReceipt {
-            projects_scanned: projects.len(),
+            projects_scanned: candidates.len(),
             ..CompactionServiceReceipt::default()
         };
 
-        for project_name in projects {
+        for candidate in candidates {
             let now = current_time_unix_nano()?;
             let lease_expires_at = now
                 .checked_add(lease_duration_nanos)
                 .ok_or_else(|| anyhow!("compaction lease expiry overflow"))?;
             if !self
-                .try_acquire_compaction_lease(&project_name, &holder_id, lease_expires_at, now)
+                .try_acquire_compaction_lease(
+                    &candidate.project_name,
+                    &holder_id,
+                    lease_expires_at,
+                    now,
+                )
                 .await?
             {
                 continue;
             }
             receipt.leases_acquired += 1;
-            let compacted = self.compact_project(&project_name).await?;
+            let compaction = self.compact_candidate(&candidate).await;
+            let release = self
+                .release_compaction_lease(&candidate.project_name, &holder_id)
+                .await;
+            let compacted = compaction?;
+            release?;
             add_compaction_receipt(&mut receipt, compacted);
-            self.release_compaction_lease(&project_name, &holder_id)
-                .await?;
         }
 
         Ok(receipt)
     }
 
-    async fn list_compaction_projects(&self) -> Result<Vec<String>> {
+    async fn list_compaction_candidates(&self) -> Result<Vec<CompactionCandidate>> {
         let (client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
             .await
             .context("connect postgres for compaction project scan")?;
@@ -90,20 +107,24 @@ impl Ingestor {
 
         let rows = client
             .query(
-                "SELECT DISTINCT project_name
-                FROM (
-                    SELECT project_name
-                    FROM trace_segments
-                    WHERE compacted_at IS NULL
-                    GROUP BY project_name, time_bucket_start_unix_nano
-                    HAVING count(*) > 1
-                ) AS compactable_projects
-                ORDER BY project_name",
-                &[],
+                "SELECT project_name, time_bucket_start_unix_nano
+                FROM trace_segments
+                WHERE compacted_at IS NULL
+                GROUP BY project_name, time_bucket_start_unix_nano
+                HAVING count(*) > 1
+                ORDER BY time_bucket_start_unix_nano, project_name
+                LIMIT $1",
+                &[&MAX_COMPACTION_CANDIDATES_PER_PASS],
             )
             .await
             .context("list compaction projects")?;
-        Ok(rows.into_iter().map(|row| row.get(0)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| CompactionCandidate {
+                project_name: row.get(0),
+                time_bucket_start_unix_nano: row.get(1),
+            })
+            .collect())
     }
 
     async fn try_acquire_compaction_lease(

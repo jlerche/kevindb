@@ -178,7 +178,7 @@ async fn phase6_search_indexes_are_rebuilt_during_compaction() {
         .await
         .expect("compact searchable project");
     assert_eq!(compacted.compacted_segments, 2);
-    assert_eq!(compacted.written_segments, 2);
+    assert_eq!(compacted.written_segments, 1);
 
     let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store);
     assert_filter_matches(&query_engine, r#"search("invoice")"#, &["1111111111111111"]).await;

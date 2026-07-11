@@ -264,10 +264,7 @@ fn compile_compare(
         }
         FilterField::Id => {
             let id = value.as_string("id")?;
-            let predicate = format!(
-                "(NULLIF({run_alias}.run_id, '') = {id} OR {run_alias}.generated_run_id = {id})",
-                id = sql_string_literal(&id)
-            );
+            let predicate = format!("{run_alias}.run_id = {}", sql_string_literal(&id));
             match op {
                 CompareOp::Eq => Ok(predicate),
                 CompareOp::Neq => Ok(format!("NOT ({predicate})")),
@@ -448,10 +445,7 @@ fn compile_in(
                 .collect::<Result<Vec<_>, _>>()?;
             let predicates = values
                 .iter()
-                .map(|id| {
-                    let id = sql_string_literal(id);
-                    format!("(NULLIF({run_alias}.run_id, '') = {id} OR {run_alias}.generated_run_id = {id})")
-                })
+                .map(|id| format!("{run_alias}.run_id = {}", sql_string_literal(id)))
                 .collect::<Vec<_>>();
             Ok(format!("({})", predicates.join(" OR ")))
         }
@@ -831,14 +825,12 @@ fn feedback_exists_sql(
     project_names: Option<&[String]>,
 ) -> String {
     format!(
-        "(({run_alias}.run_id <> '' AND {run_alias}.run_id IN ({subquery}))
-            OR {run_alias}.generated_run_id IN ({subquery}))",
-        subquery = format!(
-            "SELECT feedback_filter.run_id FROM feedback feedback_filter
-            WHERE feedback_filter.run_id IS NOT NULL AND {}{}",
-            project_scope_sql("feedback_filter", project_names),
-            conditions.join(" AND ")
-        )
+        "{run_alias}.run_id IN (
+            SELECT feedback_filter.run_id FROM feedback feedback_filter
+            WHERE feedback_filter.run_id IS NOT NULL AND {}{}
+        )",
+        project_scope_sql("feedback_filter", project_names),
+        conditions.join(" AND ")
     )
 }
 

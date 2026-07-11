@@ -2,7 +2,8 @@ use super::{
     MAX_INDEXED_VALUE_BYTES, MAX_JSON_KEYS_PER_RUN, MutableSearchIndex, SearchIndex,
     exact_value_token, json_tape, tokens_for_text,
 };
-use crate::otlp::SpanRecord;
+use crate::record::SpanRecord;
+use anyhow::Context;
 
 pub(super) fn build_search_index(records: &[SpanRecord]) -> anyhow::Result<SearchIndex> {
     let mut builder = SearchIndexBuilder::new(records.len());
@@ -11,7 +12,9 @@ pub(super) fn build_search_index(records: &[SpanRecord]) -> anyhow::Result<Searc
         builder.add_text(row, "name", &record.name);
         builder.add_text(row, "run_type", &record.run_type);
         builder.add_text(row, "status", status_from_record(record));
-        builder.add_json(row, &record.attributes_json);
+        builder
+            .add_json(row, &record.attributes_json)
+            .with_context(|| format!("index attributes_json at row {row_index}"))?;
     }
     builder.finish()
 }
@@ -29,16 +32,15 @@ impl SearchIndexBuilder {
         }
     }
 
-    fn add_json(&mut self, row: u32, attributes_json: &str) {
-        let Ok(tape) = json_tape::JsonTape::parse(attributes_json) else {
-            return;
-        };
+    fn add_json(&mut self, row: u32, attributes_json: &str) -> anyhow::Result<()> {
+        let tape = json_tape::JsonTape::parse(attributes_json)?;
         for leaf in tape.leaves().take(MAX_JSON_KEYS_PER_RUN) {
             match leaf.value {
                 Some(value) => self.add_json_value(row, leaf.path, value),
                 None => self.index.add_path(row, leaf.path),
             }
         }
+        Ok(())
     }
 
     fn add_json_value(&mut self, row: u32, path: &str, value: &str) {
@@ -106,7 +108,7 @@ fn status_from_record(record: &SpanRecord) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::otlp::RunEventKind;
+    use crate::record::RunEventKind;
     use crate::search::{SearchField, SearchPredicate, SearchQuery};
 
     #[test]
@@ -162,11 +164,10 @@ mod tests {
     }
 
     #[test]
-    fn streams_json_scalars_empty_containers_and_rejects_invalid_json() {
-        let index = build_search_index(&[
-            record(r#"{"empty_object":{},"empty_array":[],"number":42,"flag":true,"nil":null}"#),
-            record(r#"{"broken":"invoice""#),
-        ])
+    fn streams_json_scalars_and_empty_containers() {
+        let index = build_search_index(&[record(
+            r#"{"empty_object":{},"empty_array":[],"number":42,"flag":true,"nil":null}"#,
+        )])
         .expect("build index");
 
         for path in ["empty_object", "empty_array", "nil"] {
@@ -191,14 +192,13 @@ mod tests {
             }),
             [0].into_iter().collect()
         );
-        assert!(
-            index
-                .matching_rows(&SearchPredicate::Text {
-                    field: SearchField::All,
-                    query: SearchQuery::parse("invoice"),
-                })
-                .is_empty()
-        );
+    }
+
+    #[test]
+    fn rejects_invalid_attributes_json() {
+        let error = build_search_index(&[record(r#"{"broken":"invoice""#)])
+            .expect_err("invalid JSON must reject the segment");
+        assert!(error.to_string().contains("row 0"));
     }
 
     #[test]

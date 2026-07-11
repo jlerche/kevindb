@@ -632,8 +632,8 @@ mod tests {
         }
     }
 
-    fn record(span_id: &str, attributes_json: &str) -> crate::otlp::SpanRecord {
-        crate::otlp::SpanRecord {
+    fn record(span_id: &str, attributes_json: &str) -> crate::record::SpanRecord {
+        crate::record::SpanRecord {
             project_name: "demo".to_owned(),
             run_id: String::new(),
             trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
@@ -645,7 +645,7 @@ mod tests {
             start_time_unix_nano: 1,
             end_time_unix_nano: 2,
             status_code: 1,
-            event_kind: crate::otlp::RunEventKind::End,
+            event_kind: crate::record::RunEventKind::End,
             attributes_json: attributes_json.to_owned(),
             idempotency_key: None,
         }

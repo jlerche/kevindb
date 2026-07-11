@@ -110,23 +110,20 @@ async fn load_trace_tree_runs(
 
     Ok(rows
         .into_iter()
-        .map(|row| {
-            let run_id = row.get::<_, String>(1);
-            RunSummary {
-                project_name: row.get(0),
-                run_id: (!run_id.is_empty()).then_some(run_id),
-                trace_id: row.get(2),
-                span_id: row.get(3),
-                parent_run_id: row.get::<_, Option<String>>(4),
-                parent_span_id: row.get::<_, Option<String>>(5),
-                name: row.get(6),
-                run_type: row.get(7),
-                status: row.get(8),
-                start_time_unix_nano: row.get(9),
-                end_time_unix_nano: row.get(10),
-                is_root: row.get(11),
-                attributes_json: "{}".to_owned(),
-            }
+        .map(|row| RunSummary {
+            project_name: row.get(0),
+            run_id: row.get(1),
+            trace_id: row.get(2),
+            span_id: row.get(3),
+            parent_run_id: row.get::<_, Option<String>>(4),
+            parent_span_id: row.get::<_, Option<String>>(5),
+            name: row.get(6),
+            run_type: row.get(7),
+            status: row.get(8),
+            start_time_unix_nano: row.get(9),
+            end_time_unix_nano: row.get(10),
+            is_root: row.get(11),
+            attributes_json: "{}".to_owned(),
         })
         .collect())
 }

@@ -1,7 +1,7 @@
 use std::env;
 
 use anyhow::{Context, Result};
-use kevindb::otlp::{RunEventKind, SpanRecord};
+use kevindb::{RunEventKind, SpanRecord};
 use serde::Serialize;
 use serde_json::json;
 

@@ -1,5 +1,4 @@
 #[path = "../../../tests/support/mockgres.rs"]
-#[allow(dead_code)]
 mod mockgres_support;
 
 use std::io::Read;
@@ -31,7 +30,7 @@ impl Drop for ChildGuard {
 
 #[tokio::test]
 async fn local_service_roles_share_metastore_coordination_state() -> Result<()> {
-    let mockgres = mockgres_support::MockgresInstance::start().await?;
+    let mockgres = mockgres_support::start_mockgres_with_migrations().await?;
     let postgres_url = mockgres.postgres_url().to_owned();
     let ingest_port = reserve_port()?;
     let query_port = reserve_port()?;
@@ -105,8 +104,9 @@ fn start_server(
     command
         .env("KEVINDB_BIND_ADDR", format!("127.0.0.1:{port}"))
         .env("KEVINDB_POSTGRES_URL", postgres_url)
+        .env("KEVINDB_OBJECT_STORE", "memory")
         .env("KEVINDB_SERVICE_ROLE", role)
-        .env("KEVINDB_RUN_MIGRATIONS", (role == "ingest").to_string())
+        .env("KEVINDB_RUN_MIGRATIONS", "false")
         .env("KEVINDB_INGEST_MAX_FLUSH_DELAY_MS", "0")
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())

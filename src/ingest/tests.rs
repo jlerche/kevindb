@@ -7,8 +7,21 @@ use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
 
 use super::*;
-use crate::db::run_migrations;
-use crate::query::{QueryEngine, RunProjection, RunQuery, generated_run_id};
+use crate::generated_run_id;
+use crate::query::{QueryEngine, RunProjection, RunQuery};
+use kevindb_metastore_postgres::run_migrations;
+
+#[test]
+fn deduplicates_idempotency_keys_within_a_flush() {
+    let mut first = sample_record("1111111111111111", 10);
+    first.idempotency_key = Some("same-request".to_owned());
+    let mut duplicate = sample_record("2222222222222222", 20);
+    duplicate.idempotency_key = Some("same-request".to_owned());
+
+    let records = deduplicate_records(vec![first.clone(), duplicate]);
+
+    assert_eq!(records, vec![first]);
+}
 
 mod phase1;
 mod phase10;
@@ -135,7 +148,7 @@ async fn ingest_records_flushes_to_object_store_and_postgres() {
         .await
         .expect("load generated run id")
         .expect("generated run should exist");
-    assert_eq!(child.run_id, None);
+    assert_eq!(child.run_id, generated_child_id);
     assert_eq!(child.span_id, "2222222222222222");
 
     mockgres.stop().await.expect("stop mockgres");
@@ -674,7 +687,7 @@ async fn compacts_and_respects_deletes_and_retention() {
         .expect("compact project");
     assert_eq!(compacted.compacted_runs, 2);
     assert_eq!(compacted.compacted_segments, 2);
-    assert_eq!(compacted.written_segments, 2);
+    assert_eq!(compacted.written_segments, 1);
 
     let compacted_run = query_engine
         .load_run_by_id("2222222222222222")
@@ -687,7 +700,7 @@ async fn compacts_and_respects_deletes_and_retention() {
         .await
         .expect("load trace after compaction");
     assert_eq!(compacted_trace.runs.len(), 2);
-    assert_eq!(compacted_trace.diagnostics.candidate_segments, 2);
+    assert_eq!(compacted_trace.diagnostics.candidate_segments, 1);
 
     assert!(
         query_engine
@@ -751,14 +764,14 @@ async fn repeated_compaction_preserves_active_runs() {
         .expect("ingest compactable records");
 
     let query_engine = QueryEngine::new(mockgres.postgres_url().to_owned(), object_store);
-    for _ in 0..2 {
+    for expected in [(2, 2, 1), (0, 0, 0)] {
         let compacted = ingestor
             .compact_project("demo")
             .await
             .expect("compact project");
-        assert_eq!(compacted.compacted_runs, 2);
-        assert_eq!(compacted.compacted_segments, 2);
-        assert_eq!(compacted.written_segments, 2);
+        assert_eq!(compacted.compacted_runs, expected.0);
+        assert_eq!(compacted.compacted_segments, expected.1);
+        assert_eq!(compacted.written_segments, expected.2);
 
         let active = query_engine
             .list_runs_in_trace("demo", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")

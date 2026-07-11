@@ -1,9 +1,10 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
-use kevindb::db::run_migrations;
-use kevindb::ingest::IngestConfig as RuntimeIngestConfig;
-use kevindb_config::{CacheConfig, CacheMode, ObjectStoreConfig, ServerConfig};
+use kevindb::ingest::{CompactionServiceConfig, IngestConfig as RuntimeIngestConfig};
+use kevindb_config::{CacheConfig, CacheMode, ObjectStoreConfig, ServerConfig, ServiceRole};
+use kevindb_metastore_postgres::run_migrations;
 use kevindb_server::cache::CachedObjectStore;
 use kevindb_server::{ServerState, app};
 use object_store::ObjectStore;
@@ -30,6 +31,11 @@ async fn main() -> Result<()> {
         max_flush_delay: config.ingest.max_flush_delay,
     };
 
+    let service_role = config.service_role;
+    let compaction_holder_id = config
+        .node_id
+        .clone()
+        .unwrap_or_else(|| config.bind_addr.to_string());
     let object_store = object_store_from_config(config.object_store, config.cache).await?;
     let state = ServerState::new_with_role(
         config.postgres_url,
@@ -41,9 +47,39 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
     tracing::info!(bind_addr = %config.bind_addr, "kevindb server listening");
 
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+    let compaction_task =
+        matches!(service_role, ServiceRole::All | ServiceRole::Compaction).then({
+            let state = state.clone();
+            let worker_shutdown = shutdown_sender.clone();
+            let shutdown_receiver = shutdown_receiver.clone();
+            move || {
+                tokio::spawn(async move {
+                    let result = state
+                        .run_compaction_service_loop(
+                            CompactionServiceConfig {
+                                holder_id: compaction_holder_id,
+                                lease_duration: Duration::from_secs(60),
+                            },
+                            Duration::from_secs(30),
+                            shutdown_receiver,
+                        )
+                        .await;
+                    if result.is_err() {
+                        let _ = worker_shutdown.send(true);
+                    }
+                    result
+                })
+            }
+        });
+
     axum::serve(listener, app(state.clone()))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(shutdown_sender, shutdown_receiver))
         .await?;
+
+    if let Some(task) = compaction_task {
+        task.await??;
+    }
 
     let flushed = state.flush_pending_ingest().await?;
     if !flushed.is_empty() {
@@ -74,11 +110,7 @@ async fn object_store_from_config(
                 builder = builder.with_allow_http(true);
             }
             let store = builder.build()?;
-            if let Some(prefix) = config.prefix {
-                Arc::new(PrefixStore::new(store, prefix))
-            } else {
-                Arc::new(store)
-            }
+            Arc::new(PrefixStore::new(store, config.prefix))
         }
     };
 
@@ -105,7 +137,22 @@ async fn object_store_from_config(
     }
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(
+    shutdown: tokio::sync::watch::Sender<bool>,
+    mut shutdown_receiver: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::select! {
+        () = operating_system_shutdown_signal() => {}
+        changed = shutdown_receiver.changed() => {
+            if changed.is_err() {
+                tracing::warn!("shutdown channel closed unexpectedly");
+            }
+        }
+    }
+    let _ = shutdown.send(true);
+}
+
+async fn operating_system_shutdown_signal() {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
             tracing::warn!(%error, "failed to listen for shutdown signal");

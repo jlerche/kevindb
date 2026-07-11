@@ -122,16 +122,6 @@ async fn scalar_indexes_are_materialized_and_bounded() {
     assert!(metadata.contains(&("temperature".to_owned(), "0.7".to_owned())));
     assert!(!metadata.iter().any(|(key, _)| key == "large"));
 
-    let stat_count: i64 = client
-        .query_one(
-            "SELECT count(*) FROM project_filter_stats WHERE project_name = 'demo'",
-            &[],
-        )
-        .await
-        .expect("count filter stats")
-        .get(0);
-    assert!(stat_count >= 5);
-
     mockgres.stop().await.expect("stop mockgres");
 }
 
@@ -335,7 +325,7 @@ async fn feedback_filters_are_scoped_to_query_projects() {
 }
 
 #[tokio::test]
-async fn deleting_runs_refreshes_current_filter_stats() {
+async fn deleting_runs_are_excluded_from_scalar_index_filters() {
     let mockgres = Mockgres::start().await.expect("start mockgres");
     run_migrations(mockgres.postgres_url())
         .await
@@ -383,35 +373,21 @@ async fn deleting_runs_refreshes_current_filter_stats() {
             .expect("delete indexed run")
     );
 
-    let (client, connection) = tokio_postgres::connect(mockgres.postgres_url(), NoTls)
+    let mut deleted_query = RunQuery::new("demo");
+    deleted_query.filter = Some(FilterExpr::parse(r#"has(tags, "drop")"#).expect("drop filter"));
+    let deleted_matches = query_engine
+        .list_runs(deleted_query)
         .await
-        .expect("connect postgres");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    let stats = client
-        .query(
-            "SELECT stat_name, distinct_count
-            FROM project_filter_stats
-            WHERE project_name = 'demo'
-                AND stat_name IN ('run_type', 'tag', 'metadata_key')
-            ORDER BY stat_name",
-            &[],
-        )
-        .await
-        .expect("load filter stats")
-        .into_iter()
-        .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
-        .collect::<Vec<_>>();
+        .expect("query deleted tag");
+    assert!(deleted_matches.is_empty());
 
-    assert_eq!(
-        stats,
-        vec![
-            ("metadata_key".to_owned(), 1),
-            ("run_type".to_owned(), 1),
-            ("tag".to_owned(), 1),
-        ]
-    );
+    let mut kept_query = RunQuery::new("demo");
+    kept_query.filter = Some(FilterExpr::parse(r#"has(tags, "keep")"#).expect("keep filter"));
+    let kept_matches = query_engine
+        .list_runs(kept_query)
+        .await
+        .expect("query kept tag");
+    assert_eq!(kept_matches.len(), 1);
 
     mockgres.stop().await.expect("stop mockgres");
 }

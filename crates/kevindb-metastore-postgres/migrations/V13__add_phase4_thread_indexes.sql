@@ -39,8 +39,8 @@ CREATE TABLE IF NOT EXISTS thread_traces (
     project_name TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,
     thread_id TEXT NOT NULL,
     trace_id TEXT NOT NULL,
-    root_run_id TEXT NOT NULL DEFAULT '',
-    root_span_id TEXT NOT NULL DEFAULT '',
+    root_run_id TEXT NOT NULL,
+    root_span_id TEXT NOT NULL,
     name TEXT,
     start_time_unix_nano BIGINT NOT NULL,
     end_time_unix_nano BIGINT NOT NULL DEFAULT 0,
@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS thread_messages (
     thread_id TEXT NOT NULL,
     trace_id TEXT NOT NULL,
     span_id TEXT NOT NULL,
-    run_id TEXT NOT NULL DEFAULT '',
+    run_id TEXT NOT NULL,
     role TEXT NOT NULL,
     preview TEXT NOT NULL,
     turn_order BIGINT NOT NULL,
@@ -92,7 +92,6 @@ WITH run_thread_ids AS (
         heads.trace_id,
         heads.span_id,
         heads.run_id,
-        heads.generated_run_id,
         heads.root_run_id,
         heads.root_span_id,
         heads.name,
@@ -124,16 +123,8 @@ root_rows AS (
         project_name,
         thread_id,
         trace_id,
-        CASE
-            WHEN run_id <> '' THEN run_id
-            WHEN generated_run_id <> '' THEN generated_run_id
-            WHEN root_run_id <> '' THEN root_run_id
-            ELSE span_id
-        END AS root_run_id,
-        CASE
-            WHEN root_span_id <> '' THEN root_span_id
-            ELSE span_id
-        END AS root_span_id,
+        root_run_id,
+        root_span_id,
         name
     FROM run_thread_ids
     ORDER BY project_name, thread_id, trace_id, is_root DESC, start_time_unix_nano ASC, span_id ASC
@@ -168,7 +159,6 @@ WITH run_thread_ids AS (
         heads.trace_id,
         heads.span_id,
         heads.run_id,
-        heads.generated_run_id,
         heads.root_run_id,
         heads.root_span_id,
         heads.name,
@@ -200,16 +190,8 @@ root_rows AS (
         project_name,
         thread_id,
         trace_id,
-        CASE
-            WHEN run_id <> '' THEN run_id
-            WHEN generated_run_id <> '' THEN generated_run_id
-            WHEN root_run_id <> '' THEN root_run_id
-            ELSE span_id
-        END AS root_run_id,
-        CASE
-            WHEN root_span_id <> '' THEN root_span_id
-            ELSE span_id
-        END AS root_span_id,
+        root_run_id,
+        root_span_id,
         name
     FROM run_thread_ids
     ORDER BY project_name, thread_id, trace_id, is_root DESC, start_time_unix_nano ASC, span_id ASC

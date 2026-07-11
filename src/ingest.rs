@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,8 +13,8 @@ use tokio::sync::oneshot;
 use tokio::time::{Duration, sleep};
 use tokio_postgres::NoTls;
 
-use crate::otlp::{RunEventKind, SpanRecord};
-use crate::query::{QueryEngine, RunQuery, RunSummary};
+use crate::query::{FilterExpr, QueryEngine, RunQuery, RunSummary};
+use crate::record::{RunEventKind, SpanRecord, canonicalize_record_ids};
 use crate::search::{
     SEARCH_INDEX_SCHEMA_VERSION, build_search_index, encode_search_index,
     search_index_uri_for_segment,
@@ -22,6 +22,8 @@ use crate::search::{
 use crate::segment::encode_span_records;
 
 const INGEST_TIME_BUCKET_UNIX_NANOS: i64 = 60 * 60 * 1_000_000_000;
+const MAX_COMPACTION_SPANS_PER_SEGMENT: usize = 8192;
+const MAX_DUPLICATE_CONFLICT_RETRIES: usize = 3;
 
 mod compaction;
 mod indexes;
@@ -29,6 +31,7 @@ mod metadata;
 mod routing;
 mod thread;
 mod tree;
+use compaction::{CompactionCandidate, MAX_SEGMENTS_PER_COMPACTION};
 pub use compaction::{CompactionServiceConfig, CompactionServiceReceipt};
 use metadata::{SegmentObjectMetadata, persist_metadata};
 
@@ -37,10 +40,23 @@ pub(crate) async fn refresh_trace_materialized_metadata(
     project_name: &str,
     trace_id: &str,
 ) -> Result<()> {
+    let rollup_buckets = tx
+        .query(
+            "SELECT DISTINCT start_time_unix_nano
+            FROM run_heads
+            WHERE project_name = $1 AND trace_id = $2",
+            &[&project_name, &trace_id],
+        )
+        .await
+        .context("load trace aggregate buckets")?
+        .into_iter()
+        .map(|row| indexes::rollup_time_bucket(row.get(0)))
+        .collect::<HashSet<_>>();
     tree::refresh_trace_tree_metadata(tx, project_name, trace_id).await?;
     thread::refresh_trace_thread_metadata(tx, project_name, trace_id).await?;
-    indexes::refresh_project_filter_stats(tx, project_name).await?;
-    indexes::refresh_project_aggregate_rollups(tx, project_name).await?;
+    for bucket in rollup_buckets {
+        indexes::refresh_project_aggregate_rollups(tx, project_name, bucket).await?;
+    }
     Ok(())
 }
 
@@ -152,7 +168,8 @@ impl Ingestor {
         )
     }
 
-    pub async fn ingest_records(&self, records: Vec<SpanRecord>) -> Result<IngestReceipt> {
+    pub async fn ingest_records(&self, mut records: Vec<SpanRecord>) -> Result<IngestReceipt> {
+        records.iter_mut().for_each(canonicalize_record_ids);
         let accepted_spans = records.len();
         if accepted_spans == 0 {
             return Ok(IngestReceipt {
@@ -279,11 +296,41 @@ impl Ingestor {
     }
 
     pub async fn compact_project(&self, project_name: &str) -> Result<CompactReceipt> {
-        let old_segment_ids = self.active_project_segment_ids(project_name).await?;
-        let runs = QueryEngine::new(self.postgres_url.clone(), Arc::clone(&self.object_store))
-            .list_runs(RunQuery::new(project_name))
-            .await
-            .context("load project runs for compaction")?;
+        let Some(candidate) = self.oldest_compaction_candidate(project_name).await? else {
+            return Ok(CompactReceipt {
+                compacted_runs: 0,
+                compacted_segments: 0,
+                written_segments: 0,
+                flushes: Vec::new(),
+            });
+        };
+        self.compact_candidate(&candidate).await
+    }
+
+    async fn compact_candidate(&self, candidate: &CompactionCandidate) -> Result<CompactReceipt> {
+        let old_segment_ids = self
+            .active_bucket_segment_ids(
+                &candidate.project_name,
+                candidate.time_bucket_start_unix_nano,
+            )
+            .await?;
+        let run_ids = self.active_segment_run_ids(&old_segment_ids).await?;
+        let runs = if run_ids.is_empty() {
+            Vec::new()
+        } else {
+            let filter_json = serde_json::to_string(&run_ids)?;
+            let mut query = RunQuery::new(&candidate.project_name);
+            query.filter = Some(
+                FilterExpr::parse(&format!("in(id, {filter_json})"))
+                    .context("build bounded compaction filter")?,
+            );
+            query.limits.max_candidate_segments = Some(old_segment_ids.len());
+            query.limits.max_candidate_runs = Some(run_ids.len());
+            QueryEngine::new(self.postgres_url.clone(), Arc::clone(&self.object_store))
+                .list_runs(query)
+                .await
+                .context("load bounded runs for compaction")?
+        };
 
         if runs.is_empty() || old_segment_ids.len() <= 1 {
             return Ok(CompactReceipt {
@@ -303,14 +350,21 @@ impl Ingestor {
         );
         let mut flushes = Vec::new();
         for (partition, records) in grouped_records {
-            flushes.extend(self.persist_partition_records(&partition, records).await.map_err(
-                |error| {
+            flushes.extend(
+                self.persist_partition_records_with_limit(
+                    &partition,
+                    records,
+                    MAX_COMPACTION_SPANS_PER_SEGMENT,
+                )
+                .await
+                .map_err(|error| {
                     anyhow!(
-                        "compact project {project_name} failed while writing replacement segment: {}",
+                        "compact project {} failed while writing replacement segment: {}",
+                        candidate.project_name,
                         error.error
                     )
-                },
-            )?);
+                })?,
+            );
         }
 
         let compacted_segments = self.mark_segments_compacted(&old_segment_ids).await?;
@@ -328,8 +382,19 @@ impl Ingestor {
         partition: &PartitionKey,
         records: Vec<SpanRecord>,
     ) -> std::result::Result<Vec<FlushReceipt>, PersistError> {
+        self.persist_partition_records_with_limit(partition, records, self.max_spans_per_segment())
+            .await
+    }
+
+    async fn persist_partition_records_with_limit(
+        &self,
+        partition: &PartitionKey,
+        records: Vec<SpanRecord>,
+        max_spans_per_segment: usize,
+    ) -> std::result::Result<Vec<FlushReceipt>, PersistError> {
         let mut remaining_records = records;
         let mut receipts = Vec::new();
+        let mut duplicate_conflicts = 0;
 
         loop {
             remaining_records = self
@@ -340,7 +405,7 @@ impl Ingestor {
                 return Ok(receipts);
             }
 
-            let segment_span_count = self.max_spans_per_segment().min(remaining_records.len());
+            let segment_span_count = max_spans_per_segment.max(1).min(remaining_records.len());
             let segment_records = remaining_records
                 .drain(..segment_span_count)
                 .collect::<Vec<_>>();
@@ -348,6 +413,16 @@ impl Ingestor {
             match self.persist_segment(partition, segment_records).await {
                 Ok(PersistSegmentResult::Written(receipt)) => receipts.push(receipt),
                 Ok(PersistSegmentResult::DuplicateConflict(mut records)) => {
+                    duplicate_conflicts += 1;
+                    if duplicate_conflicts > MAX_DUPLICATE_CONFLICT_RETRIES {
+                        records.append(&mut remaining_records);
+                        return Err(PersistError {
+                            records,
+                            error: anyhow!(
+                                "ingest made no progress after {MAX_DUPLICATE_CONFLICT_RETRIES} idempotency conflicts"
+                            ),
+                        });
+                    }
                     records.append(&mut remaining_records);
                     remaining_records = records;
                 }
@@ -367,6 +442,7 @@ impl Ingestor {
             return Ok(records);
         }
 
+        let records = deduplicate_records(records);
         let keys = records
             .iter()
             .map(run_event_idempotency_key)
@@ -528,7 +604,45 @@ impl Ingestor {
         self.config.max_spans_per_segment.max(1)
     }
 
-    async fn active_project_segment_ids(&self, project_name: &str) -> Result<Vec<i64>> {
+    async fn oldest_compaction_candidate(
+        &self,
+        project_name: &str,
+    ) -> Result<Option<CompactionCandidate>> {
+        let (client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
+            .await
+            .context("connect postgres for compaction candidate lookup")?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::warn!(error = %err, "postgres compaction candidate connection failed");
+            }
+        });
+        Ok(client
+            .query_opt(
+                "SELECT time_bucket_start_unix_nano
+                FROM (
+                    SELECT time_bucket_start_unix_nano
+                    FROM trace_segments
+                    WHERE project_name = $1 AND compacted_at IS NULL
+                    GROUP BY time_bucket_start_unix_nano
+                    HAVING count(*) > 1
+                ) AS compactable_buckets
+                ORDER BY time_bucket_start_unix_nano
+                LIMIT 1",
+                &[&project_name],
+            )
+            .await
+            .context("load oldest compaction candidate")?
+            .map(|row| CompactionCandidate {
+                project_name: project_name.to_owned(),
+                time_bucket_start_unix_nano: row.get(0),
+            }))
+    }
+
+    async fn active_bucket_segment_ids(
+        &self,
+        project_name: &str,
+        time_bucket_start_unix_nano: i64,
+    ) -> Result<Vec<i64>> {
         let (client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
             .await
             .context("connect postgres for compaction segment lookup")?;
@@ -542,13 +656,53 @@ impl Ingestor {
             .query(
                 "SELECT id
                 FROM trace_segments
-                WHERE project_name = $1 AND compacted_at IS NULL
-                ORDER BY id",
-                &[&project_name],
+                WHERE project_name = $1
+                    AND time_bucket_start_unix_nano = $2
+                    AND compacted_at IS NULL
+                ORDER BY id
+                LIMIT $3",
+                &[
+                    &project_name,
+                    &time_bucket_start_unix_nano,
+                    &MAX_SEGMENTS_PER_COMPACTION,
+                ],
             )
             .await
             .context("load active project segments")?;
 
+        Ok(rows.into_iter().map(|row| row.get(0)).collect())
+    }
+
+    async fn active_segment_run_ids(&self, segment_ids: &[i64]) -> Result<Vec<String>> {
+        if segment_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
+            .await
+            .context("connect postgres for compaction run lookup")?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::warn!(error = %err, "postgres compaction run lookup failed");
+            }
+        });
+        let ids = segment_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = client
+            .query(
+                format!(
+                    "SELECT run_id FROM run_heads
+                    WHERE deleted_at_unix_nano IS NULL
+                        AND last_trace_segment_id IN ({ids})
+                    ORDER BY run_id"
+                )
+                .as_str(),
+                &[],
+            )
+            .await
+            .context("load bounded compaction run ids")?;
         Ok(rows.into_iter().map(|row| row.get(0)).collect())
     }
 
@@ -584,6 +738,14 @@ impl Ingestor {
             .context("mark segments compacted")?;
         Ok(updated as usize)
     }
+}
+
+fn deduplicate_records(records: Vec<SpanRecord>) -> Vec<SpanRecord> {
+    let mut seen = HashSet::with_capacity(records.len());
+    records
+        .into_iter()
+        .filter(|record| seen.insert(run_event_idempotency_key(record)))
+        .collect()
 }
 
 fn normalize_node_id(node_id: String) -> Option<String> {
@@ -638,7 +800,7 @@ fn receipt_from_flushes(accepted_spans: usize, flushes: Vec<FlushReceipt>) -> In
 fn span_record_from_run_summary(run: &RunSummary, compaction_batch_key: &str) -> SpanRecord {
     SpanRecord {
         project_name: run.project_name.clone(),
-        run_id: run.run_id.clone().unwrap_or_default(),
+        run_id: run.run_id.clone(),
         trace_id: run.trace_id.clone(),
         span_id: run.span_id.clone(),
         parent_run_id: run.parent_run_id.clone(),

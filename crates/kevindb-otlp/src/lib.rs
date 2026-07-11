@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
-use kevindb::{RunEventKind, SpanRecord};
+use kevindb_core::{RunEventKind, SpanRecord, canonicalize_record_ids};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::trace::v1::Span;
@@ -69,7 +69,7 @@ fn span_record_from_span(
         attributes.insert(key, value);
     }
 
-    Ok(SpanRecord {
+    let mut record = SpanRecord {
         project_name,
         run_id: String::new(),
         trace_id,
@@ -84,7 +84,9 @@ fn span_record_from_span(
         event_kind,
         attributes_json: Value::Object(attributes).to_string(),
         idempotency_key: None,
-    })
+    };
+    canonicalize_record_ids(&mut record);
+    Ok(record)
 }
 
 fn infer_run_type(name: &str, attributes: &BTreeMap<String, Value>) -> String {

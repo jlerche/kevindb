@@ -8,6 +8,10 @@ use tokio_postgres::NoTls;
 
 use super::{QueryEngine, current_time_unix_nano};
 
+const MAX_CLEANUP_CANDIDATES: i64 = 1000;
+const MAX_ORPHAN_OBJECTS_SCANNED: usize = 100_000;
+const MAX_ORPHAN_REFERENCES: i64 = 100_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectCleanupCandidate {
     pub trace_segment_id: i64,
@@ -74,11 +78,13 @@ impl QueryEngine {
 
         let mut deleted_objects = 0;
         for candidate in &candidates {
-            delete_if_exists(self.object_store.as_ref(), &candidate.segment_uri).await?;
-            deleted_objects += 1;
+            deleted_objects += usize::from(
+                delete_if_exists(self.object_store.as_ref(), &candidate.segment_uri).await?,
+            );
             if let Some(search_index_uri) = &candidate.search_index_uri {
-                delete_if_exists(self.object_store.as_ref(), search_index_uri).await?;
-                deleted_objects += 1;
+                deleted_objects += usize::from(
+                    delete_if_exists(self.object_store.as_ref(), search_index_uri).await?,
+                );
             }
         }
         self.mark_compacted_objects_cleaned(&candidates, now_unix_nano)
@@ -99,11 +105,18 @@ impl QueryEngine {
         let referenced = self.load_referenced_object_uris().await?;
         let mut objects = self.object_store.list(None);
         let mut candidates = Vec::new();
+        let mut objects_scanned = 0;
         while let Some(meta) = objects
             .try_next()
             .await
             .context("list object store for orphan cleanup")?
         {
+            objects_scanned += 1;
+            if objects_scanned > MAX_ORPHAN_OBJECTS_SCANNED {
+                anyhow::bail!(
+                    "orphan cleanup rejected: object count exceeds {MAX_ORPHAN_OBJECTS_SCANNED}"
+                );
+            }
             let uri = meta.location.to_string();
             if !referenced.contains(&uri) {
                 candidates.push(OrphanObjectCandidate {
@@ -128,8 +141,8 @@ impl QueryEngine {
 
         let mut deleted_objects = 0;
         for candidate in &candidates {
-            delete_if_exists(self.object_store.as_ref(), &candidate.uri).await?;
-            deleted_objects += 1;
+            deleted_objects +=
+                usize::from(delete_if_exists(self.object_store.as_ref(), &candidate.uri).await?);
         }
         Ok(OrphanObjectCleanupReceipt {
             dry_run,
@@ -153,8 +166,9 @@ impl QueryEngine {
             .query(
                 "SELECT uri
                 FROM trace_segments
-                WHERE object_deleted_at_unix_nano IS NULL",
-                &[],
+                WHERE object_deleted_at_unix_nano IS NULL
+                LIMIT $1",
+                &[&(MAX_ORPHAN_REFERENCES + 1)],
             )
             .await
             .context("load referenced segment uris")?;
@@ -163,12 +177,20 @@ impl QueryEngine {
                 "SELECT search_index_uri
                 FROM trace_segments
                 WHERE search_index_uri IS NOT NULL
-                    AND object_deleted_at_unix_nano IS NULL",
-                &[],
+                    AND object_deleted_at_unix_nano IS NULL
+                LIMIT $1",
+                &[&(MAX_ORPHAN_REFERENCES + 1)],
             )
             .await
             .context("load referenced search index uris")?;
 
+        if segment_rows.len() > MAX_ORPHAN_REFERENCES as usize
+            || search_index_rows.len() > MAX_ORPHAN_REFERENCES as usize
+        {
+            anyhow::bail!(
+                "orphan cleanup rejected: metadata reference count exceeds {MAX_ORPHAN_REFERENCES}"
+            );
+        }
         let mut referenced = segment_rows
             .into_iter()
             .map(|row| row.get(0))
@@ -197,8 +219,9 @@ impl QueryEngine {
                 WHERE compacted_at IS NOT NULL
                     AND object_deleted_at_unix_nano IS NULL
                     AND COALESCE(compacted_at_unix_nano, 0) <= $1
-                ORDER BY id",
-                &[&cutoff_unix_nano],
+                ORDER BY id
+                LIMIT $2",
+                &[&cutoff_unix_nano, &MAX_CLEANUP_CANDIDATES],
             )
             .await
             .context("load compacted object cleanup candidates")?;
@@ -256,9 +279,10 @@ fn candidate_bytes(candidate: &ObjectCleanupCandidate) -> i64 {
         .saturating_add(candidate.search_index_bytes)
 }
 
-async fn delete_if_exists(object_store: &dyn ObjectStore, uri: &str) -> Result<()> {
+async fn delete_if_exists(object_store: &dyn ObjectStore, uri: &str) -> Result<bool> {
     match object_store.delete(&Path::from(uri)).await {
-        Ok(()) | Err(ObjectStoreError::NotFound { .. }) => Ok(()),
+        Ok(()) => Ok(true),
+        Err(ObjectStoreError::NotFound { .. }) => Ok(false),
         Err(error) => Err(error).with_context(|| format!("delete compacted object {uri}")),
     }
 }

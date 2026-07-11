@@ -24,7 +24,7 @@ pub(crate) fn run_summaries_from_batches(batches: &[RecordBatch]) -> Result<Vec<
         for row in 0..batch.num_rows() {
             runs.push(RunSummary {
                 project_name: project_names.value(row).to_owned(),
-                run_id: optional_string_value(&run_ids, row),
+                run_id: run_ids.value(row).to_owned(),
                 trace_id: trace_ids.value(row).to_owned(),
                 span_id: span_ids.value(row).to_owned(),
                 parent_run_id: optional_string_value(&parent_run_ids, row),

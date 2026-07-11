@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::metrics::TypedRunMetrics;
-use crate::otlp::SpanRecord;
+use crate::record::SpanRecord;
 
 const MAX_TAGS: usize = 32;
 const MAX_TAG_BYTES: usize = 128;
@@ -39,10 +39,10 @@ pub(super) struct RootLocator {
 }
 
 impl ScalarIndexes {
-    pub fn from_record(record: &SpanRecord, root: RootLocator) -> Self {
-        let attributes = parse_attributes(&record.attributes_json);
+    pub fn from_record(record: &SpanRecord, root: RootLocator) -> Result<Self> {
+        let attributes = parse_attributes(&record.attributes_json)?;
         let metrics = TypedRunMetrics::from_record(record);
-        Self {
+        Ok(Self {
             root_run_id: root.run_id,
             root_span_id: root.span_id,
             latency_nanos: metrics.latency_nanos,
@@ -58,20 +58,15 @@ impl ScalarIndexes {
             provider_name: metrics.provider_name,
             tags: extract_tags(&attributes),
             metadata: extract_metadata(&attributes),
-        }
+        })
     }
 }
 
 pub(super) async fn root_locator_for_record(
     tx: &tokio_postgres::Transaction<'_>,
     record: &SpanRecord,
-    generated_run_id: &str,
 ) -> Result<RootLocator> {
-    let own_run_id = if record.run_id.is_empty() {
-        generated_run_id.to_owned()
-    } else {
-        record.run_id.clone()
-    };
+    let own_run_id = record.run_id.clone();
 
     let Some(parent_span_id) = record.parent_span_id.as_deref() else {
         return Ok(RootLocator {
@@ -82,7 +77,7 @@ pub(super) async fn root_locator_for_record(
 
     let row = tx
         .query_opt(
-            "SELECT root_run_id, root_span_id, run_id, generated_run_id, span_id
+            "SELECT root_run_id, root_span_id, run_id, span_id
             FROM run_heads
             WHERE project_name = $1 AND trace_id = $2 AND span_id = $3
             LIMIT 1",
@@ -96,10 +91,9 @@ pub(super) async fn root_locator_for_record(
             let root_run_id: String = row.get(0);
             let root_span_id: String = row.get(1);
             let run_id: String = row.get(2);
-            let generated_run_id: String = row.get(3);
-            let span_id: String = row.get(4);
+            let span_id: String = row.get(3);
             RootLocator {
-                run_id: first_nonempty(&[&root_run_id, &run_id, &generated_run_id])
+                run_id: first_nonempty(&[&root_run_id, &run_id])
                     .unwrap_or(&own_run_id)
                     .to_owned(),
                 span_id: first_nonempty(&[&root_span_id, &span_id])
@@ -175,54 +169,15 @@ pub(super) async fn replace_run_scalar_indexes(
     Ok(())
 }
 
-pub(super) async fn refresh_project_filter_stats(
-    tx: &tokio_postgres::Transaction<'_>,
-    project_name: &str,
-) -> Result<()> {
-    let stats = [
-        (
-            "run_type",
-            count_distinct_run_head(tx, project_name, "run_type").await?,
-        ),
-        ("tag", count_distinct_tag(tx, project_name).await?),
-        (
-            "metadata_key",
-            count_distinct_metadata_key(tx, project_name).await?,
-        ),
-        (
-            "model_name",
-            count_distinct_run_head(tx, project_name, "model_name").await?,
-        ),
-        (
-            "provider_name",
-            count_distinct_run_head(tx, project_name, "provider_name").await?,
-        ),
-    ];
-
-    for (stat_name, distinct_count) in stats {
-        tx.execute(
-            "INSERT INTO project_filter_stats(project_name, stat_name, distinct_count, updated_at)
-            VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-            ON CONFLICT (project_name, stat_name)
-            DO UPDATE SET
-                distinct_count = EXCLUDED.distinct_count,
-                updated_at = CURRENT_TIMESTAMP",
-            &[&project_name, &stat_name, &distinct_count],
-        )
-        .await
-        .context("upsert project filter stat")?;
-    }
-
-    Ok(())
-}
-
 pub(super) async fn refresh_project_aggregate_rollups(
     tx: &tokio_postgres::Transaction<'_>,
     project_name: &str,
+    time_bucket_start_unix_nano: i64,
 ) -> Result<()> {
     tx.execute(
-        "DELETE FROM run_metric_rollups WHERE project_name = $1",
-        &[&project_name],
+        "DELETE FROM run_metric_rollups
+        WHERE project_name = $1 AND time_bucket_start_unix_nano = $2",
+        &[&project_name, &time_bucket_start_unix_nano],
     )
     .await
     .context("delete old run aggregate rollups")?;
@@ -240,9 +195,15 @@ pub(super) async fn refresh_project_aggregate_rollups(
                 AND deletions.trace_id = heads.trace_id
                 AND deletions.span_id = heads.span_id
             WHERE heads.project_name = $1
+                AND heads.start_time_unix_nano >= $2
+                AND heads.start_time_unix_nano < $3
                 AND heads.deleted_at_unix_nano IS NULL
                 AND deletions.span_id IS NULL",
-            &[&project_name],
+            &[
+                &project_name,
+                &time_bucket_start_unix_nano,
+                &time_bucket_start_unix_nano.saturating_add(AGGREGATE_ROLLUP_BUCKET_UNIX_NANOS),
+            ],
         )
         .await
         .context("load run heads for aggregate rollups")?;
@@ -460,7 +421,7 @@ struct RollupStats {
     evaluator_score_avg: Option<f64>,
 }
 
-fn rollup_time_bucket(start_time_unix_nano: i64) -> i64 {
+pub(super) fn rollup_time_bucket(start_time_unix_nano: i64) -> i64 {
     start_time_unix_nano.div_euclid(AGGREGATE_ROLLUP_BUCKET_UNIX_NANOS)
         * AGGREGATE_ROLLUP_BUCKET_UNIX_NANOS
 }
@@ -501,86 +462,8 @@ fn percentile_i64(sorted_values: &[i64], percentile: usize) -> Option<f64> {
     Some(sorted_values[index.min(sorted_values.len() - 1)] as f64)
 }
 
-async fn count_distinct_run_head(
-    tx: &tokio_postgres::Transaction<'_>,
-    project_name: &str,
-    column: &str,
-) -> Result<i64> {
-    let row = tx
-        .query_one(
-            format!(
-                "SELECT COUNT(DISTINCT heads.{column})
-                FROM run_heads heads
-                LEFT JOIN run_deletions deletions
-                    ON deletions.project_name = heads.project_name
-                    AND deletions.trace_id = heads.trace_id
-                    AND deletions.span_id = heads.span_id
-                WHERE heads.project_name = $1
-                    AND heads.deleted_at_unix_nano IS NULL
-                    AND deletions.span_id IS NULL"
-            )
-            .as_str(),
-            &[&project_name],
-        )
-        .await
-        .with_context(|| format!("count distinct {column}"))?;
-    Ok(row.get(0))
-}
-
-async fn count_distinct_tag(
-    tx: &tokio_postgres::Transaction<'_>,
-    project_name: &str,
-) -> Result<i64> {
-    let row = tx
-        .query_one(
-            "SELECT COUNT(DISTINCT tags.tag)
-            FROM run_tags tags
-            INNER JOIN run_heads heads
-                ON heads.project_name = tags.project_name
-                AND heads.trace_id = tags.trace_id
-                AND heads.span_id = tags.span_id
-            LEFT JOIN run_deletions deletions
-                ON deletions.project_name = tags.project_name
-                AND deletions.trace_id = tags.trace_id
-                AND deletions.span_id = tags.span_id
-            WHERE tags.project_name = $1
-                AND heads.deleted_at_unix_nano IS NULL
-                AND deletions.span_id IS NULL",
-            &[&project_name],
-        )
-        .await
-        .context("count distinct tags")?;
-    Ok(row.get(0))
-}
-
-async fn count_distinct_metadata_key(
-    tx: &tokio_postgres::Transaction<'_>,
-    project_name: &str,
-) -> Result<i64> {
-    let row = tx
-        .query_one(
-            "SELECT COUNT(DISTINCT metadata.key)
-            FROM run_metadata metadata
-            INNER JOIN run_heads heads
-                ON heads.project_name = metadata.project_name
-                AND heads.trace_id = metadata.trace_id
-                AND heads.span_id = metadata.span_id
-            LEFT JOIN run_deletions deletions
-                ON deletions.project_name = metadata.project_name
-                AND deletions.trace_id = metadata.trace_id
-                AND deletions.span_id = metadata.span_id
-            WHERE metadata.project_name = $1
-                AND heads.deleted_at_unix_nano IS NULL
-                AND deletions.span_id IS NULL",
-            &[&project_name],
-        )
-        .await
-        .context("count distinct metadata keys")?;
-    Ok(row.get(0))
-}
-
-fn parse_attributes(attributes_json: &str) -> Value {
-    serde_json::from_str(attributes_json).unwrap_or(Value::Null)
+fn parse_attributes(attributes_json: &str) -> Result<Value> {
+    serde_json::from_str(attributes_json).context("parse attributes_json for scalar indexes")
 }
 
 fn extract_tags(root: &Value) -> Vec<String> {
@@ -666,7 +549,7 @@ const METADATA_PATHS: &[&[&str]] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::otlp::RunEventKind;
+    use crate::record::RunEventKind;
 
     #[test]
     fn extracts_bounded_scalar_indexes() {
@@ -710,7 +593,8 @@ mod tests {
                 run_id: "run".to_owned(),
                 span_id: "span".to_owned(),
             },
-        );
+        )
+        .expect("build scalar indexes");
 
         assert_eq!(indexes.latency_nanos, 32);
         assert_eq!(indexes.tags, vec!["llm", "prod"]);

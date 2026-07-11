@@ -1,8 +1,29 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
+use refinery::embed_migrations;
 use serde_json::Value;
 use tokio_postgres::{NoTls, Row};
+
+const FEEDBACK_ROLLUP_BUCKET_NANOS: i64 = 60 * 60 * 1_000_000_000;
+
+mod embedded {
+    use super::embed_migrations;
+    embed_migrations!("migrations");
+}
+
+pub async fn run_migrations(postgres_url: &str) -> Result<()> {
+    let (mut client, connection) = tokio_postgres::connect(postgres_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "postgres migration connection failed");
+        }
+    });
+    embedded::migrations::runner()
+        .run_async(&mut client)
+        .await?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FeedbackRecord {
@@ -94,14 +115,18 @@ impl PostgresMetastore {
                 .await
                 .context("ensure feedback project")?;
         }
-        let old_project_name = client
+        let old_rollup_bucket = client
             .query_opt(
-                "SELECT project_name FROM feedback WHERE id = $1",
+                "SELECT project_name, created_at_unix_nano FROM feedback WHERE id = $1",
                 &[&feedback.id],
             )
             .await
-            .context("load old feedback project for rollup refresh")?
-            .and_then(|row| row.get::<_, Option<String>>(0));
+            .context("load old feedback bucket for rollup refresh")?
+            .and_then(|row| {
+                row.get::<_, Option<String>>(0).map(|project_name| {
+                    (project_name, feedback_rollup_bucket(row.get::<_, i64>(1)))
+                })
+            });
         client
             .execute(
                 "INSERT INTO feedback(
@@ -146,15 +171,19 @@ impl PostgresMetastore {
             .await
             .context("insert feedback")?;
 
-        let mut affected_projects = BTreeSet::new();
-        if let Some(project_name) = old_project_name {
-            affected_projects.insert(project_name);
+        let mut affected_buckets = BTreeSet::new();
+        if let Some(bucket) = old_rollup_bucket {
+            affected_buckets.insert(bucket);
         }
         if let Some(project_name) = feedback.project_name.clone() {
-            affected_projects.insert(project_name);
+            affected_buckets.insert((
+                project_name,
+                feedback_rollup_bucket(feedback.created_at_unix_nano),
+            ));
         }
-        for project_name in affected_projects {
-            refresh_feedback_metric_rollups(&client, &project_name).await?;
+        for (project_name, time_bucket_start_unix_nano) in affected_buckets {
+            refresh_feedback_metric_rollups(&client, &project_name, time_bucket_start_unix_nano)
+                .await?;
         }
 
         Ok(())
@@ -271,13 +300,13 @@ fn list_feedback_sql(filter: &FeedbackFilter) -> String {
 async fn refresh_feedback_metric_rollups(
     client: &tokio_postgres::Client,
     project_name: &str,
+    time_bucket_start_unix_nano: i64,
 ) -> Result<()> {
-    const BUCKET_NANOS: i64 = 60 * 60 * 1_000_000_000;
-
     client
         .execute(
-            "DELETE FROM feedback_metric_rollups WHERE project_name = $1",
-            &[&project_name],
+            "DELETE FROM feedback_metric_rollups
+            WHERE project_name = $1 AND time_bucket_start_unix_nano = $2",
+            &[&project_name, &time_bucket_start_unix_nano],
         )
         .await
         .context("delete old feedback aggregate rollups")?;
@@ -286,8 +315,14 @@ async fn refresh_feedback_metric_rollups(
         .query(
             "SELECT key, created_at_unix_nano, score_number
             FROM feedback
-            WHERE project_name = $1",
-            &[&project_name],
+            WHERE project_name = $1
+                AND created_at_unix_nano >= $2
+                AND created_at_unix_nano < $3",
+            &[
+                &project_name,
+                &time_bucket_start_unix_nano,
+                &time_bucket_start_unix_nano.saturating_add(FEEDBACK_ROLLUP_BUCKET_NANOS),
+            ],
         )
         .await
         .context("load feedback rows for aggregate rollups")?;
@@ -296,10 +331,7 @@ async fn refresh_feedback_metric_rollups(
         let key: String = row.get(0);
         let created_at_unix_nano: i64 = row.get(1);
         groups
-            .entry((
-                created_at_unix_nano.div_euclid(BUCKET_NANOS) * BUCKET_NANOS,
-                key,
-            ))
+            .entry((feedback_rollup_bucket(created_at_unix_nano), key))
             .or_default()
             .push(row.get(2));
     }
@@ -320,7 +352,7 @@ async fn refresh_feedback_metric_rollups(
                 )",
                 &[
                     &project_name,
-                    &BUCKET_NANOS,
+                    &FEEDBACK_ROLLUP_BUCKET_NANOS,
                     &time_bucket_start_unix_nano,
                     &key,
                     &stats.feedback_count,
@@ -339,6 +371,10 @@ async fn refresh_feedback_metric_rollups(
     }
 
     Ok(())
+}
+
+fn feedback_rollup_bucket(timestamp_unix_nano: i64) -> i64 {
+    timestamp_unix_nano.div_euclid(FEEDBACK_ROLLUP_BUCKET_NANOS) * FEEDBACK_ROLLUP_BUCKET_NANOS
 }
 
 #[derive(Debug, Default)]
@@ -498,7 +534,7 @@ mod tests {
 
     use super::*;
     use anyhow::anyhow;
-    use kevindb::db::run_migrations;
+    use refinery::Target;
     use serde_json::json;
     use tokio::process::{Child, Command};
     use tokio::time::sleep;
@@ -587,6 +623,72 @@ mod tests {
         let distribution: Value =
             serde_json::from_str(&rollup.get::<_, String>(3)).expect("parse distribution");
         assert_eq!(distribution["gt_1"], json!(1));
+
+        mockgres.stop().await.expect("stop mockgres");
+    }
+
+    #[tokio::test]
+    async fn upgrades_nonempty_v8_schema_through_idempotency_and_locators() {
+        let mockgres = Mockgres::start().await.expect("start mockgres");
+        let (mut client, connection) = tokio_postgres::connect(mockgres.postgres_url(), NoTls)
+            .await
+            .expect("connect postgres");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        embedded::migrations::runner()
+            .set_target(Target::Version(8))
+            .run_async(&mut client)
+            .await
+            .expect("migrate through v8");
+        client
+            .batch_execute(
+                "INSERT INTO projects(name) VALUES ('demo');
+                INSERT INTO trace_segments(
+                    project_name, uri, etag, total_bytes, span_count,
+                    min_start_time_unix_nano, max_end_time_unix_nano,
+                    time_bucket_start_unix_nano
+                ) VALUES ('demo', 'segment.vortex', 'etag', 1, 1, 1, 2, 0);
+                INSERT INTO run_events(
+                    trace_segment_id, project_name, run_id, trace_id, span_id,
+                    event_type, event_time_unix_nano, row_index
+                ) VALUES (1, 'demo', 'run-a', 'trace-a', 'span-a', 'end', 2, 0);
+                INSERT INTO run_heads(
+                    project_name, trace_id, span_id, name,
+                    start_time_unix_nano, end_time_unix_nano, status_code,
+                    last_trace_segment_id, run_type, status, is_root, run_id,
+                    last_event_type, last_event_time_unix_nano,
+                    last_row_index, last_run_event_id
+                ) VALUES (
+                    'demo', 'trace-a', 'span-a', 'run-a', 1, 2, 1,
+                    1, 'chain', 'success', true, 'run-a', 'end', 2, 0, 1
+                );",
+            )
+            .await
+            .expect("seed v8 rows");
+
+        client
+            .batch_execute(include_str!(
+                "../migrations/V9__add_run_trace_locators_and_idempotency.sql"
+            ))
+            .await
+            .expect("apply v9 upgrade");
+
+        let event_key: String = client
+            .query_one("SELECT idempotency_key FROM run_events WHERE id = 1", &[])
+            .await
+            .expect("load migrated idempotency key")
+            .get(0);
+        assert_eq!(event_key, "migrated-run-event:1");
+        let locator_count: i64 = client
+            .query_one(
+                "SELECT count(*) FROM run_locators WHERE run_id = 'run-a'",
+                &[],
+            )
+            .await
+            .expect("load migrated locator")
+            .get(0);
+        assert_eq!(locator_count, 1);
 
         mockgres.stop().await.expect("stop mockgres");
     }

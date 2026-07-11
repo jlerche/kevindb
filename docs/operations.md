@@ -23,6 +23,7 @@ Use `KEVINDB_OBJECT_STORE=s3` for S3-compatible storage.
 Required:
 
 - `KEVINDB_S3_BUCKET`
+- `KEVINDB_S3_PREFIX` to isolate one KevinDB deployment inside a bucket
 - Standard AWS credentials such as `AWS_ACCESS_KEY_ID` and
   `AWS_SECRET_ACCESS_KEY`, or another credential source supported by
   `object_store::aws::AmazonS3Builder::from_env`
@@ -32,7 +33,6 @@ Optional:
 - `KEVINDB_S3_REGION`
 - `KEVINDB_S3_ENDPOINT` for MinIO or another S3-compatible endpoint
 - `KEVINDB_S3_ALLOW_HTTP=true` for local non-TLS endpoints only
-- `KEVINDB_S3_PREFIX` to isolate one KevinDB deployment inside a bucket
 
 ## Backup And Restore
 

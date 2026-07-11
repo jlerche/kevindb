@@ -5,6 +5,40 @@ use object_store::PutPayload;
 use super::*;
 
 #[tokio::test]
+async fn manual_compaction_skips_singleton_buckets() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        Arc::new(InMemory::new()),
+        IngestConfig {
+            max_spans_per_segment: 1,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+    let hour = 60 * 60 * 1_000_000_000;
+    ingestor
+        .ingest_records(vec![
+            sample_record("1111111111111111", 1),
+            sample_record("2222222222222222", hour + 1),
+            sample_record("3333333333333333", hour + 2),
+        ])
+        .await
+        .expect("ingest mixed compaction buckets");
+
+    let receipt = ingestor
+        .compact_project("demo")
+        .await
+        .expect("compact project");
+
+    assert_eq!(receipt.compacted_runs, 2);
+    assert_eq!(receipt.compacted_segments, 2);
+    mockgres.stop().await.expect("stop mockgres");
+}
+
+#[tokio::test]
 async fn retention_policy_expires_old_runs_and_pushes_delete_masks() {
     let mockgres = Mockgres::start().await.expect("start mockgres");
     run_migrations(mockgres.postgres_url())

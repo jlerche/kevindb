@@ -15,7 +15,7 @@ use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 
 use crate::metrics::TypedRunMetrics;
-use crate::otlp::SpanRecord;
+use crate::record::SpanRecord;
 
 pub const SPAN_SEGMENT_SCHEMA_VERSION: i64 = 3;
 pub const ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION: i64 = 3;
@@ -290,7 +290,7 @@ mod tests {
             start_time_unix_nano: 1,
             end_time_unix_nano: 2,
             status_code: 1,
-            event_kind: crate::otlp::RunEventKind::End,
+            event_kind: crate::record::RunEventKind::End,
             attributes_json: "{}".to_owned(),
             idempotency_key: None,
         }

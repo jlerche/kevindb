@@ -7,10 +7,8 @@ use axum::extract::Path;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use chrono::{DateTime, SecondsFormat, Utc};
-use kevindb::otlp::{RunEventKind, SpanRecord};
-use kevindb::query::{
-    RunProjection, RunQuery, RunQueryDiagnostics, RunQueryLimits, RunSummary, generated_run_id,
-};
+use kevindb::query::{RunProjection, RunQuery, RunQueryDiagnostics, RunQueryLimits, RunSummary};
+use kevindb::{RunEventKind, SpanRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_postgres::NoTls;
@@ -153,6 +151,12 @@ pub(super) async fn list_sessions(
     State(state): State<ServerState>,
     Query(query): Query<ListSessionsQuery>,
 ) -> Result<Json<Vec<ProjectResponse>>, ApiError> {
+    if query.include_stats.unwrap_or(false) {
+        return Err(ApiError::bad_request(
+            "include_stats is unsupported; session statistics require an aggregate query"
+                .to_owned(),
+        ));
+    }
     let project_names = state
         .list_project_names(query.name.as_deref(), query.limit)
         .await?;
@@ -300,8 +304,7 @@ pub(super) async fn read_project_trace(
 pub(super) struct ListSessionsQuery {
     name: Option<String>,
     limit: Option<usize>,
-    #[allow(dead_code)]
-    include_stats: Option<String>,
+    include_stats: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -781,16 +784,9 @@ pub struct RunResponse {
 
 impl From<RunSummary> for RunResponse {
     fn from(run: RunSummary) -> Self {
-        let id = run
-            .run_id
-            .clone()
-            .unwrap_or_else(|| generated_run_id(&run.project_name, &run.trace_id, &run.span_id));
+        let id = run.run_id.clone();
         let session_id = project_uuid(&run.project_name).to_string();
-        let parent_run_id = run.parent_run_id.clone().or_else(|| {
-            run.parent_span_id.as_ref().map(|parent_span_id| {
-                generated_run_id(&run.project_name, &run.trace_id, parent_span_id)
-            })
-        });
+        let parent_run_id = run.parent_run_id.clone();
         let start_time = unix_nano_to_rfc3339(run.start_time_unix_nano);
         let end_time =
             (run.end_time_unix_nano > 0).then(|| unix_nano_to_rfc3339(run.end_time_unix_nano));

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::Json;
@@ -6,13 +7,16 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use kevindb::ingest::{FlushReceipt, IngestConfig, IngestReceipt, Ingestor};
+use kevindb::ingest::{
+    CompactionServiceConfig, FlushReceipt, IngestConfig, IngestReceipt, Ingestor,
+};
 use kevindb::query::QueryEngine;
 use kevindb_config::ServiceRole;
 use object_store::ObjectStore;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 use tokio_postgres::NoTls;
 
 pub mod cache;
@@ -95,6 +99,17 @@ impl ServerState {
 
     pub async fn flush_pending_ingest(&self) -> anyhow::Result<Vec<FlushReceipt>> {
         self.ingestor.flush().await
+    }
+
+    pub async fn run_compaction_service_loop(
+        &self,
+        config: CompactionServiceConfig,
+        interval: Duration,
+        shutdown: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        self.ingestor
+            .run_compaction_service_loop(config, interval, shutdown)
+            .await
     }
 
     fn service_role(&self) -> ServiceRole {
@@ -273,7 +288,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use kevindb::db::run_migrations;
+    use kevindb_metastore_postgres::run_migrations;
 
     #[tokio::test]
     async fn serves_otlp_ingest_and_trace_run_query() -> Result<()> {

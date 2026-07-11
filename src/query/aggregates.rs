@@ -568,10 +568,7 @@ async fn load_feedback_scores(
                 FROM run_heads heads
                 INNER JOIN feedback feedback
                     ON feedback.run_id IS NOT NULL
-                    AND (
-                        (heads.run_id <> '' AND feedback.run_id = heads.run_id)
-                        OR feedback.run_id = heads.generated_run_id
-                    )
+                    AND feedback.run_id = heads.run_id
                 WHERE {}
                 ORDER BY heads.project_name, heads.trace_id, heads.span_id,
                     feedback.key, feedback.created_at_unix_nano",

@@ -16,19 +16,19 @@ Run the HTTP server:
 
 ```bash
 KEVINDB_POSTGRES_URL=postgresql://127.0.0.1:55432/postgres \
+KEVINDB_OBJECT_STORE=memory \
 cargo run -p kevindb-server
 ```
 
-Optional environment variables:
+Environment variables:
 
 - `KEVINDB_BIND_ADDR`: socket address to bind, default `127.0.0.1:3000`.
-- `KEVINDB_OBJECT_STORE`: object store backend, `memory` or `s3`, default
-  `memory`.
+- `KEVINDB_OBJECT_STORE`: required object store backend, `memory` or `s3`.
 - `KEVINDB_S3_BUCKET`: S3 bucket, required when `KEVINDB_OBJECT_STORE=s3`.
 - `KEVINDB_S3_REGION`: optional S3 region override.
 - `KEVINDB_S3_ENDPOINT`: optional S3-compatible endpoint such as MinIO.
 - `KEVINDB_S3_ALLOW_HTTP`: allow non-TLS S3 endpoints, default `false`.
-- `KEVINDB_S3_PREFIX`: optional bucket prefix for this deployment.
+- `KEVINDB_S3_PREFIX`: required bucket prefix for this deployment when using S3.
 - `KEVINDB_CACHE_MODE`: object-store cache mode, `memory` or `hybrid`,
   default `memory`.
 - `KEVINDB_CACHE_MEMORY_CAPACITY_BYTES`: in-memory cache capacity, default

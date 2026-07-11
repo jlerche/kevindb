@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS run_events (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     trace_segment_id BIGINT NOT NULL REFERENCES trace_segments(id) ON DELETE CASCADE,
     project_name TEXT NOT NULL,
-    run_id TEXT NOT NULL DEFAULT '',
+    run_id TEXT NOT NULL,
     trace_id TEXT NOT NULL,
     span_id TEXT NOT NULL,
     event_type TEXT NOT NULL,
@@ -47,5 +47,4 @@ CREATE INDEX IF NOT EXISTS ix_run_events_project_trace_time
     ON run_events(project_name, trace_id, event_time_unix_nano);
 
 CREATE INDEX IF NOT EXISTS ix_run_events_run_id_time
-    ON run_events(run_id, event_time_unix_nano)
-    WHERE run_id <> '';
+    ON run_events(run_id, event_time_unix_nano);

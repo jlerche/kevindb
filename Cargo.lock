@@ -2607,19 +2607,19 @@ dependencies = [
  "fst",
  "futures-util",
  "hex",
+ "kevindb-core",
+ "kevindb-metastore-postgres",
  "kevindb-otlp",
  "object_store",
  "opentelemetry-proto",
  "portpicker",
  "prost",
- "refinery",
  "serde",
  "serde_json",
  "tokio",
  "tokio-postgres",
  "tracing",
  "url",
- "uuid",
  "vortex",
  "vortex-datafusion",
 ]
@@ -2646,12 +2646,19 @@ name = "kevindb-config"
 version = "0.0.1"
 
 [[package]]
+name = "kevindb-core"
+version = "0.0.1"
+dependencies = [
+ "uuid",
+]
+
+[[package]]
 name = "kevindb-metastore-postgres"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "kevindb",
  "portpicker",
+ "refinery",
  "serde_json",
  "tokio",
  "tokio-postgres",
@@ -2664,7 +2671,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "hex",
- "kevindb",
+ "kevindb-core",
  "opentelemetry-proto",
  "serde_json",
 ]

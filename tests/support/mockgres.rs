@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use kevindb::db::run_migrations;
+use kevindb_metastore_postgres::run_migrations;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
 use tokio_postgres::NoTls;

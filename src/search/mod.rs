@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use fst::automaton::Str;
 use fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
 
-use crate::otlp::SpanRecord;
+use crate::record::SpanRecord;
 
 mod codec;
 mod indexer;
@@ -848,7 +848,7 @@ pub(super) fn path_matches_pattern(path: &str, pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::otlp::RunEventKind;
+    use crate::record::RunEventKind;
     use crate::search::codec::MAGIC;
 
     #[test]

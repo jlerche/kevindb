@@ -408,7 +408,7 @@ Phase 2 evidence:
 
 - `src/query/filter.rs` and `src/query/filter/parser.rs` implement the filter
   AST/parser/compiler for the indexed LangSmith filter surface.
-- `src/db/migrations/V11__add_phase2_filter_indexes.sql` adds scalar run-head,
+- `crates/kevindb-metastore-postgres/migrations/V11__add_phase2_filter_indexes.sql` adds scalar run-head,
   tag, metadata, feedback, and project-cardinality indexes.
 - `src/ingest/indexes.rs` materializes bounded scalar indexes and refreshes
   `project_filter_stats` with `COUNT(DISTINCT ...)`.

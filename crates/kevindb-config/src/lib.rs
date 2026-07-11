@@ -11,7 +11,6 @@ pub const DEFAULT_CACHE_MEMORY_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_CACHE_MODE: &str = "memory";
 pub const DEFAULT_INGEST_MAX_FLUSH_DELAY_MS: u64 = 500;
 pub const DEFAULT_INGEST_MAX_SPANS_PER_SEGMENT: usize = 1024;
-pub const DEFAULT_OBJECT_STORE: &str = "memory";
 pub const DEFAULT_RUN_MIGRATIONS: bool = true;
 pub const DEFAULT_SERVICE_ROLE: &str = "all";
 pub const ENV_BIND_ADDR: &str = "KEVINDB_BIND_ADDR";
@@ -130,10 +129,10 @@ impl ServiceRole {
     pub fn parse(value: &str) -> Result<Self, ConfigError> {
         match value.to_ascii_lowercase().as_str() {
             "all" => Ok(Self::All),
-            "ingest" | "ingestion" => Ok(Self::Ingest),
+            "ingest" => Ok(Self::Ingest),
             "query" => Ok(Self::Query),
-            "compaction" | "compactor" => Ok(Self::Compaction),
-            "coordination" | "coordinator" | "cluster-manager" => Ok(Self::Coordinator),
+            "compaction" => Ok(Self::Compaction),
+            "coordinator" => Ok(Self::Coordinator),
             _ => Err(ConfigError::UnsupportedServiceRole {
                 value: value.to_owned(),
             }),
@@ -163,7 +162,7 @@ pub struct S3ObjectStoreConfig {
     pub region: Option<String>,
     pub endpoint: Option<String>,
     pub allow_http: bool,
-    pub prefix: Option<String>,
+    pub prefix: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,9 +176,7 @@ impl ObjectStoreConfig {
     where
         F: FnMut(&str) -> Option<String>,
     {
-        match object_store_kind(
-            &lookup(ENV_OBJECT_STORE).unwrap_or_else(|| DEFAULT_OBJECT_STORE.to_owned()),
-        )? {
+        match object_store_kind(&non_empty_env(ENV_OBJECT_STORE, lookup(ENV_OBJECT_STORE))?)? {
             ObjectStoreKind::Memory => Ok(Self::Memory),
             ObjectStoreKind::S3 => Ok(Self::S3(S3ObjectStoreConfig {
                 bucket: non_empty_env(ENV_S3_BUCKET, lookup(ENV_S3_BUCKET))?,
@@ -189,7 +186,7 @@ impl ObjectStoreConfig {
                     ENV_S3_ALLOW_HTTP,
                     lookup(ENV_S3_ALLOW_HTTP).unwrap_or_else(|| "false".to_owned()),
                 )?,
-                prefix: optional_non_empty(lookup(ENV_S3_PREFIX)),
+                prefix: non_empty_env(ENV_S3_PREFIX, lookup(ENV_S3_PREFIX))?,
             })),
         }
     }
@@ -198,7 +195,7 @@ impl ObjectStoreConfig {
 fn object_store_kind(value: &str) -> Result<ObjectStoreKind, ConfigError> {
     match value.to_ascii_lowercase().as_str() {
         "memory" => Ok(ObjectStoreKind::Memory),
-        "s3" | "aws" | "amazon-s3" => Ok(ObjectStoreKind::S3),
+        "s3" => Ok(ObjectStoreKind::S3),
         _ => Err(ConfigError::UnsupportedObjectStore {
             value: value.to_owned(),
         }),
@@ -357,10 +354,26 @@ fn optional_non_empty(value: Option<String>) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn test_config<I, K, V>(vars: I) -> Result<ServerConfig, ConfigError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let mut vars = vars
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect::<Vec<_>>();
+        if !vars.iter().any(|(key, _)| key == ENV_OBJECT_STORE) {
+            vars.push((ENV_OBJECT_STORE.to_owned(), "memory".to_owned()));
+        }
+        ServerConfig::from_env_vars(vars)
+    }
+
     #[test]
     fn parses_required_postgres_url_with_defaults() {
-        let config = ServerConfig::from_env_vars([(ENV_POSTGRES_URL, "postgresql://db/postgres")])
-            .expect("parse config");
+        let config =
+            test_config([(ENV_POSTGRES_URL, "postgresql://db/postgres")]).expect("parse config");
 
         assert_eq!(config.postgres_url, "postgresql://db/postgres");
         assert_eq!(config.node_id, None);
@@ -392,7 +405,7 @@ mod tests {
 
     #[test]
     fn parses_explicit_server_values() {
-        let config = ServerConfig::from_env_vars([
+        let config = test_config([
             (ENV_POSTGRES_URL, "postgresql://db/postgres"),
             (ENV_BIND_ADDR, "0.0.0.0:8080"),
             (ENV_NODE_ID, "node-a"),
@@ -435,7 +448,7 @@ mod tests {
 
     #[test]
     fn parses_s3_object_store_values() {
-        let config = ServerConfig::from_env_vars([
+        let config = test_config([
             (ENV_POSTGRES_URL, "postgresql://db/postgres"),
             (ENV_OBJECT_STORE, "s3"),
             (ENV_S3_BUCKET, "kevindb"),
@@ -453,15 +466,14 @@ mod tests {
                 region: Some("us-east-1".to_owned()),
                 endpoint: Some("http://minio:9000".to_owned()),
                 allow_http: true,
-                prefix: Some("dev".to_owned()),
+                prefix: "dev".to_owned(),
             })
         );
     }
 
     #[test]
     fn rejects_missing_postgres_url() {
-        let error = ServerConfig::from_env_vars(Vec::<(String, String)>::new())
-            .expect_err("missing postgres url");
+        let error = test_config(Vec::<(String, String)>::new()).expect_err("missing postgres url");
 
         assert_eq!(
             error,
@@ -472,8 +484,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_object_store() {
+        let error = ServerConfig::from_env_vars([(ENV_POSTGRES_URL, "postgresql://db/postgres")])
+            .expect_err("missing object store");
+
+        assert_eq!(
+            error,
+            ConfigError::MissingEnv {
+                name: ENV_OBJECT_STORE
+            }
+        );
+    }
+
+    #[test]
     fn rejects_invalid_bind_addr() {
-        let error = ServerConfig::from_env_vars([
+        let error = test_config([
             (ENV_POSTGRES_URL, "postgresql://db/postgres"),
             (ENV_BIND_ADDR, "not-a-socket"),
         ])
@@ -489,7 +514,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_object_store() {
-        let error = ServerConfig::from_env_vars([
+        let error = test_config([
             (ENV_POSTGRES_URL, "postgresql://db/postgres"),
             (ENV_OBJECT_STORE, "local"),
         ])
@@ -505,7 +530,7 @@ mod tests {
 
     #[test]
     fn rejects_s3_without_bucket() {
-        let err = ServerConfig::from_env_vars([
+        let err = test_config([
             (ENV_POSTGRES_URL, "postgresql://db/postgres"),
             (ENV_OBJECT_STORE, "s3"),
         ])
@@ -520,8 +545,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_s3_without_prefix() {
+        let err = test_config([
+            (ENV_POSTGRES_URL, "postgresql://db/postgres"),
+            (ENV_OBJECT_STORE, "s3"),
+            (ENV_S3_BUCKET, "kevindb"),
+        ])
+        .expect_err("s3 prefix is required");
+
+        assert_eq!(
+            err,
+            ConfigError::MissingEnv {
+                name: ENV_S3_PREFIX
+            }
+        );
+    }
+
+    #[test]
     fn rejects_invalid_s3_allow_http() {
-        let err = ServerConfig::from_env_vars([
+        let err = test_config([
             (ENV_POSTGRES_URL, "postgresql://db/postgres"),
             (ENV_OBJECT_STORE, "s3"),
             (ENV_S3_BUCKET, "kevindb"),
@@ -540,7 +582,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_run_migrations_bool() {
-        let err = ServerConfig::from_env_vars([
+        let err = test_config([
             (ENV_POSTGRES_URL, "postgresql://db/postgres"),
             (ENV_RUN_MIGRATIONS, "sometimes"),
         ])
@@ -557,7 +599,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_service_role() {
-        let error = ServerConfig::from_env_vars([
+        let error = test_config([
             (ENV_POSTGRES_URL, "postgresql://db/postgres"),
             (ENV_SERVICE_ROLE, "everything"),
         ])
@@ -573,7 +615,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_cache_mode() {
-        let error = ServerConfig::from_env_vars([
+        let error = test_config([
             (ENV_POSTGRES_URL, "postgresql://db/postgres"),
             (ENV_CACHE_MODE, "disk"),
         ])
@@ -589,7 +631,7 @@ mod tests {
 
     #[test]
     fn rejects_hybrid_cache_without_dir() {
-        let error = ServerConfig::from_env_vars([
+        let error = test_config([
             (ENV_POSTGRES_URL, "postgresql://db/postgres"),
             (ENV_CACHE_MODE, "hybrid"),
         ])
@@ -605,7 +647,7 @@ mod tests {
 
     #[test]
     fn rejects_zero_ingest_segment_size() {
-        let error = ServerConfig::from_env_vars([
+        let error = test_config([
             (ENV_POSTGRES_URL, "postgresql://db/postgres"),
             (ENV_INGEST_MAX_SPANS_PER_SEGMENT, "0"),
         ])
@@ -622,7 +664,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_ingest_flush_delay() {
-        let error = ServerConfig::from_env_vars([
+        let error = test_config([
             (ENV_POSTGRES_URL, "postgresql://db/postgres"),
             (ENV_INGEST_MAX_FLUSH_DELAY_MS, "soon"),
         ])
@@ -639,7 +681,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_cache_size() {
-        let error = ServerConfig::from_env_vars([
+        let error = test_config([
             (ENV_POSTGRES_URL, "postgresql://db/postgres"),
             (ENV_CACHE_MEMORY_CAPACITY_BYTES, "0"),
         ])

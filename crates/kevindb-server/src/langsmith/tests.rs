@@ -18,7 +18,7 @@ fn builds_langsmith_run_response_fields() {
     let parent_run_id = "22222222-2222-5222-8222-222222222222";
     let response = RunResponse::from(RunSummary {
         project_name: "demo".to_owned(),
-        run_id: Some(run_id.to_owned()),
+        run_id: run_id.to_owned(),
         trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
         span_id: "1111111111111111".to_owned(),
         parent_run_id: Some(parent_run_id.to_owned()),

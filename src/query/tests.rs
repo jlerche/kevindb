@@ -3,7 +3,7 @@ use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
-use crate::otlp::SpanRecord;
+use crate::record::SpanRecord;
 use crate::segment::encode_span_records;
 
 const TRACE_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -384,7 +384,7 @@ fn datafusion_sql_omits_candidate_key_pushdown_when_row_locators_exist() {
 }
 
 #[test]
-fn candidate_run_key_source_pushdown_is_not_capped_at_legacy_threshold() {
+fn candidate_run_key_source_pushdown_handles_large_key_sets() {
     let candidate_run_keys = (0..1025)
         .map(|index| RunKey {
             project_name: "demo".to_owned(),
@@ -408,7 +408,7 @@ fn run(
 ) -> RunSummary {
     RunSummary {
         project_name: project_name.to_owned(),
-        run_id: None,
+        run_id: name.to_owned(),
         trace_id: trace_id.to_owned(),
         span_id: name.to_owned(),
         parent_run_id: None,
@@ -452,7 +452,7 @@ fn span_record(
         start_time_unix_nano,
         end_time_unix_nano,
         status_code,
-        event_kind: crate::otlp::RunEventKind::End,
+        event_kind: crate::record::RunEventKind::End,
         attributes_json: "{}".to_owned(),
         idempotency_key: None,
     }

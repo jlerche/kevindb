@@ -9,11 +9,10 @@ use datafusion::prelude::SessionContext;
 use object_store::ObjectStore;
 use tokio_postgres::NoTls;
 use url::Url;
-use uuid::Uuid;
 use vortex_datafusion::VortexFormatFactory;
 
 use crate::ingest::refresh_trace_materialized_metadata;
-use crate::otlp::RunEventKind;
+use crate::record::RunEventKind;
 const MAX_DATAFUSION_SEGMENTS_PER_BATCH: usize = 8;
 
 mod aggregates;
@@ -42,7 +41,7 @@ pub use distributed::{
     DistributedQueryCancellation, DistributedQueryConfig, DistributedQueryDiagnostics,
     DistributedQueryPartitionDiagnostics, DistributedRunAggregateResult, DistributedRunQueryResult,
 };
-use filter::FilterExpr;
+pub use filter::FilterExpr;
 use object_store_stats::{
     MeasuringObjectStore, ObjectStoreReadLimits, ObjectStoreReadSnapshot, datafusion_batch_query,
     enforce_runtime_object_store_limits, page_datafusion_runs,
@@ -67,7 +66,7 @@ pub use tree_filter::{TreeFilterExpr, TreeFilterMode, TreeFilterScope};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunSummary {
     pub project_name: String,
-    pub run_id: Option<String>,
+    pub run_id: String,
     pub trace_id: String,
     pub span_id: String,
     pub parent_run_id: Option<String>,
@@ -382,14 +381,6 @@ fn query_without_wall_time_limit(mut query: RunQuery) -> RunQuery {
     query
 }
 
-pub fn generated_run_id(project_name: &str, trace_id: &str, span_id: &str) -> String {
-    Uuid::new_v5(
-        &Uuid::NAMESPACE_URL,
-        format!("kevindb:run:{project_name}:{trace_id}:{span_id}").as_bytes(),
-    )
-    .to_string()
-}
-
 async fn delete_run_in_tx(
     tx: &tokio_postgres::Transaction<'_>,
     project_name: &str,
@@ -408,7 +399,7 @@ async fn delete_run_in_tx(
                 AND trace_id = $2
                 AND span_id = $3
                 AND deleted_at_unix_nano IS NULL
-            RETURNING run_id, generated_run_id, last_trace_segment_id, last_row_index",
+            RETURNING run_id, last_trace_segment_id, last_row_index",
             &[
                 &project_name,
                 &trace_id,
@@ -424,9 +415,8 @@ async fn delete_run_in_tx(
         return Ok(false);
     };
     let run_id: String = deleted_row.get(0);
-    let _generated_run_id: String = deleted_row.get(1);
-    let trace_segment_id: i64 = deleted_row.get(2);
-    let row_index: i64 = deleted_row.get(3);
+    let trace_segment_id: i64 = deleted_row.get(1);
+    let row_index: i64 = deleted_row.get(2);
 
     let event_type = RunEventKind::Tombstone.as_str();
     let idempotency_key =
@@ -765,7 +755,7 @@ fn run_head_datafusion_sql(
             FROM (
                 SELECT
                     project_name,
-                    NULLIF(run_id, '') AS run_id,
+                    run_id,
                     trace_id,
                     span_id,
                     parent_run_id,

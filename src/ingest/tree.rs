@@ -2,14 +2,11 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 
-use crate::query::generated_run_id;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunTreeInput {
     span_id: String,
     parent_span_id: Option<String>,
     run_id: String,
-    generated_run_id: String,
     start_time_unix_nano: i64,
 }
 
@@ -17,7 +14,6 @@ struct RunTreeInput {
 struct RunTreeIndexNode {
     span_id: String,
     run_id: String,
-    generated_run_id: String,
     parent_span_id: Option<String>,
     root_span_id: String,
     root_run_id: String,
@@ -41,7 +37,6 @@ pub(super) async fn refresh_trace_tree_metadata(
                 heads.span_id,
                 heads.parent_span_id,
                 heads.run_id,
-                heads.generated_run_id,
                 heads.start_time_unix_nano
             FROM run_heads heads
             LEFT JOIN run_deletions deletions
@@ -59,20 +54,11 @@ pub(super) async fn refresh_trace_tree_metadata(
         .context("load run heads for tree refresh")?;
     let inputs = rows
         .into_iter()
-        .map(|row| {
-            let span_id: String = row.get(0);
-            let generated: String = row.get(3);
-            RunTreeInput {
-                span_id: span_id.clone(),
-                parent_span_id: row.get(1),
-                run_id: row.get(2),
-                generated_run_id: if generated.is_empty() {
-                    generated_run_id(project_name, trace_id, &span_id)
-                } else {
-                    generated
-                },
-                start_time_unix_nano: row.get(4),
-            }
+        .map(|row| RunTreeInput {
+            span_id: row.get(0),
+            parent_span_id: row.get(1),
+            run_id: row.get(2),
+            start_time_unix_nano: row.get(3),
         })
         .collect::<Vec<_>>();
     let nodes = build_trace_tree_index(inputs);
@@ -93,17 +79,16 @@ pub(super) async fn refresh_trace_tree_metadata(
     for node in nodes {
         tx.execute(
             "INSERT INTO run_tree_nodes(
-                project_name, trace_id, span_id, run_id, generated_run_id, parent_span_id,
+                project_name, trace_id, span_id, run_id, parent_span_id,
                 root_span_id, root_run_id, depth, sibling_order, subtree_start, subtree_end,
                 descendant_count, unresolved_parent, cycle_detected, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, CURRENT_TIMESTAMP)",
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, CURRENT_TIMESTAMP)",
             &[
                 &project_name,
                 &trace_id,
                 &node.span_id,
                 &node.run_id,
-                &node.generated_run_id,
                 &node.parent_span_id,
                 &node.root_span_id,
                 &node.root_run_id,
@@ -306,7 +291,6 @@ fn visit_tree_node(
     nodes.push(RunTreeIndexNode {
         span_id: input.run.span_id.clone(),
         run_id: input.run.run_id.clone(),
-        generated_run_id: input.run.generated_run_id.clone(),
         parent_span_id: input.effective_parent.clone(),
         root_span_id: root_span_id.to_owned(),
         root_run_id: root_run_id.to_owned(),
@@ -322,11 +306,7 @@ fn visit_tree_node(
 }
 
 fn stable_run_id(run: &RunTreeInput) -> String {
-    if !run.run_id.is_empty() {
-        run.run_id.clone()
-    } else {
-        run.generated_run_id.clone()
-    }
+    run.run_id.clone()
 }
 
 #[cfg(test)]
@@ -380,7 +360,6 @@ mod tests {
             span_id: span_id.to_owned(),
             parent_span_id: parent_span_id.map(str::to_owned),
             run_id: format!("run-{span_id}"),
-            generated_run_id: format!("generated-{span_id}"),
             start_time_unix_nano,
         }
     }

@@ -7,8 +7,8 @@ use object_store::path::Path;
 use object_store::{ObjectStoreExt, PutPayload};
 
 use super::*;
-use crate::otlp::{RunEventKind, SpanRecord};
 use crate::query::SegmentSource;
+use crate::record::{RunEventKind, SpanRecord};
 use crate::segment::encode_span_records;
 
 const TRACE_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

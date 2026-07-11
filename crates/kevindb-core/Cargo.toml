@@ -1,0 +1,8 @@
+[package]
+name = "kevindb-core"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.92"
+
+[dependencies]
+uuid = { version = "1.23.4", features = ["v5"] }
