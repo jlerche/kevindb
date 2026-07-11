@@ -7,8 +7,8 @@ use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
 
 use super::*;
-use crate::generated_run_id;
 use crate::query::{QueryEngine, RunProjection, RunQuery};
+use kevindb_core::generated_run_id;
 use kevindb_metastore_postgres::run_migrations;
 
 #[test]
@@ -21,6 +21,26 @@ fn deduplicates_idempotency_keys_within_a_flush() {
     let records = deduplicate_records(vec![first.clone(), duplicate]);
 
     assert_eq!(records, vec![first]);
+}
+
+#[tokio::test]
+async fn invalid_record_does_not_poison_pending_ingest() {
+    let ingestor = Ingestor::in_memory("postgresql://invalid");
+    let mut invalid = sample_record("1111111111111111", 10);
+    invalid.attributes_json = "{".to_owned();
+
+    let error = ingestor
+        .ingest_records(vec![invalid])
+        .await
+        .expect_err("invalid JSON must fail before buffering");
+    assert!(error.to_string().contains("attributes_json"));
+
+    let receipt = ingestor
+        .ingest_records(Vec::new())
+        .await
+        .expect("empty ingest remains usable after validation failure");
+    assert_eq!(receipt.accepted_spans, 0);
+    assert!(ingestor.pending.lock().await.buffers.is_empty());
 }
 
 mod phase1;
@@ -103,7 +123,7 @@ async fn ingest_records_flushes_to_object_store_and_postgres() {
         .await
         .expect("load trace segment schema version")
         .get(0);
-    let search_index_uri: Option<String> = client
+    let search_index_uri: String = client
         .query_one("SELECT search_index_uri FROM trace_segments", &[])
         .await
         .expect("load search index uri")
@@ -127,7 +147,6 @@ async fn ingest_records_flushes_to_object_store_and_postgres() {
     assert_eq!(run_locator_count, 2);
     assert_eq!(trace_locator_count, 2);
     assert_eq!(schema_version, crate::segment::SPAN_SEGMENT_SCHEMA_VERSION);
-    let search_index_uri = search_index_uri.expect("search index uri");
     assert!(
         object_store
             .head(&Path::from(search_index_uri.as_str()))

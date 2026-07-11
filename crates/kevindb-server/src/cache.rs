@@ -180,7 +180,7 @@ impl ObjectStore for CachedObjectStore {
         let request_key = cache_key(&path, options.range.as_ref());
         if let Some(read) = self.lookup(&request_key).await {
             crate::metrics::record_cache_hit();
-            return Ok(read.into_get_result(Attributes::new()));
+            return read.into_get_result(Attributes::new());
         }
         if options.range.is_some()
             && let Some(full_read) = self.lookup(&cache_key(&path, None)).await
@@ -188,7 +188,7 @@ impl ObjectStore for CachedObjectStore {
         {
             self.insert(&path, request_key, read.clone());
             crate::metrics::record_cache_hit();
-            return Ok(read.into_get_result(Attributes::new()));
+            return read.into_get_result(Attributes::new());
         }
 
         let result = self.inner.get_opts(location, options).await?;
@@ -196,7 +196,7 @@ impl ObjectStore for CachedObjectStore {
         let attributes = result.attributes.clone();
         let read = CachedObjectRead::from_get_result(result).await?;
         self.insert(&path, request_key, read.clone());
-        Ok(read.into_get_result(attributes))
+        read.into_get_result(attributes)
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
@@ -301,22 +301,32 @@ impl CachedObjectRead {
         })
     }
 
-    fn into_get_result(self, attributes: Attributes) -> GetResult {
+    fn into_get_result(self, attributes: Attributes) -> Result<GetResult> {
         let range = self.range_start..self.range_end;
         let bytes = Bytes::from(self.bytes);
-        GetResult {
+        let last_modified = DateTime::<Utc>::from_timestamp_millis(self.last_modified_millis)
+            .ok_or_else(|| object_store::Error::Generic {
+                store: "kevindb-object-store-cache",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "cached object has invalid last_modified_millis: {}",
+                        self.last_modified_millis
+                    ),
+                )),
+            })?;
+        Ok(GetResult {
             payload: GetResultPayload::Stream(stream::once(async move { Ok(bytes) }).boxed()),
             meta: ObjectMeta {
                 location: Path::from(self.location.as_str()),
-                last_modified: DateTime::<Utc>::from_timestamp_millis(self.last_modified_millis)
-                    .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch")),
+                last_modified,
                 size: self.size,
                 e_tag: self.e_tag,
                 version: self.version,
             },
             range,
             attributes,
-        }
+        })
     }
 
     fn weight(&self) -> usize {
@@ -476,6 +486,22 @@ mod tests {
 
         assert_eq!(writer.get_range(&path, 7..12).await?, b"local".as_slice());
         Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_cached_timestamps() {
+        let read = CachedObjectRead {
+            bytes: Vec::new(),
+            location: "segments/corrupt.vortex".to_owned(),
+            last_modified_millis: i64::MAX,
+            size: 0,
+            e_tag: None,
+            version: None,
+            range_start: 0,
+            range_end: 0,
+        };
+
+        assert!(read.into_get_result(Attributes::new()).is_err());
     }
 
     #[tokio::test]

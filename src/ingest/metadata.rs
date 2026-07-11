@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
+use std::fmt::{Display, Formatter};
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::record::SpanRecord;
 use crate::segment::SPAN_SEGMENT_SCHEMA_VERSION;
+use kevindb_core::{SpanRecord, generated_project_id};
 
 use super::indexes::{
     ScalarIndexes, refresh_project_aggregate_rollups, replace_run_scalar_indexes,
@@ -14,9 +15,19 @@ use super::thread::{refresh_trace_thread_metadata, replace_run_preview};
 use super::tree::refresh_trace_tree_metadata;
 use super::{PartitionKey, event_time_unix_nano, run_event_idempotency_key, status_from_record};
 
+#[derive(Debug)]
+pub(super) struct RunIdCollision;
+
+impl Display for RunIdCollision {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("run_id already belongs to a different run")
+    }
+}
+
+impl std::error::Error for RunIdCollision {}
+
 pub(super) struct SegmentObjectMetadata<'a> {
     pub segment_uri: &'a str,
-    pub etag: &'a str,
     pub total_bytes: usize,
     pub search_index_uri: &'a str,
     pub search_index_bytes: usize,
@@ -37,38 +48,38 @@ pub(super) async fn persist_metadata(
         .iter()
         .map(|record| record.start_time_unix_nano)
         .min()
-        .unwrap_or(0);
-    let max_end = records
-        .iter()
-        .map(|record| record.end_time_unix_nano)
-        .max()
-        .unwrap_or(0);
-
+        .expect("nonempty records were checked above");
     tx.execute(
-        "INSERT INTO projects(name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
-        &[&first.project_name],
+        "INSERT INTO projects(name, id) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING",
+        &[
+            &first.project_name,
+            &generated_project_id(&first.project_name),
+        ],
     )
     .await
     .context("upsert project")?;
+    tx.query_one(
+        "SELECT name FROM projects WHERE name = $1 FOR UPDATE",
+        &[&first.project_name],
+    )
+    .await
+    .context("lock project metadata refresh")?;
 
     let row = tx
         .query_one(
             "INSERT INTO trace_segments(
-                project_name, uri, etag, total_bytes, span_count,
-                min_start_time_unix_nano, max_end_time_unix_nano,
-                time_bucket_start_unix_nano, schema_version,
+                project_name, uri, total_bytes, span_count,
+                min_start_time_unix_nano, time_bucket_start_unix_nano, schema_version,
                 search_index_uri, search_index_bytes, search_index_schema_version
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING id",
             &[
                 &first.project_name,
                 &object_metadata.segment_uri,
-                &object_metadata.etag,
                 &(object_metadata.total_bytes as i64),
                 &(records.len() as i64),
                 &min_start,
-                &max_end,
                 &partition.time_bucket_start_unix_nano,
                 &SPAN_SEGMENT_SCHEMA_VERSION,
                 &object_metadata.search_index_uri,
@@ -125,54 +136,39 @@ pub(super) async fn persist_metadata(
 
         tx.execute(
             "INSERT INTO trace_segment_spans(
-                trace_segment_id, project_name, run_id, trace_id, span_id,
-                parent_run_id, parent_span_id,
-                name, run_type, start_time_unix_nano, end_time_unix_nano,
-                status_code, status, is_root, row_index, event_type, event_time_unix_nano
+                trace_segment_id, project_name, trace_id, span_id, row_index
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+            VALUES ($1, $2, $3, $4, $5)",
             &[
                 &segment_id,
                 &record.project_name,
-                &record.run_id,
                 &record.trace_id,
                 &record.span_id,
-                &record.parent_run_id,
-                &record.parent_span_id,
-                &record.name,
-                &record.run_type,
-                &record.start_time_unix_nano,
-                &record.end_time_unix_nano,
-                &record.status_code,
-                &status_from_record(record),
-                &record.parent_span_id.is_none(),
                 &(row_index as i64),
-                &record.event_kind.as_str(),
-                &event_time_unix_nano(record),
             ],
         )
         .await
         .context("insert trace segment span")?;
 
-        let run_head_updated = tx
-            .execute(
+        let run_head_updated =
+            tx.execute(
                 "INSERT INTO run_heads(
                 project_name, run_id,
                 trace_id, span_id, parent_run_id, parent_span_id,
                 name, run_type,
-                start_time_unix_nano, end_time_unix_nano, status_code, status, is_root,
+                start_time_unix_nano, end_time_unix_nano, status, is_root,
                 root_run_id, root_span_id, latency_nanos,
                 prompt_tokens, completion_tokens, total_tokens,
                 prompt_cost, completion_cost, total_cost,
                 first_token_latency_nanos, evaluator_score,
                 model_name, provider_name,
                 last_trace_segment_id, last_row_index,
-                last_event_type, last_event_time_unix_nano, last_run_event_id, updated_at
+                last_event_type, last_event_time_unix_nano, last_run_event_id
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                 $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25,
-                $26, $27, $28, $29, $30, $31, CURRENT_TIMESTAMP
+                $26, $27, $28, $29, $30
             )
             ON CONFLICT (project_name, trace_id, span_id)
             DO UPDATE SET
@@ -183,7 +179,6 @@ pub(super) async fn persist_metadata(
                 run_type = EXCLUDED.run_type,
                 start_time_unix_nano = EXCLUDED.start_time_unix_nano,
                 end_time_unix_nano = EXCLUDED.end_time_unix_nano,
-                status_code = EXCLUDED.status_code,
                 status = EXCLUDED.status,
                 is_root = EXCLUDED.is_root,
                 root_run_id = EXCLUDED.root_run_id,
@@ -204,13 +199,11 @@ pub(super) async fn persist_metadata(
                 last_event_type = EXCLUDED.last_event_type,
                 last_event_time_unix_nano = EXCLUDED.last_event_time_unix_nano,
                 last_run_event_id = EXCLUDED.last_run_event_id,
-                deleted_at_unix_nano = NULL,
-                deletion_reason = NULL,
-                updated_at = CURRENT_TIMESTAMP
+                deleted_at_unix_nano = NULL
             WHERE run_heads.last_event_time_unix_nano < EXCLUDED.last_event_time_unix_nano
                 OR (
                     run_heads.last_event_time_unix_nano = EXCLUDED.last_event_time_unix_nano
-                    AND COALESCE(run_heads.last_run_event_id, 0) <= EXCLUDED.last_run_event_id
+                    AND run_heads.last_run_event_id <= EXCLUDED.last_run_event_id
                 )",
                 &[
                     &record.project_name,
@@ -223,7 +216,6 @@ pub(super) async fn persist_metadata(
                     &record.run_type,
                     &record.start_time_unix_nano,
                     &record.end_time_unix_nano,
-                    &record.status_code,
                     &status_from_record(record),
                     &record.parent_span_id.is_none(),
                     &scalar_indexes.root_run_id,
@@ -247,8 +239,15 @@ pub(super) async fn persist_metadata(
                 ],
             )
             .await
-            .context("upsert run head")?
-            > 0;
+            .map_err(|error| {
+                if error.as_db_error().is_some_and(|database_error| {
+                    database_error.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+                }) {
+                    anyhow::Error::new(RunIdCollision).context("upsert run head")
+                } else {
+                    anyhow::Error::new(error).context("upsert run head")
+                }
+            })? > 0;
 
         if run_head_updated {
             replace_run_scalar_indexes(tx, record, &scalar_indexes).await?;
@@ -279,12 +278,11 @@ pub(super) async fn persist_metadata(
                 row_index = EXCLUDED.row_index,
                 event_type = EXCLUDED.event_type,
                 event_time_unix_nano = EXCLUDED.event_time_unix_nano,
-                run_event_id = EXCLUDED.run_event_id,
-                updated_at = CURRENT_TIMESTAMP
+                run_event_id = EXCLUDED.run_event_id
             WHERE run_locators.event_time_unix_nano < EXCLUDED.event_time_unix_nano
                 OR (
                     run_locators.event_time_unix_nano = EXCLUDED.event_time_unix_nano
-                    AND COALESCE(run_locators.run_event_id, 0) <= EXCLUDED.run_event_id
+                    AND run_locators.run_event_id <= EXCLUDED.run_event_id
                 )",
             &[
                 &record.project_name,
@@ -313,12 +311,11 @@ pub(super) async fn persist_metadata(
                 row_index = EXCLUDED.row_index,
                 event_type = EXCLUDED.event_type,
                 event_time_unix_nano = EXCLUDED.event_time_unix_nano,
-                run_event_id = EXCLUDED.run_event_id,
-                updated_at = CURRENT_TIMESTAMP
+                run_event_id = EXCLUDED.run_event_id
             WHERE trace_locators.event_time_unix_nano < EXCLUDED.event_time_unix_nano
                 OR (
                     trace_locators.event_time_unix_nano = EXCLUDED.event_time_unix_nano
-                    AND COALESCE(trace_locators.run_event_id, 0) <= EXCLUDED.run_event_id
+                    AND trace_locators.run_event_id <= EXCLUDED.run_event_id
                 )",
             &[
                 &record.project_name,

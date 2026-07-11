@@ -543,7 +543,7 @@ async fn load_segment_count(postgres_url: &str) -> Result<usize> {
     });
     let count: i64 = client
         .query_one(
-            "SELECT count(*) FROM trace_segments WHERE compacted_at IS NULL",
+            "SELECT count(*) FROM trace_segments WHERE compacted_at_unix_nano IS NULL",
             &[],
         )
         .await?

@@ -33,11 +33,12 @@ impl JsonTape {
 
     pub(super) fn leaves(&self) -> impl Iterator<Item = JsonLeafRef<'_>> {
         self.leaves.iter().map(|leaf| JsonLeafRef {
-            path: std::str::from_utf8(&self.bytes[leaf.path.clone()]).unwrap_or_default(),
-            value: leaf
-                .value
-                .clone()
-                .map(|range| std::str::from_utf8(&self.bytes[range]).unwrap_or_default()),
+            path: std::str::from_utf8(&self.bytes[leaf.path.clone()])
+                .expect("JSON tape paths are copied from UTF-8 strings"),
+            value: leaf.value.clone().map(|range| {
+                std::str::from_utf8(&self.bytes[range])
+                    .expect("JSON tape values are copied from UTF-8 strings")
+            }),
         })
     }
 

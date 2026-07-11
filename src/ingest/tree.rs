@@ -39,14 +39,9 @@ pub(super) async fn refresh_trace_tree_metadata(
                 heads.run_id,
                 heads.start_time_unix_nano
             FROM run_heads heads
-            LEFT JOIN run_deletions deletions
-                ON deletions.project_name = heads.project_name
-                AND deletions.trace_id = heads.trace_id
-                AND deletions.span_id = heads.span_id
             WHERE heads.project_name = $1
                 AND heads.trace_id = $2
                 AND heads.deleted_at_unix_nano IS NULL
-                AND deletions.span_id IS NULL
             ORDER BY heads.start_time_unix_nano ASC, heads.span_id ASC",
             &[&project_name, &trace_id],
         )
@@ -81,9 +76,9 @@ pub(super) async fn refresh_trace_tree_metadata(
             "INSERT INTO run_tree_nodes(
                 project_name, trace_id, span_id, run_id, parent_span_id,
                 root_span_id, root_run_id, depth, sibling_order, subtree_start, subtree_end,
-                descendant_count, unresolved_parent, cycle_detected, updated_at
+                descendant_count, unresolved_parent, cycle_detected
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, CURRENT_TIMESTAMP)",
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
             &[
                 &project_name,
                 &trace_id,
@@ -108,9 +103,9 @@ pub(super) async fn refresh_trace_tree_metadata(
             tx.execute(
                 "INSERT INTO run_tree_edges(
                     project_name, trace_id, parent_span_id, child_span_id,
-                    sibling_order, depth, updated_at
+                    sibling_order, depth
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)",
+                VALUES ($1, $2, $3, $4, $5, $6)",
                 &[
                     &project_name,
                     &trace_id,
@@ -128,8 +123,7 @@ pub(super) async fn refresh_trace_tree_metadata(
             "UPDATE run_heads
             SET root_run_id = $4,
                 root_span_id = $5,
-                is_root = $6,
-                updated_at = CURRENT_TIMESTAMP
+                is_root = $6
             WHERE project_name = $1 AND trace_id = $2 AND span_id = $3",
             &[
                 &project_name,

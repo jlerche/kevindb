@@ -279,12 +279,12 @@ async fn feedback_filters_are_scoped_to_query_projects() {
     );
 
     let demo = sample_record("1111111111111111", 10);
-    let mut other = sample_record("1111111111111111", 20);
+    let mut other = sample_record("2222222222222222", 20);
     other.project_name = "other".to_owned();
     ingestor
         .ingest_records(vec![demo, other])
         .await
-        .expect("ingest colliding run ids");
+        .expect("ingest project-scoped runs");
 
     let (client, connection) = tokio_postgres::connect(mockgres.postgres_url(), NoTls)
         .await
@@ -300,7 +300,7 @@ async fn feedback_filters_are_scoped_to_query_projects() {
                 created_at_unix_nano, modified_at_unix_nano
             )
             VALUES (
-                'feedback-other', '1111111111111111',
+                'feedback-other', '2222222222222222',
                 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
                 'other', 'quality', '1.0', '\"pass\"', 1.0, 'pass', 300, 300
             )",

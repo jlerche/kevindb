@@ -45,12 +45,11 @@ async fn phase6_search_and_json_filters_use_sibling_indexes() {
     tokio::spawn(async move {
         let _ = connection.await;
     });
-    let search_index_uri: Option<String> = client
+    let search_index_uri: String = client
         .query_one("SELECT search_index_uri FROM trace_segments", &[])
         .await
         .expect("load search index uri")
         .get(0);
-    let search_index_uri = search_index_uri.expect("search index uri");
     object_store
         .head(&Path::from(search_index_uri.as_str()))
         .await

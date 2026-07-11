@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::record::SpanRecord;
+use kevindb_core::SpanRecord;
 
 const MAX_PREVIEW_BYTES: usize = 512;
 const MAX_THREAD_ID_BYTES: usize = 256;
@@ -87,16 +87,15 @@ pub(super) async fn replace_run_preview(
     tx.execute(
         "INSERT INTO run_previews(
             project_name, trace_id, span_id, inputs_preview, outputs_preview,
-            error_preview, first_token_time_unix_nano, updated_at
+            error_preview, first_token_time_unix_nano
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (project_name, trace_id, span_id)
         DO UPDATE SET
             inputs_preview = EXCLUDED.inputs_preview,
             outputs_preview = EXCLUDED.outputs_preview,
             error_preview = EXCLUDED.error_preview,
-            first_token_time_unix_nano = EXCLUDED.first_token_time_unix_nano,
-            updated_at = CURRENT_TIMESTAMP",
+            first_token_time_unix_nano = EXCLUDED.first_token_time_unix_nano",
         &[
             &record.project_name,
             &record.trace_id,
@@ -214,10 +213,6 @@ async fn load_trace_thread_runs(
                 previews.error_preview,
                 previews.first_token_time_unix_nano
             FROM run_heads heads
-            LEFT JOIN run_deletions deletions
-                ON deletions.project_name = heads.project_name
-                AND deletions.trace_id = heads.trace_id
-                AND deletions.span_id = heads.span_id
             LEFT JOIN run_metadata thread_meta
                 ON thread_meta.project_name = heads.project_name
                 AND thread_meta.trace_id = heads.trace_id
@@ -235,7 +230,6 @@ async fn load_trace_thread_runs(
             WHERE heads.project_name = $1
                 AND heads.trace_id = $2
                 AND heads.deleted_at_unix_nano IS NULL
-                AND deletions.span_id IS NULL
             ORDER BY heads.start_time_unix_nano ASC, heads.span_id ASC",
             &[&project_name, &trace_id],
         )
@@ -355,10 +349,9 @@ async fn ensure_thread_row(
     thread_id: &str,
 ) -> Result<()> {
     tx.execute(
-        "INSERT INTO threads(project_name, thread_id, updated_at)
-        VALUES ($1, $2, CURRENT_TIMESTAMP)
-        ON CONFLICT (project_name, thread_id)
-        DO UPDATE SET updated_at = CURRENT_TIMESTAMP",
+        "INSERT INTO threads(project_name, thread_id)
+        VALUES ($1, $2)
+        ON CONFLICT (project_name, thread_id) DO NOTHING",
         &[&project_name, &thread_id],
     )
     .await
@@ -379,11 +372,11 @@ async fn upsert_thread_trace(
             start_time_unix_nano, end_time_unix_nano, latency_nanos,
             first_token_time_unix_nano, inputs_preview, outputs_preview, error_preview,
             prompt_tokens, completion_tokens, total_tokens,
-            prompt_cost, completion_cost, total_cost, updated_at
+            prompt_cost, completion_cost, total_cost
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-            $14, $15, $16, $17, $18, $19, CURRENT_TIMESTAMP
+            $14, $15, $16, $17, $18, $19
         )
         ON CONFLICT (project_name, thread_id, trace_id)
         DO UPDATE SET
@@ -402,8 +395,7 @@ async fn upsert_thread_trace(
             total_tokens = EXCLUDED.total_tokens,
             prompt_cost = EXCLUDED.prompt_cost,
             completion_cost = EXCLUDED.completion_cost,
-            total_cost = EXCLUDED.total_cost,
-            updated_at = CURRENT_TIMESTAMP",
+            total_cost = EXCLUDED.total_cost",
         &[
             &project_name,
             &thread_id,
@@ -471,9 +463,9 @@ async fn upsert_thread_message(
     tx.execute(
         "INSERT INTO thread_messages(
             project_name, thread_id, trace_id, span_id, run_id, role, preview,
-            turn_order, trace_segment_id, row_index, start_time_unix_nano, updated_at
+            turn_order, trace_segment_id, row_index, start_time_unix_nano
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (project_name, thread_id, trace_id, span_id, role)
         DO UPDATE SET
             run_id = EXCLUDED.run_id,
@@ -481,8 +473,7 @@ async fn upsert_thread_message(
             turn_order = EXCLUDED.turn_order,
             trace_segment_id = EXCLUDED.trace_segment_id,
             row_index = EXCLUDED.row_index,
-            start_time_unix_nano = EXCLUDED.start_time_unix_nano,
-            updated_at = CURRENT_TIMESTAMP",
+            start_time_unix_nano = EXCLUDED.start_time_unix_nano",
         &[
             &project_name,
             &thread_id,
@@ -601,8 +592,7 @@ async fn refresh_thread_summary(
             total_cost = $16,
             latency_p50 = $17,
             latency_p99 = $18,
-            num_errored_turns = $19,
-            updated_at = CURRENT_TIMESTAMP
+            num_errored_turns = $19
         WHERE project_name = $1 AND thread_id = $2",
         &[
             &project_name,

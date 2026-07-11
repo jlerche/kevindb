@@ -16,7 +16,7 @@ use tokio_postgres::NoTls;
 use kevindb::ingest::{IngestConfig, Ingestor};
 use kevindb::query::{QueryEngine, RunQuery};
 use kevindb::segment::read_span_count;
-use kevindb::{RunEventKind, SpanRecord, generated_run_id};
+use kevindb_core::{RunEventKind, SpanRecord, generated_run_id};
 use mockgres_support::start_mockgres_with_migrations;
 use tokio::time::Duration;
 

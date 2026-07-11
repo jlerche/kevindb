@@ -110,12 +110,18 @@ impl FeedbackWriteRequest {
             ),
             None => None,
         };
-        let trace_id = self
+        let requested_trace_id = self
             .trace_id
             .as_deref()
             .map(|trace_id| canonical_uuid(trace_id, "trace_id"))
-            .transpose()?
-            .or_else(|| run.as_ref().map(|run| otel_trace_id_to_uuid(&run.trace_id)));
+            .transpose()?;
+        let trace_id = match requested_trace_id {
+            Some(trace_id) => Some(trace_id),
+            None => run
+                .as_ref()
+                .map(|run| otel_trace_id_to_uuid(&run.trace_id))
+                .transpose()?,
+        };
         let project_name = run.as_ref().map(|run| run.project_name.clone());
         let created_at_unix_nano =
             parse_time_nanos(self.created_at.as_deref())?.unwrap_or_else(current_time_nanos);
@@ -271,8 +277,10 @@ impl FeedbackResponse {
             comment: self.comment.clone(),
             feedback_source: self.feedback_source.clone(),
             extra: self.extra.clone(),
-            created_at_unix_nano: parse_time_nanos(Some(&self.created_at))?.unwrap_or(0),
-            modified_at_unix_nano: parse_time_nanos(Some(&self.modified_at))?.unwrap_or(0),
+            created_at_unix_nano: parse_time_nanos(Some(&self.created_at))?
+                .ok_or_else(|| ApiError::bad_request("created_at is required".to_owned()))?,
+            modified_at_unix_nano: parse_time_nanos(Some(&self.modified_at))?
+                .ok_or_else(|| ApiError::bad_request("modified_at is required".to_owned()))?,
         })
     }
 }
@@ -298,13 +306,12 @@ impl From<FeedbackRecord> for FeedbackResponse {
 }
 
 fn feedback_uuid(run_id: Option<&str>, key: &str, created_at_unix_nano: i64) -> String {
+    let owner = run_id
+        .map(|run_id| format!("run:{run_id}"))
+        .unwrap_or_else(|| "unscoped".to_owned());
     Uuid::new_v5(
         &Uuid::NAMESPACE_URL,
-        format!(
-            "kevindb:feedback:{}:{key}:{created_at_unix_nano}",
-            run_id.unwrap_or("")
-        )
-        .as_bytes(),
+        format!("kevindb:feedback:{owner}:{key}:{created_at_unix_nano}").as_bytes(),
     )
     .to_string()
 }

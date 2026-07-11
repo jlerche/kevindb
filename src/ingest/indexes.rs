@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::metrics::TypedRunMetrics;
-use crate::record::SpanRecord;
+use kevindb_core::SpanRecord;
 
 const MAX_TAGS: usize = 32;
 const MAX_TAG_BYTES: usize = 128;
@@ -41,7 +41,7 @@ pub(super) struct RootLocator {
 impl ScalarIndexes {
     pub fn from_record(record: &SpanRecord, root: RootLocator) -> Result<Self> {
         let attributes = parse_attributes(&record.attributes_json)?;
-        let metrics = TypedRunMetrics::from_record(record);
+        let metrics = TypedRunMetrics::from_record(record)?;
         Ok(Self {
             root_run_id: root.run_id,
             root_span_id: root.span_id,
@@ -126,10 +126,8 @@ pub(super) async fn replace_run_scalar_indexes(
 
     for tag in &indexes.tags {
         tx.execute(
-            "INSERT INTO run_tags(project_name, trace_id, span_id, tag, updated_at)
-            VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
-            ON CONFLICT (project_name, trace_id, span_id, tag)
-            DO UPDATE SET updated_at = CURRENT_TIMESTAMP",
+            "INSERT INTO run_tags(project_name, trace_id, span_id, tag)
+            VALUES ($1, $2, $3, $4)",
             &[
                 &record.project_name,
                 &record.trace_id,
@@ -151,10 +149,8 @@ pub(super) async fn replace_run_scalar_indexes(
 
     for (key, value) in &indexes.metadata {
         tx.execute(
-            "INSERT INTO run_metadata(project_name, trace_id, span_id, key, value, updated_at)
-            VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
-            ON CONFLICT (project_name, trace_id, span_id, key, value)
-            DO UPDATE SET updated_at = CURRENT_TIMESTAMP",
+            "INSERT INTO run_metadata(project_name, trace_id, span_id, key, value)
+            VALUES ($1, $2, $3, $4, $5)",
             &[
                 &record.project_name,
                 &record.trace_id,
@@ -190,15 +186,10 @@ pub(super) async fn refresh_project_aggregate_rollups(
                 prompt_cost, completion_cost, total_cost,
                 evaluator_score, model_name
             FROM run_heads heads
-            LEFT JOIN run_deletions deletions
-                ON deletions.project_name = heads.project_name
-                AND deletions.trace_id = heads.trace_id
-                AND deletions.span_id = heads.span_id
             WHERE heads.project_name = $1
                 AND heads.start_time_unix_nano >= $2
                 AND heads.start_time_unix_nano < $3
-                AND heads.deleted_at_unix_nano IS NULL
-                AND deletions.span_id IS NULL",
+                AND heads.deleted_at_unix_nano IS NULL",
             &[
                 &project_name,
                 &time_bucket_start_unix_nano,
@@ -280,12 +271,12 @@ async fn insert_run_metric_rollup(
             prompt_cost_sum, prompt_cost_avg,
             completion_cost_sum, completion_cost_avg,
             total_cost_sum, total_cost_avg,
-            evaluator_score_avg, updated_at
+            evaluator_score_avg
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
             $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-            $21, $22, $23, $24, $25, $26, CURRENT_TIMESTAMP
+            $21, $22, $23, $24, $25, $26
         )",
         &[
             &project_name,
@@ -549,7 +540,7 @@ const METADATA_PATHS: &[&[&str]] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::RunEventKind;
+    use kevindb_core::RunEventKind;
 
     #[test]
     fn extracts_bounded_scalar_indexes() {

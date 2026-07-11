@@ -333,8 +333,8 @@ fn parse_u64(name: &'static str, value: String) -> Result<u64, ConfigError> {
 
 fn parse_bool(name: &'static str, value: String) -> Result<bool, ConfigError> {
     match value.to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" => Ok(true),
-        "false" | "0" | "no" | "off" => Ok(false),
+        "true" => Ok(true),
+        "false" => Ok(false),
         _ => Err(ConfigError::InvalidBool { name, value }),
     }
 }

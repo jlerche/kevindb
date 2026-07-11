@@ -2613,7 +2613,6 @@ dependencies = [
  "object_store",
  "opentelemetry-proto",
  "portpicker",
- "prost",
  "serde",
  "serde_json",
  "tokio",
@@ -2633,6 +2632,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "kevindb",
+ "kevindb-core",
  "kevindb-metastore-postgres",
  "object_store",
  "serde",
@@ -2657,6 +2657,7 @@ name = "kevindb-metastore-postgres"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "kevindb-core",
  "portpicker",
  "refinery",
  "serde_json",
@@ -2689,6 +2690,7 @@ dependencies = [
  "futures-util",
  "kevindb",
  "kevindb-config",
+ "kevindb-core",
  "kevindb-metastore-postgres",
  "kevindb-otlp",
  "object_store",

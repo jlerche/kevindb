@@ -24,8 +24,6 @@ mod langsmith;
 mod metrics;
 mod routes;
 mod routing;
-pub use routes::app;
-
 pub use langsmith::{
     FeedbackResponse, ProjectResponse, RunResponse, RunsQueryRequest, RunsResponse, StringList,
     ThreadResponse, ThreadTraceResponse, ThreadTracesResponse, ThreadsQueryRequest,
@@ -36,6 +34,7 @@ use langsmith::{
     query_thread_traces, query_threads, read_feedback, read_project_trace, read_run,
     update_feedback, update_run,
 };
+pub use routes::app;
 use routing::read_project_route;
 
 #[derive(Clone)]
@@ -171,9 +170,11 @@ async fn list_trace_runs(
         .list_runs_in_trace(&project_name, &trace_id)
         .await
         .with_context(|| format!("list runs for trace {trace_id}"))?;
-    Ok(Json(RunsResponse::new(
-        runs.into_iter().map(RunResponse::from).collect(),
-    )))
+    let runs = runs
+        .into_iter()
+        .map(RunResponse::try_from_summary)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(RunsResponse::new(runs)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

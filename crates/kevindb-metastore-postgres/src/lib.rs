@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use kevindb_core::generated_project_id;
 use refinery::embed_migrations;
 use serde_json::Value;
+use tokio_postgres::types::ToSql;
 use tokio_postgres::{NoTls, Row};
 
 const FEEDBACK_ROLLUP_BUCKET_NANOS: i64 = 60 * 60 * 1_000_000_000;
@@ -90,7 +92,7 @@ impl PostgresMetastore {
     }
 
     pub async fn insert_feedback(&self, feedback: &FeedbackRecord) -> Result<()> {
-        let (client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
+        let (mut client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
             .await
             .context("connect postgres for feedback insert")?;
         tokio::spawn(async move {
@@ -99,6 +101,14 @@ impl PostgresMetastore {
             }
         });
 
+        let tx = client
+            .transaction()
+            .await
+            .context("begin feedback insert")?;
+        let lock_id = feedback_lock_id(&feedback.id);
+        tx.query_one("SELECT pg_advisory_lock($1)", &[&lock_id])
+            .await
+            .context("lock feedback write")?;
         let score_json = json_option_to_string(&feedback.score);
         let score_number = json_option_to_f64(&feedback.score);
         let value_json = json_option_to_string(&feedback.value);
@@ -106,18 +116,12 @@ impl PostgresMetastore {
         let correction_json = json_option_to_string(&feedback.correction);
         let feedback_source_json = json_option_to_string(&feedback.feedback_source);
         let extra_json = json_option_to_string(&feedback.extra);
-        if let Some(project_name) = &feedback.project_name {
-            client
-                .execute(
-                    "INSERT INTO projects(name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
-                    &[project_name],
-                )
-                .await
-                .context("ensure feedback project")?;
-        }
-        let old_rollup_bucket = client
+        let old_rollup_bucket = tx
             .query_opt(
-                "SELECT project_name, created_at_unix_nano FROM feedback WHERE id = $1",
+                "SELECT project_name, created_at_unix_nano
+                FROM feedback
+                WHERE id = $1
+                FOR UPDATE",
                 &[&feedback.id],
             )
             .await
@@ -127,8 +131,31 @@ impl PostgresMetastore {
                     (project_name, feedback_rollup_bucket(row.get::<_, i64>(1)))
                 })
             });
-        client
-            .execute(
+        if let Some(project_name) = &feedback.project_name {
+            tx.execute(
+                "INSERT INTO projects(name, id) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING",
+                &[project_name, &generated_project_id(project_name)],
+            )
+            .await
+            .context("ensure feedback project")?;
+        }
+        let mut locked_projects = BTreeSet::new();
+        if let Some((project_name, _)) = &old_rollup_bucket {
+            locked_projects.insert(project_name.clone());
+        }
+        if let Some(project_name) = &feedback.project_name {
+            locked_projects.insert(project_name.clone());
+        }
+        for project_name in locked_projects {
+            tx.query_one(
+                "SELECT name FROM projects WHERE name = $1 FOR UPDATE",
+                &[&project_name],
+            )
+            .await
+            .context("lock feedback rollup project")?;
+        }
+        let stored_feedback = tx
+            .query_one(
                 "INSERT INTO feedback(
                     id, run_id, trace_id, project_name, key, score_json, value_json,
                     score_number, value_text,
@@ -149,7 +176,8 @@ impl PostgresMetastore {
                     comment = EXCLUDED.comment,
                     feedback_source_json = EXCLUDED.feedback_source_json,
                     extra_json = EXCLUDED.extra_json,
-                    modified_at_unix_nano = EXCLUDED.modified_at_unix_nano",
+                    modified_at_unix_nano = EXCLUDED.modified_at_unix_nano
+                RETURNING project_name, created_at_unix_nano",
                 &[
                     &feedback.id,
                     &feedback.run_id,
@@ -175,15 +203,24 @@ impl PostgresMetastore {
         if let Some(bucket) = old_rollup_bucket {
             affected_buckets.insert(bucket);
         }
-        if let Some(project_name) = feedback.project_name.clone() {
+        if let Some(project_name) = stored_feedback.get::<_, Option<String>>(0) {
             affected_buckets.insert((
                 project_name,
-                feedback_rollup_bucket(feedback.created_at_unix_nano),
+                feedback_rollup_bucket(stored_feedback.get::<_, i64>(1)),
             ));
         }
         for (project_name, time_bucket_start_unix_nano) in affected_buckets {
-            refresh_feedback_metric_rollups(&client, &project_name, time_bucket_start_unix_nano)
+            refresh_feedback_metric_rollups(&tx, &project_name, time_bucket_start_unix_nano)
                 .await?;
+        }
+        tx.commit().await.context("commit feedback insert")?;
+        let unlocked: bool = client
+            .query_one("SELECT pg_advisory_unlock($1)", &[&lock_id])
+            .await
+            .context("unlock feedback write")?
+            .get(0);
+        if !unlocked {
+            return Err(anyhow!("feedback write lock was not held at unlock"));
         }
 
         Ok(())
@@ -199,10 +236,12 @@ impl PostgresMetastore {
             }
         });
 
-        let rows = client
-            .query(list_feedback_sql(&filter).as_str(), &[])
-            .await
-            .context("list feedback")?;
+        let (sql, params) = list_feedback_query(&filter)?;
+        let params = params
+            .iter()
+            .map(|param| param.as_ref() as &(dyn ToSql + Sync))
+            .collect::<Vec<_>>();
+        let rows = client.query(&sql, &params).await.context("list feedback")?;
 
         rows.into_iter().map(feedback_from_row).collect()
     }
@@ -233,85 +272,154 @@ impl PostgresMetastore {
     }
 }
 
-fn list_feedback_sql(filter: &FeedbackFilter) -> String {
+type SqlParam = Box<dyn ToSql + Sync + Send>;
+
+fn list_feedback_query(filter: &FeedbackFilter) -> Result<(String, Vec<SqlParam>)> {
+    // TODO(mockgres): Use array parameters with cardinality() once mockgres supports that
+    // PostgreSQL path; expanded typed parameters preserve the same semantics for now.
     let mut predicates = Vec::new();
-    if !filter.run_ids.is_empty() {
-        predicates.push(format!("run_id IN ({})", sql_string_list(&filter.run_ids)));
-    }
-    if !filter.trace_ids.is_empty() {
-        predicates.push(format!(
-            "trace_id IN ({})",
-            sql_string_list(&filter.trace_ids)
-        ));
-    }
-    if !filter.project_names.is_empty() {
-        predicates.push(format!(
-            "project_name IN ({})",
-            sql_string_list(&filter.project_names)
-        ));
-    }
-    if !filter.keys.is_empty() {
-        predicates.push(format!("key IN ({})", sql_string_list(&filter.keys)));
-    }
-    if let Some(score) = filter.score {
-        predicates.push(format!("score_number = {score}"));
-    }
-    if let Some(score_min) = filter.score_min {
-        predicates.push(format!("score_number >= {score_min}"));
-    }
-    if let Some(score_max) = filter.score_max {
-        predicates.push(format!("score_number <= {score_max}"));
-    }
-    if !filter.value_texts.is_empty() {
-        predicates.push(format!(
-            "value_text IN ({})",
-            sql_string_list(&filter.value_texts)
-        ));
-    }
-    if let Some(created_time_min_unix_nano) = filter.created_time_min_unix_nano {
-        predicates.push(format!(
-            "created_at_unix_nano >= {created_time_min_unix_nano}"
-        ));
-    }
-    if let Some(created_time_max_unix_nano) = filter.created_time_max_unix_nano {
-        predicates.push(format!(
-            "created_at_unix_nano <= {created_time_max_unix_nano}"
-        ));
-    }
+    let mut params = Vec::<SqlParam>::new();
+    push_text_list_predicate(&mut predicates, &mut params, "run_id", &filter.run_ids);
+    push_text_list_predicate(&mut predicates, &mut params, "trace_id", &filter.trace_ids);
+    push_text_list_predicate(
+        &mut predicates,
+        &mut params,
+        "project_name",
+        &filter.project_names,
+    );
+    push_text_list_predicate(&mut predicates, &mut params, "key", &filter.keys);
+    push_score_predicate(
+        &mut predicates,
+        &mut params,
+        "score_number =",
+        "score",
+        filter.score,
+    )?;
+    push_score_predicate(
+        &mut predicates,
+        &mut params,
+        "score_number >=",
+        "score_min",
+        filter.score_min,
+    )?;
+    push_score_predicate(
+        &mut predicates,
+        &mut params,
+        "score_number <=",
+        "score_max",
+        filter.score_max,
+    )?;
+    push_text_list_predicate(
+        &mut predicates,
+        &mut params,
+        "value_text",
+        &filter.value_texts,
+    );
+    push_optional_predicate(
+        &mut predicates,
+        &mut params,
+        "created_at_unix_nano >=",
+        filter.created_time_min_unix_nano,
+    );
+    push_optional_predicate(
+        &mut predicates,
+        &mut params,
+        "created_at_unix_nano <=",
+        filter.created_time_max_unix_nano,
+    );
 
     let where_sql = if predicates.is_empty() {
         String::new()
     } else {
         format!(" WHERE {}", predicates.join(" AND "))
     };
-    let limit = filter.limit.min(1000);
+    let limit = i64::try_from(filter.limit.min(1000)).context("feedback limit overflow")?;
+    let offset = i64::try_from(filter.offset).context("feedback offset overflow")?;
+    let limit_param = bind_param(&mut params, limit);
+    let offset_param = bind_param(&mut params, offset);
+    Ok((
+        format!(
+            "SELECT id, run_id, trace_id, project_name, key, score_json, value_json,
+                correction_json, comment, feedback_source_json, extra_json,
+                created_at_unix_nano, modified_at_unix_nano
+            FROM feedback{where_sql}
+            ORDER BY created_at_unix_nano ASC, id ASC
+            LIMIT {limit_param} OFFSET {offset_param}"
+        ),
+        params,
+    ))
+}
 
-    format!(
-        "SELECT id, run_id, trace_id, project_name, key, score_json, value_json,
-            correction_json, comment, feedback_source_json, extra_json,
-            created_at_unix_nano, modified_at_unix_nano
-        FROM feedback{where_sql}
-        ORDER BY created_at_unix_nano ASC, id ASC
-        LIMIT {limit} OFFSET {}",
-        filter.offset
-    )
+fn push_text_list_predicate(
+    predicates: &mut Vec<String>,
+    params: &mut Vec<SqlParam>,
+    column: &str,
+    values: &[String],
+) {
+    if values.is_empty() {
+        return;
+    }
+    let placeholders = values
+        .iter()
+        .cloned()
+        .map(|value| bind_param(params, value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    predicates.push(format!("{column} IN ({placeholders})"));
+}
+
+fn push_score_predicate(
+    predicates: &mut Vec<String>,
+    params: &mut Vec<SqlParam>,
+    expression: &str,
+    name: &str,
+    score: Option<f64>,
+) -> Result<()> {
+    if let Some(score) = score {
+        if !score.is_finite() {
+            return Err(anyhow!("feedback {name} must be finite"));
+        }
+        push_optional_predicate(predicates, params, expression, Some(score));
+    }
+    Ok(())
+}
+
+fn push_optional_predicate<T>(
+    predicates: &mut Vec<String>,
+    params: &mut Vec<SqlParam>,
+    expression: &str,
+    value: Option<T>,
+) where
+    T: ToSql + Sync + Send + 'static,
+{
+    if let Some(value) = value {
+        let placeholder = bind_param(params, value);
+        predicates.push(format!("{expression} {placeholder}"));
+    }
+}
+
+fn bind_param<T>(params: &mut Vec<SqlParam>, value: T) -> String
+where
+    T: ToSql + Sync + Send + 'static,
+{
+    params.push(Box::new(value));
+    format!("${}", params.len())
 }
 
 async fn refresh_feedback_metric_rollups(
-    client: &tokio_postgres::Client,
+    tx: &tokio_postgres::Transaction<'_>,
     project_name: &str,
     time_bucket_start_unix_nano: i64,
 ) -> Result<()> {
-    client
-        .execute(
-            "DELETE FROM feedback_metric_rollups
+    tx.execute(
+        "DELETE FROM feedback_metric_rollups
             WHERE project_name = $1 AND time_bucket_start_unix_nano = $2",
-            &[&project_name, &time_bucket_start_unix_nano],
-        )
-        .await
-        .context("delete old feedback aggregate rollups")?;
+        &[&project_name, &time_bucket_start_unix_nano],
+    )
+    .await
+    .context("delete old feedback aggregate rollups")?;
 
-    let rows = client
+    let rows = tx
         .query(
             "SELECT key, created_at_unix_nano, score_number
             FROM feedback
@@ -338,36 +446,35 @@ async fn refresh_feedback_metric_rollups(
 
     for ((time_bucket_start_unix_nano, key), accumulator) in groups {
         let stats = accumulator.finish();
-        client
-            .execute(
-                "INSERT INTO feedback_metric_rollups(
+        tx.execute(
+            "INSERT INTO feedback_metric_rollups(
                     project_name, bucket_size_unix_nanos, time_bucket_start_unix_nano,
                     feedback_key, feedback_count, score_count, score_min, score_max,
                     score_avg, score_p50, score_p95, score_p99,
-                    score_distribution_json, updated_at
+                    score_distribution_json
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8,
-                    $9, $10, $11, $12, $13, CURRENT_TIMESTAMP
+                    $9, $10, $11, $12, $13
                 )",
-                &[
-                    &project_name,
-                    &FEEDBACK_ROLLUP_BUCKET_NANOS,
-                    &time_bucket_start_unix_nano,
-                    &key,
-                    &stats.feedback_count,
-                    &stats.score_count,
-                    &stats.score_min,
-                    &stats.score_max,
-                    &stats.score_avg,
-                    &stats.score_p50,
-                    &stats.score_p95,
-                    &stats.score_p99,
-                    &stats.score_distribution_json,
-                ],
-            )
-            .await
-            .context("insert feedback aggregate rollup")?;
+            &[
+                &project_name,
+                &FEEDBACK_ROLLUP_BUCKET_NANOS,
+                &time_bucket_start_unix_nano,
+                &key,
+                &stats.feedback_count,
+                &stats.score_count,
+                &stats.score_min,
+                &stats.score_max,
+                &stats.score_avg,
+                &stats.score_p50,
+                &stats.score_p95,
+                &stats.score_p99,
+                &stats.score_distribution_json,
+            ],
+        )
+        .await
+        .context("insert feedback aggregate rollup")?;
     }
 
     Ok(())
@@ -375,6 +482,15 @@ async fn refresh_feedback_metric_rollups(
 
 fn feedback_rollup_bucket(timestamp_unix_nano: i64) -> i64 {
     timestamp_unix_nano.div_euclid(FEEDBACK_ROLLUP_BUCKET_NANOS) * FEEDBACK_ROLLUP_BUCKET_NANOS
+}
+
+fn feedback_lock_id(feedback_id: &str) -> i64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in feedback_id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash as i64
 }
 
 #[derive(Debug, Default)]
@@ -515,18 +631,6 @@ fn json_string_to_option(value: Option<String>) -> Result<Option<Value>> {
         .transpose()
 }
 
-fn sql_string_list(values: &[String]) -> String {
-    values
-        .iter()
-        .map(|value| sql_string_literal(value))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn sql_string_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::process::Stdio;
@@ -534,7 +638,6 @@ mod tests {
 
     use super::*;
     use anyhow::anyhow;
-    use refinery::Target;
     use serde_json::json;
     use tokio::process::{Child, Command};
     use tokio::time::sleep;
@@ -559,6 +662,10 @@ mod tests {
             .insert_feedback(&feedback("three", "run-a", "quality", 3))
             .await
             .expect("insert third feedback");
+        metastore
+            .insert_feedback(&feedback("four", "run-c", "quality's", 4))
+            .await
+            .expect("insert feedback with quoted key");
 
         let page = metastore
             .list_feedback(FeedbackFilter {
@@ -602,6 +709,16 @@ mod tests {
         assert_eq!(loaded.run_id.as_deref(), Some("run-a"));
         assert_eq!(loaded.extra, Some(json!({"source": "test"})));
 
+        let quoted = metastore
+            .list_feedback(FeedbackFilter {
+                keys: vec!["quality's".to_owned()],
+                ..FeedbackFilter::default()
+            })
+            .await
+            .expect("list feedback with quoted key");
+        assert_eq!(quoted.len(), 1);
+        assert_eq!(quoted[0].id, "four");
+
         let (client, connection) = tokio_postgres::connect(mockgres.postgres_url(), NoTls)
             .await
             .expect("connect postgres for feedback rollup check");
@@ -628,92 +745,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upgrades_nonempty_v8_schema_through_idempotency_and_locators() {
+    async fn concurrent_feedback_writes_serialize_rollup_refreshes() {
         let mockgres = Mockgres::start().await.expect("start mockgres");
-        let (mut client, connection) = tokio_postgres::connect(mockgres.postgres_url(), NoTls)
+        run_migrations(mockgres.postgres_url())
+            .await
+            .expect("run migrations");
+        let metastore = PostgresMetastore::new(mockgres.postgres_url().to_owned());
+        let (client, connection) = tokio_postgres::connect(mockgres.postgres_url(), NoTls)
             .await
             .expect("connect postgres");
         tokio::spawn(async move {
             let _ = connection.await;
         });
-        embedded::migrations::runner()
-            .set_target(Target::Version(8))
-            .run_async(&mut client)
-            .await
-            .expect("migrate through v8");
         client
-            .batch_execute(
-                "INSERT INTO projects(name) VALUES ('demo');
-                INSERT INTO trace_segments(
-                    project_name, uri, etag, total_bytes, span_count,
-                    min_start_time_unix_nano, max_end_time_unix_nano,
-                    time_bucket_start_unix_nano
-                ) VALUES ('demo', 'segment.vortex', 'etag', 1, 1, 1, 2, 0);
-                INSERT INTO run_events(
-                    trace_segment_id, project_name, run_id, trace_id, span_id,
-                    event_type, event_time_unix_nano, row_index
-                ) VALUES (1, 'demo', 'run-a', 'trace-a', 'span-a', 'end', 2, 0);
-                INSERT INTO run_heads(
-                    project_name, trace_id, span_id, name,
-                    start_time_unix_nano, end_time_unix_nano, status_code,
-                    last_trace_segment_id, run_type, status, is_root, run_id,
-                    last_event_type, last_event_time_unix_nano,
-                    last_row_index, last_run_event_id
-                ) VALUES (
-                    'demo', 'trace-a', 'span-a', 'run-a', 1, 2, 1,
-                    1, 'chain', 'success', true, 'run-a', 'end', 2, 0, 1
-                );",
-            )
-            .await
-            .expect("seed v8 rows");
-
-        client
-            .batch_execute(include_str!(
-                "../migrations/V9__add_run_trace_locators_and_idempotency.sql"
-            ))
-            .await
-            .expect("apply v9 upgrade");
-
-        let event_key: String = client
-            .query_one("SELECT idempotency_key FROM run_events WHERE id = 1", &[])
-            .await
-            .expect("load migrated idempotency key")
-            .get(0);
-        assert_eq!(event_key, "migrated-run-event:1");
-        let locator_count: i64 = client
-            .query_one(
-                "SELECT count(*) FROM run_locators WHERE run_id = 'run-a'",
+            .execute(
+                "INSERT INTO projects(name, id) VALUES ('demo', 'demo-id')",
                 &[],
             )
             .await
-            .expect("load migrated locator")
+            .expect("seed concurrent feedback project");
+
+        let first_feedback = feedback("one", "run-a", "quality", 1);
+        let second_feedback = feedback("two", "run-b", "quality", 2);
+        let (first, second) = tokio::join!(
+            metastore.insert_feedback(&first_feedback),
+            metastore.insert_feedback(&second_feedback),
+        );
+        first.expect("first concurrent feedback insert");
+        second.expect("second concurrent feedback insert");
+
+        let feedback_count: i64 = client
+            .query_one(
+                "SELECT feedback_count
+                FROM feedback_metric_rollups
+                WHERE project_name = 'demo' AND feedback_key = 'quality'",
+                &[],
+            )
+            .await
+            .expect("load serialized feedback rollup")
             .get(0);
-        assert_eq!(locator_count, 1);
+        assert_eq!(feedback_count, 2);
 
         mockgres.stop().await.expect("stop mockgres");
     }
 
-    #[test]
-    fn list_feedback_sql_escapes_filter_values() {
-        let sql = list_feedback_sql(&FeedbackFilter {
-            run_ids: vec!["run-a".to_owned()],
-            trace_ids: vec!["trace-a".to_owned()],
-            project_names: vec!["demo".to_owned()],
-            keys: vec!["quality's".to_owned()],
-            score_min: Some(0.5),
-            value_texts: vec!["good".to_owned()],
-            limit: 2000,
-            offset: 3,
-            ..FeedbackFilter::default()
+    #[tokio::test]
+    async fn concurrent_feedback_id_reuse_does_not_leave_stale_project_rollups() {
+        let mockgres = Mockgres::start().await.expect("start mockgres");
+        run_migrations(mockgres.postgres_url())
+            .await
+            .expect("run migrations");
+        let metastore = PostgresMetastore::new(mockgres.postgres_url().to_owned());
+        let (client, connection) = tokio_postgres::connect(mockgres.postgres_url(), NoTls)
+            .await
+            .expect("connect postgres");
+        tokio::spawn(async move {
+            let _ = connection.await;
         });
 
-        assert!(sql.contains("run_id IN ('run-a')"));
-        assert!(sql.contains("trace_id IN ('trace-a')"));
-        assert!(sql.contains("project_name IN ('demo')"));
-        assert!(sql.contains("key IN ('quality''s')"));
-        assert!(sql.contains("score_number >= 0.5"));
-        assert!(sql.contains("value_text IN ('good')"));
-        assert!(sql.contains("LIMIT 1000 OFFSET 3"));
+        let mut first = feedback("shared", "run-a", "quality", 1);
+        first.project_name = Some("first-project".to_owned());
+        let mut second = feedback("shared", "run-a", "quality", 2);
+        second.project_name = Some("second-project".to_owned());
+        let (first_result, second_result) = tokio::join!(
+            metastore.insert_feedback(&first),
+            metastore.insert_feedback(&second),
+        );
+        first_result.expect("first concurrent feedback insert");
+        second_result.expect("second concurrent feedback insert");
+
+        let rollups = client
+            .query(
+                "SELECT project_name, feedback_count
+                FROM feedback_metric_rollups
+                WHERE feedback_key = 'quality'",
+                &[],
+            )
+            .await
+            .expect("load feedback rollups after project move");
+        assert_eq!(rollups.len(), 1);
+        assert_eq!(rollups[0].get::<_, i64>(1), 1);
+
+        mockgres.stop().await.expect("stop mockgres");
     }
 
     fn feedback(id: &str, run_id: &str, key: &str, created_at_unix_nano: i64) -> FeedbackRecord {

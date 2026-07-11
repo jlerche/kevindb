@@ -1,6 +1,48 @@
 use super::*;
 
 #[tokio::test]
+async fn rejects_run_id_reuse_for_a_different_run() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+
+    let ingestor = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        Arc::new(InMemory::new()),
+        IngestConfig {
+            max_spans_per_segment: 1,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+    let first = sample_record("1111111111111111", 10);
+    let mut collision = sample_record("2222222222222222", 20);
+    collision.project_name = "other".to_owned();
+    collision.trace_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned();
+    collision.run_id = first.run_id.clone();
+
+    ingestor
+        .ingest_records(vec![first])
+        .await
+        .expect("ingest canonical run id owner");
+    let error = ingestor
+        .ingest_records(vec![collision])
+        .await
+        .expect_err("run id collision must fail");
+    assert!(error.to_string().contains("upsert run head"));
+
+    let mut valid = sample_record("3333333333333333", 30);
+    valid.project_name = "other".to_owned();
+    valid.trace_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned();
+    ingestor
+        .ingest_records(vec![valid])
+        .await
+        .expect("collision must not poison the project partition");
+
+    mockgres.stop().await.expect("stop mockgres");
+}
+
+#[tokio::test]
 async fn direct_run_lookup_uses_current_locator_after_stale_segment_deleted() {
     let mockgres = Mockgres::start().await.expect("start mockgres");
     run_migrations(mockgres.postgres_url())

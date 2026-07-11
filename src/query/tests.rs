@@ -3,8 +3,8 @@ use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
-use crate::record::SpanRecord;
 use crate::segment::encode_span_records;
+use kevindb_core::SpanRecord;
 
 const TRACE_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -452,7 +452,7 @@ fn span_record(
         start_time_unix_nano,
         end_time_unix_nano,
         status_code,
-        event_kind: crate::record::RunEventKind::End,
+        event_kind: kevindb_core::RunEventKind::End,
         attributes_json: "{}".to_owned(),
         idempotency_key: None,
     }

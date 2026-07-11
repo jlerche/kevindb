@@ -84,7 +84,7 @@ pub(crate) async fn load_run_query_plan(
         let uri: String = row.get(0);
         let total_bytes: i64 = row.get(1);
         let schema_version: i64 = row.get(2);
-        let search_index_uri: Option<String> = row.get(3);
+        let search_index_uri: String = row.get(3);
         let search_index_bytes: i64 = row.get(4);
         let search_index_schema_version: i64 = row.get(5);
         let project_name: String = row.get(6);
@@ -102,7 +102,7 @@ pub(crate) async fn load_run_query_plan(
                 uri,
                 total_bytes,
                 schema_version,
-                search_index_uri,
+                search_index_uri: Some(search_index_uri),
                 search_index_bytes,
                 search_index_schema_version,
                 candidate_rows: Vec::new(),
@@ -131,7 +131,10 @@ pub(crate) async fn load_run_query_plan(
         .sum::<i64>();
     let estimated_object_store_requests =
         estimate_vortex_object_store_requests(segments_by_uri.len())
-            + estimate_search_index_object_store_requests(query, segments_by_uri.values());
+            + estimate_search_index_object_store_requests(
+                has_phase6_predicate,
+                segments_by_uri.values(),
+            );
     enforce_limits(
         query,
         segments_by_uri.len(),
@@ -202,7 +205,6 @@ fn run_candidate_runs_sql(query: &RunQuery) -> Result<String> {
             FROM run_heads
             INNER JOIN trace_segments
                 ON trace_segments.id = run_heads.last_trace_segment_id
-            {joins}
             WHERE {where_sql}
             ORDER BY
                 run_heads.start_time_unix_nano {order_direction},
@@ -213,36 +215,15 @@ fn run_candidate_runs_sql(query: &RunQuery) -> Result<String> {
             candidate.start_time_unix_nano {order_direction},
             candidate.span_id ASC,
             candidate.last_row_index ASC",
-        joins = run_head_join_sql(query),
     ))
-}
-
-fn run_head_join_sql(query: &RunQuery) -> String {
-    let mut joins = Vec::new();
-    if !query.include_deleted {
-        joins.push(
-            "LEFT JOIN run_deletions
-                ON run_deletions.project_name = run_heads.project_name
-                AND run_deletions.trace_id = run_heads.trace_id
-                AND run_deletions.span_id = run_heads.span_id"
-                .to_owned(),
-        );
-    }
-
-    if joins.is_empty() {
-        String::new()
-    } else {
-        format!("\n            {}", joins.join("\n            "))
-    }
 }
 
 fn run_head_where_sql(query: &RunQuery) -> Result<String> {
     let mut predicates = run_query_predicates(query, "run_heads");
-    predicates.push("trace_segments.compacted_at IS NULL".to_owned());
+    predicates.push("trace_segments.compacted_at_unix_nano IS NULL".to_owned());
 
     if !query.include_deleted {
         predicates.push("run_heads.deleted_at_unix_nano IS NULL".to_owned());
-        predicates.push("run_deletions.span_id IS NULL".to_owned());
     }
 
     if let Some(cutoff) = query.retention_cutoff_unix_nano {
@@ -398,18 +379,14 @@ pub(crate) fn estimate_search_index_object_store_requests_for_segments(
 }
 
 fn estimate_search_index_object_store_requests<'a>(
-    query: &RunQuery,
+    has_phase6_predicate: bool,
     segments: impl Iterator<Item = &'a SegmentSource>,
 ) -> usize {
-    if !query_has_phase6_predicate(query).unwrap_or(false) {
+    if !has_phase6_predicate {
         return 0;
     }
 
-    estimate_search_index_object_store_requests_for_segments(
-        segments
-            .filter(|segment| segment.search_index_uri.is_some())
-            .count(),
-    )
+    estimate_search_index_object_store_requests_for_segments(segments.count())
 }
 
 fn query_has_phase6_predicate(query: &RunQuery) -> Result<bool> {
@@ -460,8 +437,8 @@ pub(crate) async fn load_deleted_run_keys(
         .query(
             format!(
                 "SELECT project_name, trace_id, span_id
-                FROM run_deletions
-                WHERE {}",
+                FROM run_heads
+                WHERE deleted_at_unix_nano IS NOT NULL AND {}",
                 predicates.join(" AND ")
             )
             .as_str(),

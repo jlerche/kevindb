@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -11,12 +12,11 @@ pub(super) struct LangSmithPayload {
 }
 
 impl LangSmithPayload {
-    pub(super) fn from_attributes_json(attributes_json: &str) -> Self {
-        let Ok(Value::Object(attributes)) = serde_json::from_str(attributes_json) else {
-            return Self::default();
-        };
+    pub(super) fn from_attributes_json(attributes_json: &str) -> Result<Self> {
+        let attributes = serde_json::from_str::<serde_json::Map<String, Value>>(attributes_json)
+            .context("stored run attributes must be a JSON object")?;
 
-        Self {
+        Ok(Self {
             inputs: attributes
                 .get("langsmith.inputs")
                 .filter(|value| !value.is_null())
@@ -33,9 +33,9 @@ impl LangSmithPayload {
                 .get("langsmith.error")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            events: array_values(&attributes, &["langsmith.events", "events"]),
-            tags: string_values(&attributes, &["langsmith.tags", "tags"]),
-        }
+            events: array_values(&attributes, "langsmith.events"),
+            tags: string_values(&attributes, "langsmith.tags"),
+        })
     }
 
     pub(super) fn merge(
@@ -70,16 +70,18 @@ impl LangSmithPayload {
     }
 }
 
-fn array_values(attributes: &serde_json::Map<String, Value>, keys: &[&str]) -> Vec<Value> {
-    keys.iter()
-        .find_map(|key| attributes.get(*key).and_then(Value::as_array))
+fn array_values(attributes: &serde_json::Map<String, Value>, key: &str) -> Vec<Value> {
+    attributes
+        .get(key)
+        .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
 }
 
-fn string_values(attributes: &serde_json::Map<String, Value>, keys: &[&str]) -> Vec<String> {
-    keys.iter()
-        .find_map(|key| attributes.get(*key).and_then(Value::as_array))
+fn string_values(attributes: &serde_json::Map<String, Value>, key: &str) -> Vec<String> {
+    attributes
+        .get(key)
+        .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kevindb::ingest::{CompactionServiceConfig, IngestConfig as RuntimeIngestConfig};
 use kevindb_config::{CacheConfig, CacheMode, ObjectStoreConfig, ServerConfig, ServiceRole};
 use kevindb_metastore_postgres::run_migrations;
@@ -122,7 +122,7 @@ async fn object_store_from_config(
         CacheMode::Hybrid => {
             let cache_dir = cache_config
                 .hybrid_dir
-                .expect("hybrid cache config requires a directory");
+                .context("hybrid cache config requires a directory")?;
             Ok(Arc::new(
                 CachedObjectStore::hybrid(
                     object_store,

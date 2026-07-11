@@ -1,9 +1,12 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use kevindb_core::generated_project_id;
 use tokio_postgres::NoTls;
 
 use super::{QueryEngine, current_time_unix_nano};
+
+const MAX_RETENTION_POLICIES_PER_PASS: i64 = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectRetentionPolicy {
@@ -35,21 +38,19 @@ impl QueryEngine {
 
         client
             .execute(
-                "INSERT INTO projects(name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
-                &[&project_name],
+                "INSERT INTO projects(name, id) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING",
+                &[&project_name, &generated_project_id(project_name)],
             )
             .await
             .context("ensure retention policy project")?;
         client
             .execute(
                 "INSERT INTO project_retention_policies(
-                    project_name, ttl_unix_nanos, updated_at
+                    project_name, ttl_unix_nanos
                 )
-                VALUES ($1, $2, CURRENT_TIMESTAMP)
+                VALUES ($1, $2)
                 ON CONFLICT (project_name)
-                DO UPDATE SET
-                    ttl_unix_nanos = EXCLUDED.ttl_unix_nanos,
-                    updated_at = CURRENT_TIMESTAMP",
+                DO UPDATE SET ttl_unix_nanos = EXCLUDED.ttl_unix_nanos",
                 &[&project_name, &retention_period_nanos],
             )
             .await
@@ -104,6 +105,8 @@ impl QueryEngine {
             expired_runs += self
                 .expire_project_runs_before(&policy.project_name, cutoff)
                 .await?;
+            self.mark_project_retention_enforced(&policy.project_name, now_unix_nano)
+                .await?;
         }
 
         Ok(RetentionEnforcementReceipt {
@@ -126,8 +129,9 @@ impl QueryEngine {
             .query(
                 "SELECT project_name, ttl_unix_nanos
                 FROM project_retention_policies
-                ORDER BY project_name",
-                &[],
+                ORDER BY last_enforced_at_unix_nano, project_name
+                LIMIT $1",
+                &[&MAX_RETENTION_POLICIES_PER_PASS],
             )
             .await
             .context("list project retention policies")?;
@@ -139,6 +143,31 @@ impl QueryEngine {
                 retention_period_nanos: row.get(1),
             })
             .collect())
+    }
+
+    async fn mark_project_retention_enforced(
+        &self,
+        project_name: &str,
+        now_unix_nano: i64,
+    ) -> Result<()> {
+        let (client, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
+            .await
+            .context("connect postgres for retention policy progress")?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::warn!(error = %err, "postgres retention progress connection failed");
+            }
+        });
+        client
+            .execute(
+                "UPDATE project_retention_policies
+                SET last_enforced_at_unix_nano = $2
+                WHERE project_name = $1",
+                &[&project_name, &now_unix_nano],
+            )
+            .await
+            .context("mark retention policy progress")?;
+        Ok(())
     }
 }
 

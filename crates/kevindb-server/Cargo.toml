@@ -14,6 +14,7 @@ foyer = { version = "0.22.3", features = ["serde"] }
 futures-util = "0.3.31"
 kevindb = { path = "../.." }
 kevindb-config = { path = "../kevindb-config" }
+kevindb-core = { path = "../kevindb-core" }
 kevindb-metastore-postgres = { path = "../kevindb-metastore-postgres" }
 kevindb-otlp = { path = "../kevindb-otlp" }
 object_store = { version = "0.13.2", features = ["aws"] }

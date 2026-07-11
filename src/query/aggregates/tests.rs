@@ -8,8 +8,8 @@ use object_store::{ObjectStoreExt, PutPayload};
 
 use super::*;
 use crate::query::SegmentSource;
-use crate::record::{RunEventKind, SpanRecord};
 use crate::segment::encode_span_records;
+use kevindb_core::{RunEventKind, SpanRecord};
 
 const TRACE_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 

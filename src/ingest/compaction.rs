@@ -109,7 +109,7 @@ impl Ingestor {
             .query(
                 "SELECT project_name, time_bucket_start_unix_nano
                 FROM trace_segments
-                WHERE compacted_at IS NULL
+                WHERE compacted_at_unix_nano IS NULL
                 GROUP BY project_name, time_bucket_start_unix_nano
                 HAVING count(*) > 1
                 ORDER BY time_bucket_start_unix_nano, project_name
@@ -161,9 +161,9 @@ impl Ingestor {
         let row = tx
             .query_opt(
                 "INSERT INTO compaction_leases(
-                    project_name, holder_id, lease_expires_at_unix_nano, updated_at
+                    project_name, holder_id, lease_expires_at_unix_nano
                 )
-                VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+                VALUES ($1, $2, $3)
                 ON CONFLICT (project_name) DO NOTHING
                 RETURNING holder_id",
                 &[&project_name, &holder_id, &lease_expires_at_unix_nano],

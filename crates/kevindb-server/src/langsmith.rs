@@ -8,7 +8,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use chrono::{DateTime, SecondsFormat, Utc};
 use kevindb::query::{RunProjection, RunQuery, RunQueryDiagnostics, RunQueryLimits, RunSummary};
-use kevindb::{RunEventKind, SpanRecord};
+use kevindb_core::{RunEventKind, SpanRecord, generated_project_id};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_postgres::NoTls;
@@ -21,6 +21,7 @@ mod diagnostics;
 mod direct_runs;
 mod feedback;
 mod filter;
+mod identifiers;
 mod payload;
 mod threads;
 pub use diagnostics::RunQueryDiagnosticsResponse;
@@ -29,6 +30,10 @@ pub(crate) use feedback::{
     create_feedback, list_feedback, list_run_feedback, read_feedback, update_feedback,
 };
 use filter::{parse_filter, parse_tree_filter};
+use identifiers::{
+    canonical_uuid, normalize_trace_filter, otel_trace_id_to_uuid, tenant_uuid, uuid_simple,
+    uuid_to_otel_trace_id, uuid_to_span_id,
+};
 use payload::LangSmithPayload;
 pub use threads::{
     ThreadResponse, ThreadTraceResponse, ThreadTracesResponse, ThreadsQueryRequest,
@@ -58,7 +63,8 @@ impl ServerState {
             }
         });
 
-        let limit = i64::try_from(limit.unwrap_or(100).min(1000)).unwrap_or(1000);
+        let limit = i64::try_from(limit.unwrap_or(100).min(1000))
+            .expect("a project page limit of at most 1000 fits in i64");
         let rows = if let Some(name) = name {
             client
                 .query(
@@ -87,28 +93,40 @@ impl ServerState {
             return Ok(Vec::new());
         }
 
-        let project_names = self.list_project_names(None, None).await?;
-        let project_names_by_id = project_names
-            .iter()
-            .map(|name| (project_uuid(name).to_string(), name.clone()))
-            .collect::<HashMap<_, _>>();
-        let known_names = project_names.into_iter().collect::<HashSet<_>>();
-
         let mut resolved = Vec::new();
+        let mut client = None;
         for selector in selectors {
             if selector.trim().is_empty() {
                 continue;
             }
 
-            let uuid_key = Uuid::parse_str(&selector).map(|id| id.to_string()).ok();
-            if let Some(name) = uuid_key
-                .as_ref()
-                .and_then(|key| project_names_by_id.get(key))
-                .cloned()
-            {
-                resolved.push(name);
-            } else if known_names.contains(&selector) || uuid_key.is_none() {
+            if Uuid::parse_str(&selector).is_err() {
                 resolved.push(selector);
+                continue;
+            }
+            if client.is_none() {
+                let (postgres, connection) = tokio_postgres::connect(&self.postgres_url, NoTls)
+                    .await
+                    .context("connect postgres for project selector lookup")?;
+                tokio::spawn(async move {
+                    if let Err(err) = connection.await {
+                        tracing::warn!(error = %err, "postgres project selector connection failed");
+                    }
+                });
+                client = Some(postgres);
+            }
+            let canonical_id = Uuid::parse_str(&selector)?.to_string();
+            if let Some(row) = client
+                .as_ref()
+                .context("project selector client was not initialized")?
+                .query_opt(
+                    "SELECT name FROM projects WHERE id = $1 OR name = $2 LIMIT 1",
+                    &[&canonical_id, &selector],
+                )
+                .await
+                .context("resolve project selector")?
+            {
+                resolved.push(row.get(0));
             }
         }
 
@@ -144,7 +162,7 @@ pub(super) async fn read_run(
         .load_run_summary_by_id(&run_id)
         .await?
         .ok_or_else(|| ApiError::not_found("run not found".to_owned()))?;
-    Ok(Json(RunResponse::from(run)))
+    Ok(Json(RunResponse::try_from_summary(run)?))
 }
 
 pub(super) async fn list_sessions(
@@ -216,7 +234,7 @@ pub(super) async fn query_runs(
             .or(request.start_time_lte.as_deref())
             .or(request.end_time.as_deref()),
     )?;
-    let offset = request.cursor_offset().or(request.offset);
+    let offset = request.cursor_offset()?.or(request.offset);
     let limit = request.limit;
     let include_payload = request.include_payload();
     let max_candidate_runs = limit
@@ -231,17 +249,19 @@ pub(super) async fn query_runs(
         };
         let direct = direct_runs::load_direct_runs(&state, direct_run_ids, projection).await?;
         crate::metrics::record_run_query(&direct.diagnostics);
-        return Ok(Json(RunsResponse::from_runs_with_limit_and_diagnostics(
-            direct.runs,
-            limit,
-            offset,
-            request.debug.unwrap_or(false).then_some(direct.diagnostics),
-        )));
+        return Ok(Json(
+            RunsResponse::try_from_runs_with_limit_and_diagnostics(
+                direct.runs,
+                limit,
+                offset,
+                request.debug.unwrap_or(false).then_some(direct.diagnostics),
+            )?,
+        ));
     }
 
     let run_query = RunQuery {
         project_names,
-        trace_id: normalize_trace_filter(request.trace_id),
+        trace_id: normalize_trace_filter(request.trace_id)?,
         parent_run_id,
         parent_span_id: request.parent_span_id,
         run_type: request.run_type,
@@ -274,19 +294,22 @@ pub(super) async fn query_runs(
     crate::metrics::record_run_query(&result.diagnostics);
     let diagnostics = request.debug.unwrap_or(false).then_some(result.diagnostics);
 
-    Ok(Json(RunsResponse::from_runs_with_limit_and_diagnostics(
-        result.runs,
-        limit,
-        offset,
-        diagnostics,
-    )))
+    Ok(Json(
+        RunsResponse::try_from_runs_with_limit_and_diagnostics(
+            result.runs,
+            limit,
+            offset,
+            diagnostics,
+        )?,
+    ))
 }
 
 pub(super) async fn read_project_trace(
     State(state): State<ServerState>,
     Path((project_name, trace_id)): Path<(String, String)>,
 ) -> Result<Json<TraceResponse>, ApiError> {
-    let trace_id = normalize_trace_filter(Some(trace_id)).unwrap_or_default();
+    let trace_id = normalize_trace_filter(Some(trace_id))?
+        .ok_or_else(|| ApiError::bad_request("trace_id is required".to_owned()))?;
     let runs = state
         .query_engine()
         .list_runs_in_trace(&project_name, &trace_id)
@@ -297,7 +320,11 @@ pub(super) async fn read_project_trace(
         return Err(ApiError::not_found("trace not found".to_owned()));
     }
 
-    Ok(Json(TraceResponse::from_runs(project_name, trace_id, runs)))
+    Ok(Json(TraceResponse::try_from_runs(
+        project_name,
+        trace_id,
+        runs,
+    )?))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -485,9 +512,14 @@ impl ServerState {
             if let Some(project_name) = projects.pop() {
                 return Ok(project_name);
             }
+            return Err(ApiError::bad_request(format!(
+                "session_id does not identify a project: {session_id}"
+            )));
         }
 
-        Ok("default".to_owned())
+        Err(ApiError::bad_request(
+            "project_name or session_name is required for a new run".to_owned(),
+        ))
     }
 
     async fn load_run_head(&self, run_id: &str) -> Result<Option<StoredRunHead>, ApiError> {
@@ -533,13 +565,15 @@ impl ServerState {
     }
 
     async fn load_run_payload(&self, run_id: &str) -> Result<LangSmithPayload, ApiError> {
-        Ok(self
+        let run = self
             .query_engine()
             .load_run_by_id(run_id)
             .await
             .context("load run payload")?
-            .map(|run| LangSmithPayload::from_attributes_json(&run.attributes_json))
-            .unwrap_or_default())
+            .ok_or_else(|| anyhow::anyhow!("run payload missing for existing run {run_id}"))?;
+        Ok(LangSmithPayload::from_attributes_json(
+            &run.attributes_json,
+        )?)
     }
 }
 
@@ -556,7 +590,7 @@ pub struct ProjectResponse {
 impl ProjectResponse {
     fn from_project_name(name: String) -> Self {
         Self {
-            id: project_uuid(&name).to_string(),
+            id: generated_project_id(&name),
             name,
             tenant_id: tenant_uuid().to_string(),
             reference_dataset_id: None,
@@ -646,11 +680,18 @@ impl RunsQueryRequest {
         Ok(())
     }
 
-    fn cursor_offset(&self) -> Option<usize> {
+    fn cursor_offset(&self) -> Result<Option<usize>, ApiError> {
         self.cursor
             .as_deref()
-            .filter(|cursor| !cursor.trim().is_empty())
-            .and_then(|cursor| cursor.parse().ok())
+            .map(|cursor| {
+                if cursor.trim().is_empty() {
+                    return Err(ApiError::bad_request("cursor must not be empty".to_owned()));
+                }
+                cursor.parse::<usize>().map_err(|error| {
+                    ApiError::bad_request(format!("cursor must be an unsigned integer: {error}"))
+                })
+            })
+            .transpose()
     }
 
     fn include_payload(&self) -> bool {
@@ -700,20 +741,29 @@ pub struct TraceResponse {
 }
 
 impl TraceResponse {
-    fn from_runs(project_name: String, trace_id: String, runs: Vec<RunSummary>) -> Self {
-        let runs = RunsResponse::new(runs.into_iter().map(RunResponse::from).collect()).runs;
+    fn try_from_runs(
+        project_name: String,
+        trace_id: String,
+        runs: Vec<RunSummary>,
+    ) -> Result<Self, ApiError> {
+        let runs = RunsResponse::new(
+            runs.into_iter()
+                .map(RunResponse::try_from_summary)
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+        .runs;
         let root_run_ids = runs
             .iter()
             .filter(|run| run.is_root)
             .map(|run| run.id.clone())
             .collect();
 
-        Self {
+        Ok(Self {
             project_name,
             trace_id,
             root_run_ids,
             runs,
-        }
+        })
     }
 }
 
@@ -731,13 +781,16 @@ impl RunsResponse {
         }
     }
 
-    fn from_runs_with_limit_and_diagnostics(
+    fn try_from_runs_with_limit_and_diagnostics(
         runs: Vec<RunSummary>,
         limit: Option<usize>,
         offset: Option<usize>,
         diagnostics: Option<RunQueryDiagnostics>,
-    ) -> Self {
-        let mut runs = runs.into_iter().map(RunResponse::from).collect::<Vec<_>>();
+    ) -> Result<Self, ApiError> {
+        let mut runs = runs
+            .into_iter()
+            .map(RunResponse::try_from_summary)
+            .collect::<Result<Vec<_>, _>>()?;
         let next = limit.and_then(|limit| {
             if runs.len() > limit {
                 runs.truncate(limit);
@@ -747,11 +800,11 @@ impl RunsResponse {
             }
         });
 
-        Self {
+        Ok(Self {
             runs: runs_with_children(runs),
             cursors: CursorResponse { next },
             diagnostics: diagnostics.map(RunQueryDiagnosticsResponse::from),
-        }
+        })
     }
 }
 
@@ -782,19 +835,20 @@ pub struct RunResponse {
     pub child_run_ids: Vec<String>,
 }
 
-impl From<RunSummary> for RunResponse {
-    fn from(run: RunSummary) -> Self {
+impl RunResponse {
+    pub(crate) fn try_from_summary(run: RunSummary) -> Result<Self, ApiError> {
         let id = run.run_id.clone();
-        let session_id = project_uuid(&run.project_name).to_string();
+        let session_id = generated_project_id(&run.project_name);
         let parent_run_id = run.parent_run_id.clone();
         let start_time = unix_nano_to_rfc3339(run.start_time_unix_nano);
         let end_time =
             (run.end_time_unix_nano > 0).then(|| unix_nano_to_rfc3339(run.end_time_unix_nano));
         let error = (run.status == "error").then(|| "error".to_owned());
         let dotted_order = format!("{:020}.{}", run.start_time_unix_nano.max(0), run.span_id);
-        let payload = LangSmithPayload::from_attributes_json(&run.attributes_json);
+        let payload = LangSmithPayload::from_attributes_json(&run.attributes_json)
+            .context("parse stored LangSmith run payload")?;
 
-        Self {
+        Ok(Self {
             id,
             project_name: run.project_name,
             session_id,
@@ -818,7 +872,7 @@ impl From<RunSummary> for RunResponse {
             error: payload.error.or(error),
             dotted_order,
             child_run_ids: Vec::new(),
-        }
+        })
     }
 }
 
@@ -850,65 +904,6 @@ fn query_error(error: anyhow::Error) -> ApiError {
     } else {
         ApiError::from(error)
     }
-}
-
-fn tenant_uuid() -> Uuid {
-    Uuid::from_u128(0x4b4556494e4440008000000000000001)
-}
-
-fn project_uuid(project_name: &str) -> Uuid {
-    Uuid::new_v5(
-        &Uuid::NAMESPACE_URL,
-        format!("kevindb:project:{project_name}").as_bytes(),
-    )
-}
-
-fn canonical_uuid(value: &str, field: &str) -> Result<String, ApiError> {
-    Uuid::parse_str(value)
-        .map(|uuid| uuid.to_string())
-        .map_err(|error| ApiError::bad_request(format!("{field} must be a UUID: {error}")))
-}
-
-fn uuid_to_otel_trace_id(value: &str, field: &str) -> Result<String, ApiError> {
-    Uuid::parse_str(value)
-        .map(|uuid| uuid.simple().to_string())
-        .map_err(|error| ApiError::bad_request(format!("{field} must be a UUID: {error}")))
-}
-
-fn uuid_simple(value: &str) -> String {
-    Uuid::parse_str(value)
-        .map(|uuid| uuid.simple().to_string())
-        .unwrap_or_else(|_| value.replace('-', ""))
-}
-
-fn uuid_to_span_id(value: &str) -> String {
-    uuid_simple(value).chars().take(16).collect()
-}
-
-fn otel_trace_id_to_uuid(trace_id: &str) -> String {
-    if let Ok(uuid) = Uuid::parse_str(trace_id) {
-        return uuid.to_string();
-    }
-    if trace_id.len() == 32 && trace_id.chars().all(|char| char.is_ascii_hexdigit()) {
-        return format!(
-            "{}-{}-{}-{}-{}",
-            &trace_id[0..8],
-            &trace_id[8..12],
-            &trace_id[12..16],
-            &trace_id[16..20],
-            &trace_id[20..32]
-        );
-    }
-
-    trace_id.to_owned()
-}
-
-fn normalize_trace_filter(trace_id: Option<String>) -> Option<String> {
-    trace_id.map(|trace_id| {
-        Uuid::parse_str(&trace_id)
-            .map(|uuid| uuid.simple().to_string())
-            .unwrap_or(trace_id)
-    })
 }
 
 fn parse_time_nanos(value: Option<&str>) -> Result<Option<i64>, ApiError> {
@@ -945,7 +940,7 @@ fn unix_nano_to_rfc3339(nanos: i64) -> String {
     let subsecond_nanos = nanos.rem_euclid(1_000_000_000) as u32;
 
     DateTime::<Utc>::from_timestamp(seconds, subsecond_nanos)
-        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+        .expect("every i64 nanosecond timestamp is in Chrono's supported range")
         .to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 

@@ -2,8 +2,8 @@ use super::{
     MAX_INDEXED_VALUE_BYTES, MAX_JSON_KEYS_PER_RUN, MutableSearchIndex, SearchIndex,
     exact_value_token, json_tape, tokens_for_text,
 };
-use crate::record::SpanRecord;
 use anyhow::Context;
+use kevindb_core::SpanRecord;
 
 pub(super) fn build_search_index(records: &[SpanRecord]) -> anyhow::Result<SearchIndex> {
     let mut builder = SearchIndexBuilder::new(records.len());
@@ -108,8 +108,8 @@ fn status_from_record(record: &SpanRecord) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::RunEventKind;
     use crate::search::{SearchField, SearchPredicate, SearchQuery};
+    use kevindb_core::RunEventKind;
 
     #[test]
     fn flattens_arrays_without_row_number_paths() {

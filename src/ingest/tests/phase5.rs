@@ -7,6 +7,64 @@ use serde_json::json;
 const HOUR_NANOS: i64 = 60 * 60 * 1_000_000_000;
 
 #[tokio::test]
+async fn concurrent_workers_serialize_project_rollup_refreshes() {
+    let mockgres = Mockgres::start().await.expect("start mockgres");
+    run_migrations(mockgres.postgres_url())
+        .await
+        .expect("run migrations");
+    let (client, connection) = tokio_postgres::connect(mockgres.postgres_url(), NoTls)
+        .await
+        .expect("connect postgres");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .execute(
+            "INSERT INTO projects(name, id) VALUES ('demo', 'demo-id')",
+            &[],
+        )
+        .await
+        .expect("seed concurrent ingest project");
+    let first = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        Arc::new(InMemory::new()),
+        IngestConfig {
+            max_spans_per_segment: 1,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+    let second = Ingestor::new(
+        mockgres.postgres_url().to_owned(),
+        Arc::new(InMemory::new()),
+        IngestConfig {
+            max_spans_per_segment: 1,
+            max_flush_delay: Duration::ZERO,
+        },
+    );
+
+    let (first_result, second_result) = tokio::join!(
+        first.ingest_records(vec![sample_record("1111111111111111", 10)]),
+        second.ingest_records(vec![sample_record("2222222222222222", 20)]),
+    );
+    first_result.expect("first concurrent ingest");
+    second_result.expect("second concurrent ingest");
+
+    let run_count: i64 = client
+        .query_one(
+            "SELECT run_count
+            FROM run_metric_rollups
+            WHERE project_name = 'demo' AND rollup_kind = 'project'",
+            &[],
+        )
+        .await
+        .expect("load serialized project rollup")
+        .get(0);
+    assert_eq!(run_count, 2);
+
+    mockgres.stop().await.expect("stop mockgres");
+}
+
+#[tokio::test]
 async fn aggregates_use_rollups_and_typed_vortex_columns() {
     let mockgres = Mockgres::start().await.expect("start mockgres");
     run_migrations(mockgres.postgres_url())
@@ -177,6 +235,41 @@ async fn aggregates_use_rollups_and_typed_vortex_columns() {
             .and_then(|stats| stats.p50),
         Some(7.0)
     );
+
+    assert!(
+        query_engine
+            .delete_run(
+                "demo",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "1111111111111111",
+                Some("aggregate_refresh_test"),
+            )
+            .await
+            .expect("delete metric run")
+    );
+    let after_delete = query_engine
+        .aggregate_runs(RunAggregateQuery {
+            project_names: vec!["demo".to_owned()],
+            group_by: vec![
+                RunAggregateGroup::Project,
+                RunAggregateGroup::TimeBucket,
+                RunAggregateGroup::RunType,
+            ],
+            time_bucket_nanos: Some(HOUR_NANOS),
+            ..RunAggregateQuery::new("demo")
+        })
+        .await
+        .expect("aggregate refreshed rollups after delete");
+    let llm_after_delete = after_delete
+        .rows
+        .iter()
+        .find(|row| {
+            row.group
+                .get("run_type")
+                .is_some_and(|value| value == "llm")
+        })
+        .expect("remaining llm rollup row");
+    assert_eq!(llm_after_delete.metrics.count, 1);
 
     PostgresMetastore::new(mockgres.postgres_url())
         .insert_feedback(&FeedbackRecord {

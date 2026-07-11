@@ -15,7 +15,7 @@ use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 
 use crate::metrics::TypedRunMetrics;
-use crate::record::SpanRecord;
+use kevindb_core::SpanRecord;
 
 pub const SPAN_SEGMENT_SCHEMA_VERSION: i64 = 3;
 pub const ROW_INDEXED_SPAN_SEGMENT_SCHEMA_VERSION: i64 = 3;
@@ -93,7 +93,7 @@ fn records_to_batch(records: &[SpanRecord]) -> Result<RecordBatch> {
     let metrics = records
         .iter()
         .map(TypedRunMetrics::from_record)
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     let columns: Vec<ArrowArrayRef> = vec![
         Arc::new(StringArray::from(
             records
@@ -290,7 +290,7 @@ mod tests {
             start_time_unix_nano: 1,
             end_time_unix_nano: 2,
             status_code: 1,
-            event_kind: crate::record::RunEventKind::End,
+            event_kind: kevindb_core::RunEventKind::End,
             attributes_json: "{}".to_owned(),
             idempotency_key: None,
         }

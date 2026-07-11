@@ -63,7 +63,6 @@ async fn load_trace_tree_runs(
                     WHEN tree.parent_span_id IS NULL
                         OR parent_heads.span_id IS NULL
                         OR parent_heads.deleted_at_unix_nano IS NOT NULL
-                        OR parent_deletions.span_id IS NOT NULL
                     THEN NULL
                     ELSE heads.parent_run_id
                 END AS parent_run_id,
@@ -71,7 +70,6 @@ async fn load_trace_tree_runs(
                     WHEN tree.parent_span_id IS NULL
                         OR parent_heads.span_id IS NULL
                         OR parent_heads.deleted_at_unix_nano IS NOT NULL
-                        OR parent_deletions.span_id IS NOT NULL
                     THEN NULL
                     ELSE tree.parent_span_id
                 END AS parent_span_id,
@@ -86,22 +84,13 @@ async fn load_trace_tree_runs(
                 ON heads.project_name = tree.project_name
                 AND heads.trace_id = tree.trace_id
                 AND heads.span_id = tree.span_id
-            LEFT JOIN run_deletions deletions
-                ON deletions.project_name = tree.project_name
-                AND deletions.trace_id = tree.trace_id
-                AND deletions.span_id = tree.span_id
             LEFT JOIN run_heads parent_heads
                 ON parent_heads.project_name = tree.project_name
                 AND parent_heads.trace_id = tree.trace_id
                 AND parent_heads.span_id = tree.parent_span_id
-            LEFT JOIN run_deletions parent_deletions
-                ON parent_deletions.project_name = tree.project_name
-                AND parent_deletions.trace_id = tree.trace_id
-                AND parent_deletions.span_id = tree.parent_span_id
             WHERE tree.project_name = $1
                 AND tree.trace_id = $2
                 AND heads.deleted_at_unix_nano IS NULL
-                AND deletions.span_id IS NULL
             ORDER BY tree.subtree_start ASC, heads.start_time_unix_nano ASC, heads.span_id ASC",
             &[&project_name, &trace_id],
         )

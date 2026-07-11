@@ -16,6 +16,9 @@ For multi-process deployments, run migrations from one process or release job.
 Secondary roles can start with `KEVINDB_RUN_MIGRATIONS=false` after the schema
 has been initialized.
 
+KevinDB currently ships one canonical development schema. Schema rewrites
+require rebuilding Postgres; upgrade backfills are intentionally not provided.
+
 ## Object Storage
 
 Use `KEVINDB_OBJECT_STORE=s3` for S3-compatible storage.

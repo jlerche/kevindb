@@ -47,6 +47,14 @@ pub fn generated_run_id(project_name: &str, trace_id: &str, span_id: &str) -> St
     .to_string()
 }
 
+pub fn generated_project_id(project_name: &str) -> String {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("kevindb:project:{project_name}").as_bytes(),
+    )
+    .to_string()
+}
+
 pub fn canonicalize_record_ids(record: &mut SpanRecord) {
     if record.run_id.trim().is_empty() {
         record.run_id = generated_run_id(&record.project_name, &record.trace_id, &record.span_id);
@@ -92,5 +100,11 @@ mod tests {
             record.parent_run_id.as_deref(),
             Some(generated_run_id("demo", "trace", "parent").as_str())
         );
+    }
+
+    #[test]
+    fn generates_stable_project_ids() {
+        assert_eq!(generated_project_id("demo"), generated_project_id("demo"));
+        assert_ne!(generated_project_id("demo"), generated_project_id("other"));
     }
 }

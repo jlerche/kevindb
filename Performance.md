@@ -216,9 +216,9 @@ Single run load:
 
 ```text
 Postgres:
-  run_locators(run_id or generated_run_id)
-  -> trace_segments(id = trace_segment_id, compacted_at IS NULL)
-  -> run_heads/run_deletions for delete filtering
+  run_locators(run_id)
+  -> trace_segments(id = trace_segment_id, compacted_at_unix_nano IS NULL)
+  -> run_heads for delete filtering
 DataFusion:
   open exactly the locator segment
   filter project_name, trace_id, run_id/span_id, row_index
@@ -232,7 +232,7 @@ Trace tree load:
 Postgres:
   run_tree_nodes(project_name, trace_id)
   -> current run_heads
-  -> run_deletions for delete filtering
+  -> run_heads for delete filtering
 DataFusion:
   not used
 Object storage:
@@ -246,7 +246,7 @@ Selective project/time filtering:
 ```text
 Postgres:
   run_heads(project_name, start_time_unix_nano, trace_segment_id)
-  -> trace_segments(compacted_at IS NULL)
+  -> trace_segments(compacted_at_unix_nano IS NULL)
 DataFusion:
   open candidate segments returned by metastore pruning
 Budget assertion:
@@ -259,7 +259,7 @@ Interactive scalar filtering:
 Postgres:
   run_heads(project_name, start_time_unix_nano, trace_segment_id)
   -> run_tags/run_metadata/feedback scalar indexes when filters reference them
-  -> trace_segments(compacted_at IS NULL)
+  -> trace_segments(compacted_at_unix_nano IS NULL)
 DataFusion:
   open candidate segments returned by metastore pruning
   push project/trace/run_type/start_time predicates into each Vortex source

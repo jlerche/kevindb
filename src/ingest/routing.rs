@@ -7,13 +7,12 @@ pub(super) async fn record_project_route(
     last_segment_uri: &str,
 ) -> Result<()> {
     tx.execute(
-        "INSERT INTO project_routes(project_name, node_id, last_segment_uri, updated_at)
-        VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+        "INSERT INTO project_routes(project_name, node_id, last_segment_uri)
+        VALUES ($1, $2, $3)
         ON CONFLICT (project_name)
         DO UPDATE SET
             node_id = EXCLUDED.node_id,
-            last_segment_uri = EXCLUDED.last_segment_uri,
-            updated_at = CURRENT_TIMESTAMP",
+            last_segment_uri = EXCLUDED.last_segment_uri",
         &[&project_name, &node_id, &last_segment_uri],
     )
     .await

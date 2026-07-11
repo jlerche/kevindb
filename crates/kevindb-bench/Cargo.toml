@@ -11,6 +11,7 @@ async-trait = "0.1.89"
 bytes = "1.11.0"
 futures-util = "0.3.31"
 kevindb = { path = "../.." }
+kevindb-core = { path = "../kevindb-core" }
 kevindb-metastore-postgres = { path = "../kevindb-metastore-postgres" }
 object_store = "0.13.2"
 serde = { version = "1.0.228", features = ["derive"] }

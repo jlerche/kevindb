@@ -82,7 +82,7 @@ Implemented or in progress:
   LangSmith-compatible thread query endpoints.
 
 Phase 6 now includes an object-store-aware FST sibling index for full-text and
-path-aware JSON predicates. Large payload scans remain an unacceptable fallback.
+path-aware JSON predicates. Large payload scans remain prohibited.
 
 ## Design Principles
 
@@ -229,16 +229,14 @@ Tasks:
   - project, trace, run/span IDs
   - min/max time
   - root/parent IDs
-- [x] Add a `run_locators` or equivalent table keyed by run ID and generated
-  run ID.
+- [x] Add a `run_locators` table keyed by canonical run ID.
 - [x] Add a `trace_locators` path for trace-level loading.
 - [x] Persist per-segment schema version.
 
 Subtasks:
 
-- [x] Use a current-only development schema for row locators; existing legacy
-  local data must be reset instead of silently backfilled with incomplete
-  generated run IDs or idempotency keys.
+- [x] Use a current-only development schema for row locators; existing local
+  data must be reset after schema rewrites.
 - [x] Add object-store missing-object detection around row-locator reads.
 - [x] Add unit tests for stale locators after compaction.
 
@@ -408,10 +406,10 @@ Phase 2 evidence:
 
 - `src/query/filter.rs` and `src/query/filter/parser.rs` implement the filter
   AST/parser/compiler for the indexed LangSmith filter surface.
-- `crates/kevindb-metastore-postgres/migrations/V11__add_phase2_filter_indexes.sql` adds scalar run-head,
-  tag, metadata, feedback, and project-cardinality indexes.
+- `crates/kevindb-metastore-postgres/migrations/V1__create_current_schema.sql`
+  defines scalar run-head, tag, metadata, and feedback indexes.
 - `src/ingest/indexes.rs` materializes bounded scalar indexes and refreshes
-  `project_filter_stats` with `COUNT(DISTINCT ...)`.
+  affected aggregate buckets.
 - `src/query/planner.rs` plans candidate runs, row locators, and segments in
   Postgres, estimates fanout, and enforces pre-read run/segment/request/byte
   limits.
@@ -448,7 +446,7 @@ Tasks:
 
 Subtasks:
 
-- [x] Add migration for tree edge and closure/nested-set metadata.
+- [x] Add tree edge and closure/nested-set metadata to the canonical schema.
 - [x] Add tests for:
   - simple tree
   - multiple roots
@@ -483,7 +481,8 @@ Exit criteria:
 - [x] Tree filters avoid scanning all runs in all traces.
 
 Phase 3 evidence:
-- `V12__add_phase3_tree_indexes.sql` adds tree nodes, edges, intervals, depth, sibling order, descendant counts, and guard flags.
+- The canonical schema adds tree nodes, edges, intervals, depth, sibling order,
+  descendant counts, and guard flags.
 - `src/ingest/tree.rs` refreshes trace tree metadata from current heads on ingest and compaction, and `src/query/tree_access.rs` reconstructs trace trees from metadata without Vortex reads.
 - `src/query/tree_filter.rs` and `src/query/planner.rs` compile tree filters into metastore candidate-key predicates before Vortex reads.
 - `src/ingest/tests/phase3.rs` covers late parent repair, multiple roots, descendant filters, and cycle guarding; bench workloads now use real tree filters.
@@ -511,9 +510,9 @@ Tasks:
 
 Subtasks:
 
-- [x] Add migration for `threads`, `thread_traces`, and thread-level summaries.
+- [x] Add `threads`, `thread_traces`, and thread-level summaries to the schema.
 - [x] Add tests for multi-trace thread ingestion.
-- [x] Add backfill from existing run metadata.
+- [x] Materialize thread state from current run metadata during ingest.
 
 Exit criteria:
 
@@ -565,15 +564,15 @@ Exit criteria:
   storage.
 
 Phase 4 evidence:
-- `V13__add_phase4_thread_indexes.sql` adds thread tables, preview locators,
-  pagination indexes, and a best-effort backfill from `run_metadata`.
+- The canonical schema includes thread tables, preview locators, and pagination
+  indexes.
 - `src/ingest/thread.rs` extracts `thread_id`/`session_id`, bounded previews,
   message previews, and thread summaries inside the ingest metadata transaction.
 - `src/query/threads.rs` implements metastore-only thread list, trace list, and
   message listing with tuple cursors and zero Vortex/object-store fanout.
 - `crates/kevindb-server/src/langsmith/threads.rs` exposes the two `/v2/threads`
   contracts with documented fields, select handling, and cursor pagination.
-- Phase 4 tests cover multi-trace ingestion, fallback IDs, ordinary traces,
+- Phase 4 tests cover multi-trace ingestion, canonical OTLP IDs, ordinary traces,
   cursor stability, root-run filtering, long threads, and HTTP compatibility.
 - The 2026-07-04 benchmark records real `thread-trace-listing`: p50 0.62 ms,
   p99 1.12 ms, zero candidate segments, and zero object-store requests.
@@ -656,7 +655,7 @@ Exit criteria:
 - [x] Dashboard-like stats avoid raw segment scans for common time windows.
 
 Phase 5 evidence: typed metrics live in `src/metrics.rs`, Vortex columns, and
-run heads; `src/query/aggregates/`, `V14__add_phase5_aggregates.sql`, feedback
+run heads; `src/query/aggregates/`, the canonical schema, feedback
 rollups, and `/v1/runs/aggregate` cover aggregate APIs, diagnostics, fanout
 limits, rollups, feedback scores, and tests.
 
@@ -727,10 +726,10 @@ Goal: implement real object-store-aware search and JSON filtering.
 - [x] Compacting a project rewrites active runs through normal ingestion, which
   rebuilds sibling indexes aligned to the compacted Vortex row order.
 - [x] Query routing rejects missing indexes, covering the core-segment-written
-  but index-missing crash shape without an unsafe live-tail fallback.
+  but index-missing crash shape while rejecting unsafe live-tail scans.
 
 Phase 6 evidence: `src/search/`, `src/query/search.rs`,
-`src/query/filter/phase6.rs`, `V15__add_phase6_search_indexes.sql`, ingest
+`src/query/filter/phase6.rs`, the canonical schema, ingest
 metadata wiring, server structured-filter support, streaming JSON construction
 tests, range-read diagnostics tests, and `src/ingest/tests/phase6.rs`.
 
@@ -780,7 +779,7 @@ Tasks:
 
 Subtasks:
 
-- [x] Add lease migration and mockgres tests.
+- [x] Add compaction leases to the canonical schema and mockgres tests.
 - [x] Add compaction idempotency.
 - [x] Add orphaned object reconciliation.
 
@@ -963,7 +962,7 @@ Exit criteria:
   queries, and KevinDB can run locally and in a basic self-hosted environment.
 
 ## Explicit Non-Goals Until Phase 6
-Until the Phase 6 index exists, do not add payload scan fallbacks for
+Without the Phase 6 index, reject payload scans for
 full-text search, Postgres JSONB storage for large `inputs` or `outputs`,
 production token tables, phrase search without positions, JSON path/value
 search without path-aware postings, or index formats that cannot be compacted

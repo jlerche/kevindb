@@ -65,7 +65,7 @@ pub(crate) async fn query_threads(
         .await
         .map_err(query_error)?;
 
-    Ok(Json(ThreadsQueryResponse::from(page)))
+    Ok(Json(ThreadsQueryResponse::try_from_page(page)?))
 }
 
 pub(crate) async fn query_thread_traces(
@@ -98,7 +98,7 @@ pub(crate) async fn query_thread_traces(
         .map_err(query_error)?;
     let selects = ThreadTraceSelects::from_values(request.selects);
 
-    Ok(Json(ThreadTracesResponse::from_page(page, &selects)))
+    Ok(Json(ThreadTracesResponse::try_from_page(page, &selects)?))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -163,15 +163,18 @@ pub struct ThreadTracesResponse {
 }
 
 impl ThreadTracesResponse {
-    fn from_page(page: ThreadTracePage, selects: &ThreadTraceSelects) -> Self {
-        Self {
+    fn try_from_page(
+        page: ThreadTracePage,
+        selects: &ThreadTraceSelects,
+    ) -> Result<Self, ApiError> {
+        Ok(Self {
             items: page
                 .items
                 .into_iter()
                 .map(|trace| ThreadTraceResponse::from_summary(trace, selects))
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
             next_cursor: page.next_cursor,
-        }
+        })
     }
 }
 
@@ -182,12 +185,16 @@ pub struct ThreadsQueryResponse {
     pub next_cursor: Option<String>,
 }
 
-impl From<ThreadListPage> for ThreadsQueryResponse {
-    fn from(page: ThreadListPage) -> Self {
-        Self {
-            items: page.items.into_iter().map(ThreadResponse::from).collect(),
+impl ThreadsQueryResponse {
+    fn try_from_page(page: ThreadListPage) -> Result<Self, ApiError> {
+        Ok(Self {
+            items: page
+                .items
+                .into_iter()
+                .map(ThreadResponse::try_from_summary)
+                .collect::<Result<Vec<_>, _>>()?,
             next_cursor: page.next_cursor,
-        }
+        })
     }
 }
 
@@ -237,8 +244,11 @@ pub struct ThreadTraceResponse {
 }
 
 impl ThreadTraceResponse {
-    fn from_summary(trace: ThreadTraceSummary, selects: &ThreadTraceSelects) -> Self {
-        Self {
+    fn from_summary(
+        trace: ThreadTraceSummary,
+        selects: &ThreadTraceSelects,
+    ) -> Result<Self, ApiError> {
+        Ok(Self {
             completion_cost: selects
                 .include("COMPLETION_COST")
                 .then_some(trace.completion_cost)
@@ -300,8 +310,8 @@ impl ThreadTraceResponse {
                 .include("TOTAL_TOKENS")
                 .then_some(trace.total_tokens)
                 .flatten(),
-            trace_id: otel_trace_id_to_uuid(&trace.trace_id),
-        }
+            trace_id: otel_trace_id_to_uuid(&trace.trace_id)?,
+        })
     }
 }
 
@@ -330,13 +340,25 @@ pub struct ThreadResponse {
     pub num_errored_turns: i64,
 }
 
-impl From<ThreadSummary> for ThreadResponse {
-    fn from(thread: ThreadSummary) -> Self {
-        Self {
+impl ThreadResponse {
+    fn try_from_summary(thread: ThreadSummary) -> Result<Self, ApiError> {
+        Ok(Self {
             thread_id: thread.thread_id,
-            trace_id: thread.trace_id.as_deref().map(otel_trace_id_to_uuid),
-            first_trace_id: thread.first_trace_id.as_deref().map(otel_trace_id_to_uuid),
-            last_trace_id: thread.last_trace_id.as_deref().map(otel_trace_id_to_uuid),
+            trace_id: thread
+                .trace_id
+                .as_deref()
+                .map(otel_trace_id_to_uuid)
+                .transpose()?,
+            first_trace_id: thread
+                .first_trace_id
+                .as_deref()
+                .map(otel_trace_id_to_uuid)
+                .transpose()?,
+            last_trace_id: thread
+                .last_trace_id
+                .as_deref()
+                .map(otel_trace_id_to_uuid)
+                .transpose()?,
             count: thread.count,
             min_start_time: thread.min_start_time_unix_nano.map(unix_nano_to_rfc3339),
             max_start_time: thread.max_start_time_unix_nano.map(unix_nano_to_rfc3339),
@@ -354,7 +376,7 @@ impl From<ThreadSummary> for ThreadResponse {
             latency_p50: thread.latency_p50,
             latency_p99: thread.latency_p99,
             num_errored_turns: thread.num_errored_turns,
-        }
+        })
     }
 }
 

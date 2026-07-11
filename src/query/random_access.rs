@@ -276,8 +276,7 @@ async fn load_run_locator(
     let deletion_sql = if include_deleted {
         ""
     } else {
-        "AND run_heads.deleted_at_unix_nano IS NULL
-                AND run_deletions.span_id IS NULL"
+        "AND run_heads.deleted_at_unix_nano IS NULL"
     };
     let row = client
         .query_opt(
@@ -297,16 +296,12 @@ async fn load_run_locator(
                     ON run_heads.project_name = run_locators.project_name
                     AND run_heads.trace_id = run_locators.trace_id
                     AND run_heads.span_id = run_locators.span_id
-                LEFT JOIN run_deletions
-                    ON run_deletions.project_name = run_locators.project_name
-                    AND run_deletions.trace_id = run_locators.trace_id
-                    AND run_deletions.span_id = run_locators.span_id
                 WHERE run_locators.run_id = $1
-                    AND trace_segments.compacted_at IS NULL
+                    AND trace_segments.compacted_at_unix_nano IS NULL
                     {deletion_sql}
                 ORDER BY
                     run_locators.event_time_unix_nano DESC,
-                    run_locators.run_event_id DESC NULLS LAST
+                    run_locators.run_event_id DESC
                 LIMIT 1",
             )
             .as_str(),
@@ -489,14 +484,14 @@ async fn load_trace_segment_sources(
             FROM trace_locators
             INNER JOIN trace_segments
                 ON trace_segments.id = trace_locators.trace_segment_id
-            LEFT JOIN run_deletions
-                ON run_deletions.project_name = trace_locators.project_name
-                AND run_deletions.trace_id = trace_locators.trace_id
-                AND run_deletions.span_id = trace_locators.span_id
+            INNER JOIN run_heads
+                ON run_heads.project_name = trace_locators.project_name
+                AND run_heads.trace_id = trace_locators.trace_id
+                AND run_heads.span_id = trace_locators.span_id
             WHERE trace_locators.project_name = $1
                 AND trace_locators.trace_id = $2
-                AND trace_segments.compacted_at IS NULL
-                AND run_deletions.span_id IS NULL
+                AND trace_segments.compacted_at_unix_nano IS NULL
+                AND run_heads.deleted_at_unix_nano IS NULL
             ORDER BY trace_segments.uri, trace_locators.span_id, trace_locators.row_index",
             &[&project_name, &trace_id],
         )

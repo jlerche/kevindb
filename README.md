@@ -45,6 +45,8 @@ Environment variables:
   waits before a durable flush, default `500`.
 
 The server always runs migrations on startup.
+The development schema is current-only: after a schema rewrite, rebuild the
+Postgres database rather than carrying forward an older migration history.
 
 For a local Postgres + MinIO deployment, see [docs/operations.md](docs/operations.md).
 The LangSmith-compatible OpenAPI snapshot is checked in at

@@ -17,7 +17,7 @@ pub struct ObjectCleanupCandidate {
     pub trace_segment_id: i64,
     pub segment_uri: String,
     pub segment_bytes: i64,
-    pub search_index_uri: Option<String>,
+    pub search_index_uri: String,
     pub search_index_bytes: i64,
 }
 
@@ -81,11 +81,9 @@ impl QueryEngine {
             deleted_objects += usize::from(
                 delete_if_exists(self.object_store.as_ref(), &candidate.segment_uri).await?,
             );
-            if let Some(search_index_uri) = &candidate.search_index_uri {
-                deleted_objects += usize::from(
-                    delete_if_exists(self.object_store.as_ref(), search_index_uri).await?,
-                );
-            }
+            deleted_objects += usize::from(
+                delete_if_exists(self.object_store.as_ref(), &candidate.search_index_uri).await?,
+            );
         }
         self.mark_compacted_objects_cleaned(&candidates, now_unix_nano)
             .await?;
@@ -176,8 +174,7 @@ impl QueryEngine {
             .query(
                 "SELECT search_index_uri
                 FROM trace_segments
-                WHERE search_index_uri IS NOT NULL
-                    AND object_deleted_at_unix_nano IS NULL
+                WHERE object_deleted_at_unix_nano IS NULL
                 LIMIT $1",
                 &[&(MAX_ORPHAN_REFERENCES + 1)],
             )
@@ -216,9 +213,9 @@ impl QueryEngine {
             .query(
                 "SELECT id, uri, total_bytes, search_index_uri, search_index_bytes
                 FROM trace_segments
-                WHERE compacted_at IS NOT NULL
+                WHERE compacted_at_unix_nano IS NOT NULL
                     AND object_deleted_at_unix_nano IS NULL
-                    AND COALESCE(compacted_at_unix_nano, 0) <= $1
+                    AND compacted_at_unix_nano <= $1
                 ORDER BY id
                 LIMIT $2",
                 &[&cutoff_unix_nano, &MAX_CLEANUP_CANDIDATES],

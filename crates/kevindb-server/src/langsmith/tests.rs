@@ -1,22 +1,47 @@
 use super::*;
 
+#[tokio::test]
+async fn new_runs_require_an_explicit_project() {
+    let state = ServerState::new(
+        "postgresql://unused",
+        std::sync::Arc::new(object_store::memory::InMemory::new()),
+        kevindb::ingest::IngestConfig::default(),
+    );
+
+    let error = state
+        .resolve_write_project_name(None, None, None)
+        .await
+        .expect_err("new run without a project must fail");
+    assert!(matches!(
+        error,
+        ApiError::BadRequest(message) if message.contains("project_name")
+    ));
+}
+
 #[test]
 fn normalizes_langsmith_trace_filter_to_otel_hex() {
     assert_eq!(
-        normalize_trace_filter(Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_owned())),
-        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned())
+        normalize_trace_filter(Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_owned()))
+            .expect("normalize UUID trace id"),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
     );
-    assert_eq!(
-        normalize_trace_filter(Some("not-a-uuid".to_owned())),
-        Some("not-a-uuid".to_owned())
-    );
+    assert!(normalize_trace_filter(Some("not-a-uuid".to_owned())).is_err());
+}
+
+#[test]
+fn rejects_malformed_pagination_cursors() {
+    let request = RunsQueryRequest {
+        cursor: Some("not-an-offset".to_owned()),
+        ..empty_runs_query_request()
+    };
+    assert!(request.cursor_offset().is_err());
 }
 
 #[test]
 fn builds_langsmith_run_response_fields() {
     let run_id = "33333333-3333-5333-8333-333333333333";
     let parent_run_id = "22222222-2222-5222-8222-222222222222";
-    let response = RunResponse::from(RunSummary {
+    let response = RunResponse::try_from_summary(RunSummary {
         project_name: "demo".to_owned(),
         run_id: run_id.to_owned(),
         trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
@@ -38,7 +63,8 @@ fn builds_langsmith_run_response_fields() {
             "langsmith.tags": ["demo"],
         })
         .to_string(),
-    });
+    })
+    .expect("build run response");
 
     assert_eq!(response.id, run_id);
     assert!(Uuid::parse_str(&response.session_id).is_ok());
@@ -113,8 +139,17 @@ fn merges_partial_langsmith_payload_updates() {
     assert_eq!(payload.events, vec![json!({"name": "token"})]);
     assert_eq!(payload.tags, vec!["demo"]);
 
-    let round_trip = LangSmithPayload::from_attributes_json(&payload.to_attributes_json());
+    let round_trip = LangSmithPayload::from_attributes_json(&payload.to_attributes_json())
+        .expect("parse payload round trip");
     assert_eq!(round_trip, payload);
+
+    assert!(LangSmithPayload::from_attributes_json("not-json").is_err());
+    let unnamespaced = LangSmithPayload::from_attributes_json(
+        r#"{"events":[{"name":"legacy"}],"tags":["legacy"]}"#,
+    )
+    .expect("parse unnamespaced payload");
+    assert!(unnamespaced.events.is_empty());
+    assert!(unnamespaced.tags.is_empty());
 }
 
 fn empty_runs_query_request() -> RunsQueryRequest {

@@ -12,20 +12,22 @@ use tokio::sync::Notify;
 use tokio::sync::oneshot;
 use tokio::time::{Duration, sleep};
 use tokio_postgres::NoTls;
+use tokio_postgres::types::ToSql;
 
 use crate::query::{FilterExpr, QueryEngine, RunQuery, RunSummary};
-use crate::record::{RunEventKind, SpanRecord, canonicalize_record_ids};
 use crate::search::{
     SEARCH_INDEX_SCHEMA_VERSION, build_search_index, encode_search_index,
     search_index_uri_for_segment,
 };
 use crate::segment::encode_span_records;
+use kevindb_core::{RunEventKind, SpanRecord, canonicalize_record_ids};
 
 const INGEST_TIME_BUCKET_UNIX_NANOS: i64 = 60 * 60 * 1_000_000_000;
 const MAX_COMPACTION_SPANS_PER_SEGMENT: usize = 8192;
 const MAX_DUPLICATE_CONFLICT_RETRIES: usize = 3;
 
 mod compaction;
+mod deletion;
 mod indexes;
 mod metadata;
 mod routing;
@@ -33,32 +35,8 @@ mod thread;
 mod tree;
 use compaction::{CompactionCandidate, MAX_SEGMENTS_PER_COMPACTION};
 pub use compaction::{CompactionServiceConfig, CompactionServiceReceipt};
-use metadata::{SegmentObjectMetadata, persist_metadata};
-
-pub(crate) async fn refresh_trace_materialized_metadata(
-    tx: &tokio_postgres::Transaction<'_>,
-    project_name: &str,
-    trace_id: &str,
-) -> Result<()> {
-    let rollup_buckets = tx
-        .query(
-            "SELECT DISTINCT start_time_unix_nano
-            FROM run_heads
-            WHERE project_name = $1 AND trace_id = $2",
-            &[&project_name, &trace_id],
-        )
-        .await
-        .context("load trace aggregate buckets")?
-        .into_iter()
-        .map(|row| indexes::rollup_time_bucket(row.get(0)))
-        .collect::<HashSet<_>>();
-    tree::refresh_trace_tree_metadata(tx, project_name, trace_id).await?;
-    thread::refresh_trace_thread_metadata(tx, project_name, trace_id).await?;
-    for bucket in rollup_buckets {
-        indexes::refresh_project_aggregate_rollups(tx, project_name, bucket).await?;
-    }
-    Ok(())
-}
+pub(crate) use deletion::refresh_deleted_run_metadata;
+use metadata::{RunIdCollision, SegmentObjectMetadata, persist_metadata};
 
 #[derive(Debug, Clone)]
 pub struct IngestConfig {
@@ -170,6 +148,9 @@ impl Ingestor {
 
     pub async fn ingest_records(&self, mut records: Vec<SpanRecord>) -> Result<IngestReceipt> {
         records.iter_mut().for_each(canonicalize_record_ids);
+        for record in &records {
+            validate_ingest_record(record)?;
+        }
         let accepted_spans = records.len();
         if accepted_spans == 0 {
             return Ok(IngestReceipt {
@@ -235,7 +216,7 @@ impl Ingestor {
                     let buffer = pending
                         .buffers
                         .get_mut(&partition)
-                        .expect("partition selected from pending buffers");
+                        .ok_or_else(|| anyhow!("selected ingest partition disappeared"))?;
                     buffer.flushing = true;
                     FlushBatch {
                         partition,
@@ -273,22 +254,24 @@ impl Ingestor {
                     receipts.extend(batch_receipts);
                 }
                 Err(err) => {
-                    let (waiters, error) = {
+                    let discard_records = is_run_id_collision(&err.error);
+                    let error = {
                         let mut pending = self.pending.lock().await;
-                        let buffer = pending.buffers.entry(batch.partition).or_default();
-                        let mut unflushed_records = err.records;
-                        unflushed_records.append(&mut buffer.records);
-                        buffer.records = unflushed_records;
-
-                        let mut waiters = batch.waiters;
-                        waiters.append(&mut buffer.waiters);
+                        let buffer = pending.buffers.entry(batch.partition.clone()).or_default();
+                        if !discard_records {
+                            let mut unflushed_records = err.records;
+                            unflushed_records.append(&mut buffer.records);
+                            buffer.records = unflushed_records;
+                        }
                         buffer.flushing = false;
-
-                        (waiters, err.error)
+                        if buffer.records.is_empty() && buffer.waiters.is_empty() {
+                            pending.buffers.remove(&batch.partition);
+                        }
+                        err.error
                     };
 
                     self.flush_finished.notify_waiters();
-                    notify_waiters(waiters, Err(error.to_string()));
+                    notify_waiters(batch.waiters, Err(error.to_string()));
                     return Err(error);
                 }
             }
@@ -458,19 +441,21 @@ impl Ingestor {
             }
         });
 
+        let placeholders = (2..=keys.len() + 1)
+            .map(|index| format!("${index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let sql = format!(
             "SELECT idempotency_key
             FROM run_events
-            WHERE project_name = {}
-                AND idempotency_key IN ({})",
-            sql_string_literal(&project_name),
-            keys.iter()
-                .map(|key| sql_string_literal(key))
-                .collect::<Vec<_>>()
-                .join(", ")
+            WHERE project_name = $1
+                AND idempotency_key IN ({placeholders})"
         );
+        let mut params = Vec::<&(dyn ToSql + Sync)>::with_capacity(keys.len() + 1);
+        params.push(&project_name);
+        params.extend(keys.iter().map(|key| key as &(dyn ToSql + Sync)));
         let existing = client
-            .query(sql.as_str(), &[])
+            .query(sql.as_str(), &params)
             .await
             .context("load existing run event idempotency keys")
             .map_err(|error| (records.clone(), error))?
@@ -512,10 +497,13 @@ impl Ingestor {
                 records: records.clone(),
                 error,
             })?;
-        let search_index_uri = search_index_uri_for_segment(&segment_uri);
+        let search_index_uri =
+            search_index_uri_for_segment(&segment_uri).map_err(|error| PersistError {
+                records: records.clone(),
+                error,
+            })?;
         let path = Path::from(segment_uri.as_str());
-        let put_result = self
-            .object_store
+        self.object_store
             .put(&path, PutPayload::from_bytes(payload.clone()))
             .await
             .context("write Vortex segment to object store")
@@ -561,7 +549,6 @@ impl Ingestor {
             partition,
             SegmentObjectMetadata {
                 segment_uri: &segment_uri,
-                etag: put_result.e_tag.as_deref().unwrap_or(""),
                 total_bytes: payload.len(),
                 search_index_uri: &search_index_uri,
                 search_index_bytes: search_index_payload.len(),
@@ -622,7 +609,7 @@ impl Ingestor {
                 FROM (
                     SELECT time_bucket_start_unix_nano
                     FROM trace_segments
-                    WHERE project_name = $1 AND compacted_at IS NULL
+                    WHERE project_name = $1 AND compacted_at_unix_nano IS NULL
                     GROUP BY time_bucket_start_unix_nano
                     HAVING count(*) > 1
                 ) AS compactable_buckets
@@ -658,7 +645,7 @@ impl Ingestor {
                 FROM trace_segments
                 WHERE project_name = $1
                     AND time_bucket_start_unix_nano = $2
-                    AND compacted_at IS NULL
+                    AND compacted_at_unix_nano IS NULL
                 ORDER BY id
                 LIMIT $3",
                 &[
@@ -723,9 +710,8 @@ impl Ingestor {
 
         let sql = format!(
             "UPDATE trace_segments
-            SET compacted_at = CURRENT_TIMESTAMP,
-                compacted_at_unix_nano = $1
-            WHERE id IN ({}) AND compacted_at IS NULL",
+            SET compacted_at_unix_nano = $1
+            WHERE id IN ({}) AND compacted_at_unix_nano IS NULL",
             segment_ids
                 .iter()
                 .map(i64::to_string)
@@ -751,6 +737,37 @@ fn deduplicate_records(records: Vec<SpanRecord>) -> Vec<SpanRecord> {
 fn normalize_node_id(node_id: String) -> Option<String> {
     let node_id = node_id.trim();
     (!node_id.is_empty()).then(|| node_id.to_owned())
+}
+
+fn validate_ingest_record(record: &SpanRecord) -> Result<()> {
+    for (field, value) in [
+        ("project_name", record.project_name.as_str()),
+        ("run_id", record.run_id.as_str()),
+        ("trace_id", record.trace_id.as_str()),
+        ("span_id", record.span_id.as_str()),
+        ("name", record.name.as_str()),
+        ("run_type", record.run_type.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(anyhow!("ingest {field} must not be empty"));
+        }
+    }
+    for (field, value) in [
+        ("parent_run_id", record.parent_run_id.as_deref()),
+        ("parent_span_id", record.parent_span_id.as_deref()),
+        ("idempotency_key", record.idempotency_key.as_deref()),
+    ] {
+        if value.is_some_and(|value| value.trim().is_empty()) {
+            return Err(anyhow!("ingest {field} must not be empty when present"));
+        }
+    }
+    serde_json::from_str::<serde_json::Value>(&record.attributes_json)
+        .context("ingest attributes_json must be valid JSON")?;
+    Ok(())
+}
+
+fn is_run_id_collision(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RunIdCollision>().is_some()
 }
 
 #[derive(Debug)]
@@ -933,10 +950,6 @@ fn current_time_unix_nano() -> Result<i64> {
         .context("system clock is before unix epoch")?
         .as_nanos();
     i64::try_from(nanos).context("system time exceeds i64 nanoseconds")
-}
-
-fn sql_string_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn segment_uri(partition: &PartitionKey, records: &[SpanRecord]) -> Result<String> {

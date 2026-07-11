@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use fst::automaton::Str;
 use fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
 
-use crate::record::SpanRecord;
+use kevindb_core::SpanRecord;
 
 mod codec;
 mod indexer;
@@ -400,11 +400,11 @@ pub fn decode_search_index(bytes: &[u8]) -> Result<SearchIndex> {
     codec::decode_search_index(bytes)
 }
 
-pub fn search_index_uri_for_segment(segment_uri: &str) -> String {
-    segment_uri
+pub fn search_index_uri_for_segment(segment_uri: &str) -> Result<String> {
+    let prefix = segment_uri
         .strip_suffix(".vortex")
-        .map(|prefix| format!("{prefix}.search.fst"))
-        .unwrap_or_else(|| format!("{segment_uri}.search.fst"))
+        .ok_or_else(|| anyhow!("segment URI must end in .vortex: {segment_uri}"))?;
+    Ok(format!("{prefix}.search.fst"))
 }
 
 pub fn decode_search_index_chunks(
@@ -848,8 +848,8 @@ pub(super) fn path_matches_pattern(path: &str, pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::RunEventKind;
     use crate::search::codec::MAGIC;
+    use kevindb_core::RunEventKind;
 
     #[test]
     fn evaluates_full_text_path_and_phrase_queries() {

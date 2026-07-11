@@ -1,7 +1,8 @@
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::record::SpanRecord;
+use kevindb_core::SpanRecord;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TypedRunMetrics {
@@ -19,8 +20,9 @@ pub struct TypedRunMetrics {
 }
 
 impl TypedRunMetrics {
-    pub fn from_record(record: &SpanRecord) -> Self {
-        let root = serde_json::from_str(&record.attributes_json).unwrap_or(Value::Null);
+    pub fn from_record(record: &SpanRecord) -> Result<Self> {
+        let root = serde_json::from_str(&record.attributes_json)
+            .context("derive metrics from attributes_json")?;
         let prompt_tokens = scalar_i64(&root, PROMPT_TOKEN_PATHS);
         let completion_tokens = scalar_i64(&root, COMPLETION_TOKEN_PATHS);
         let total_tokens = scalar_i64(&root, TOTAL_TOKEN_PATHS)
@@ -28,7 +30,7 @@ impl TypedRunMetrics {
         let prompt_cost = scalar_f64(&root, PROMPT_COST_PATHS);
         let completion_cost = scalar_f64(&root, COMPLETION_COST_PATHS);
 
-        Self {
+        Ok(Self {
             latency_nanos: latency_nanos(record),
             prompt_tokens,
             completion_tokens,
@@ -41,7 +43,7 @@ impl TypedRunMetrics {
             evaluator_score: scalar_f64(&root, EVALUATOR_SCORE_PATHS),
             model_name: scalar_string(&root, MODEL_PATHS).map(normalize_model_name),
             provider_name: scalar_string(&root, PROVIDER_PATHS).map(normalize_provider_name),
-        }
+        })
     }
 }
 
@@ -324,7 +326,7 @@ const PROVIDER_PATHS: &[&[&str]] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::RunEventKind;
+    use kevindb_core::RunEventKind;
     use serde_json::json;
 
     #[test]
@@ -346,7 +348,7 @@ mod tests {
             }
         }));
 
-        let metrics = TypedRunMetrics::from_record(&record);
+        let metrics = TypedRunMetrics::from_record(&record).expect("derive metrics");
 
         assert_eq!(metrics.latency_nanos, 900);
         assert_eq!(metrics.prompt_tokens, Some(12));
@@ -371,7 +373,7 @@ mod tests {
             "score": {"nested": true}
         }));
 
-        let metrics = TypedRunMetrics::from_record(&record);
+        let metrics = TypedRunMetrics::from_record(&record).expect("derive metrics");
 
         assert_eq!(metrics.prompt_tokens, None);
         assert_eq!(metrics.completion_tokens, None);
@@ -388,7 +390,7 @@ mod tests {
         }));
         record.start_time_unix_nano = 1_000_000_000;
 
-        let metrics = TypedRunMetrics::from_record(&record);
+        let metrics = TypedRunMetrics::from_record(&record).expect("derive metrics");
 
         assert_eq!(metrics.first_token_latency_nanos, Some(123));
     }

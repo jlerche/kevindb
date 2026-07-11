@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,9 +12,10 @@ use tokio_postgres::NoTls;
 use url::Url;
 use vortex_datafusion::VortexFormatFactory;
 
-use crate::ingest::refresh_trace_materialized_metadata;
-use crate::record::RunEventKind;
+use crate::ingest::refresh_deleted_run_metadata;
+use kevindb_core::RunEventKind;
 const MAX_DATAFUSION_SEGMENTS_PER_BATCH: usize = 8;
+const MAX_RETENTION_RUNS_PER_PASS: i64 = 1_000;
 
 mod aggregates;
 mod cleanup;
@@ -316,8 +318,10 @@ impl QueryEngine {
             span_id,
             deleted_at_unix_nano,
             reason,
+            true,
         )
-        .await?;
+        .await?
+        .is_some();
         tx.commit().await.context("commit run delete")?;
         Ok(deleted)
     }
@@ -336,41 +340,58 @@ impl QueryEngine {
             }
         });
 
-        let rows = client
-            .query(
-                "SELECT trace_id, span_id
-                FROM run_heads
-                WHERE project_name = $1
-                    AND start_time_unix_nano < $2
-                    AND deleted_at_unix_nano IS NULL
-                ORDER BY trace_id, span_id",
-                &[&project_name, &cutoff_unix_nano],
-            )
-            .await
-            .context("load retention expiration candidates")?;
-
         let tx = client
             .transaction()
             .await
             .context("begin retention expiration")?;
+        tx.query_one(
+            "SELECT name FROM projects WHERE name = $1 FOR UPDATE",
+            &[&project_name],
+        )
+        .await
+        .context("lock project for retention expiration")?;
+        let rows = tx
+            .query(
+                "SELECT trace_id, span_id, start_time_unix_nano
+                FROM run_heads
+                WHERE project_name = $1
+                    AND start_time_unix_nano < $2
+                    AND deleted_at_unix_nano IS NULL
+                ORDER BY start_time_unix_nano, trace_id, span_id
+                LIMIT $3",
+                &[
+                    &project_name,
+                    &cutoff_unix_nano,
+                    &MAX_RETENTION_RUNS_PER_PASS,
+                ],
+            )
+            .await
+            .context("load retention expiration candidates")?;
         let deleted_at_unix_nano = current_time_unix_nano()?;
         let mut deleted = 0;
+        let mut affected_traces = BTreeSet::new();
+        let mut affected_start_times = BTreeSet::new();
         for row in rows {
             let trace_id: String = row.get(0);
             let span_id: String = row.get(1);
-            if delete_run_in_tx(
+            if let Some(start_time_unix_nano) = delete_run_in_tx(
                 &tx,
                 project_name,
                 &trace_id,
                 &span_id,
                 deleted_at_unix_nano,
                 Some("retention_expired"),
+                false,
             )
             .await?
             {
                 deleted += 1;
+                affected_traces.insert(trace_id);
+                affected_start_times.insert(start_time_unix_nano);
             }
         }
+        refresh_deleted_run_metadata(&tx, project_name, &affected_traces, &affected_start_times)
+            .await?;
         tx.commit().await.context("commit retention expiration")?;
         Ok(deleted)
     }
@@ -388,35 +409,37 @@ async fn delete_run_in_tx(
     span_id: &str,
     deleted_at_unix_nano: i64,
     reason: Option<&str>,
-) -> Result<bool> {
+    refresh_metadata: bool,
+) -> Result<Option<i64>> {
+    tx.query_one(
+        "SELECT name FROM projects WHERE name = $1 FOR UPDATE",
+        &[&project_name],
+    )
+    .await
+    .context("lock project metadata refresh for run delete")?;
+
     let deleted_row = tx
         .query_opt(
             "UPDATE run_heads
-            SET deleted_at_unix_nano = $4,
-                deletion_reason = $5,
-                updated_at = CURRENT_TIMESTAMP
+            SET deleted_at_unix_nano = $4
             WHERE project_name = $1
                 AND trace_id = $2
                 AND span_id = $3
                 AND deleted_at_unix_nano IS NULL
-            RETURNING run_id, last_trace_segment_id, last_row_index",
-            &[
-                &project_name,
-                &trace_id,
-                &span_id,
-                &deleted_at_unix_nano,
-                &reason,
-            ],
+            RETURNING run_id, last_trace_segment_id, last_row_index,
+                start_time_unix_nano",
+            &[&project_name, &trace_id, &span_id, &deleted_at_unix_nano],
         )
         .await
         .context("mark run head deleted")?;
 
     let Some(deleted_row) = deleted_row else {
-        return Ok(false);
+        return Ok(None);
     };
     let run_id: String = deleted_row.get(0);
     let trace_segment_id: i64 = deleted_row.get(1);
     let row_index: i64 = deleted_row.get(2);
+    let start_time_unix_nano: i64 = deleted_row.get(3);
 
     let event_type = RunEventKind::Tombstone.as_str();
     let idempotency_key =
@@ -448,26 +471,6 @@ async fn delete_run_in_tx(
     let run_event_id: i64 = event_row.get(0);
 
     tx.execute(
-        "INSERT INTO run_deletions(
-            project_name, trace_id, span_id, deleted_at_unix_nano, reason
-        )
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (project_name, trace_id, span_id)
-        DO UPDATE SET
-            deleted_at_unix_nano = EXCLUDED.deleted_at_unix_nano,
-            reason = EXCLUDED.reason",
-        &[
-            &project_name,
-            &trace_id,
-            &span_id,
-            &deleted_at_unix_nano,
-            &reason,
-        ],
-    )
-    .await
-    .context("upsert run deletion")?;
-
-    tx.execute(
         "INSERT INTO trace_segment_delete_vectors(
             trace_segment_id, project_name, trace_id, span_id, deleted_at_unix_nano, reason
         )
@@ -493,8 +496,7 @@ async fn delete_run_in_tx(
         "UPDATE run_heads
         SET last_event_type = $4,
             last_event_time_unix_nano = $5,
-            last_run_event_id = $6,
-            updated_at = CURRENT_TIMESTAMP
+            last_run_event_id = $6
         WHERE project_name = $1
             AND trace_id = $2
             AND span_id = $3",
@@ -514,8 +516,7 @@ async fn delete_run_in_tx(
         "UPDATE run_locators
         SET event_type = $4,
             event_time_unix_nano = $5,
-            run_event_id = $6,
-            updated_at = CURRENT_TIMESTAMP
+            run_event_id = $6
         WHERE project_name = $1
             AND trace_id = $2
             AND span_id = $3",
@@ -535,8 +536,7 @@ async fn delete_run_in_tx(
         "UPDATE trace_locators
         SET event_type = $4,
             event_time_unix_nano = $5,
-            run_event_id = $6,
-            updated_at = CURRENT_TIMESTAMP
+            run_event_id = $6
         WHERE project_name = $1
             AND trace_id = $2
             AND span_id = $3",
@@ -552,11 +552,18 @@ async fn delete_run_in_tx(
     .await
     .context("advance deleted trace locator tombstone")?;
 
-    refresh_trace_materialized_metadata(tx, project_name, trace_id)
+    if refresh_metadata {
+        refresh_deleted_run_metadata(
+            tx,
+            project_name,
+            &BTreeSet::from([trace_id.to_owned()]),
+            &BTreeSet::from([start_time_unix_nano]),
+        )
         .await
         .context("refresh trace metadata after run delete")?;
+    }
 
-    Ok(true)
+    Ok(Some(start_time_unix_nano))
 }
 
 #[cfg(test)]
